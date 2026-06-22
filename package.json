@@ -1,0 +1,38 @@
+{
+  "name": "umans-proxy",
+  "version": "1.0.0",
+  "description": "Minimal OpenAI-compatible proxy for UMANS AI with /usage-informed concurrency throttling",
+  "license": "WTFPL",
+  "type": "commonjs",
+  "main": "proxy.js",
+  "bin": {
+    "umans-proxy": "launcher.js"
+  },
+  "files": [
+    "proxy.js",
+    "launcher.js",
+    "dashboard.html",
+    "start.cmd",
+    "start.sh",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "start": "node launcher.js --start",
+    "proxy": "node proxy.js",
+    "configure": "node launcher.js --no-start"
+  },
+  "keywords": [
+    "openai",
+    "proxy",
+    "umans",
+    "llm",
+    "concurrency",
+    "rate-limit",
+    "api-gateway"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {}
+}

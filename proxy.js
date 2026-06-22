@@ -1,0 +1,1125 @@
+const fs = require('fs');
+const path = require('path');
+const http = require('http');
+
+const CONFIG_DIR = path.join(__dirname, '.config');
+const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json');
+const DEFAULT_UPSTREAM = 'https://api.code.umans.ai/v1';
+const MAX_BODY_SIZE = 25 * 1024 * 1024;
+const USAGE_TTL_MS = 10 * 1000;
+const MODEL_INFO_TTL_MS = 60 * 1000;
+
+// Canonical reasoning-effort ordering, weakest to strongest.
+// Covers OpenAI (minimal/low/medium/high), UMANS (none/low/medium/high/max),
+// and common aliases clients send (xhi/xhigh -> max). Unknown values snap up
+// to the nearest supported level so a "max" intent never silently downgrades.
+const REASONING_RANK = { none: 0, off: 0, disabled: 0, minimal: 1, low: 2, medium: 3, high: 4, xhi: 5, xhigh: 5, max: 5 };
+
+let config = loadConfig();
+let usageCache = { data: null, time: 0 };
+let concurrencyCache = { concurrent: null, limit: null, softLimit: null, user_id: null, time: 0 };
+let activeRequests = 0;
+let queuedRequests = 0;
+const sseClients = new Set();
+let modelInfoCache = { data: null, time: 0 };
+// Per-session tracking for live TPS + session listing. Sessions are created
+// when a chat request begins streaming/receiving and removed on completion.
+// Bytes forwarded to the client are NEVER mutated; the tap only observes.
+const sessions = new Map();
+let sessionSeq = 0;
+// Rolling aggregate TPS: tracks tokens emitted in the last 5s.
+const TPS_WINDOW_MS = 5000;
+const tpsBuckets = []; // { time, tokens }
+// Per-model rolling TPS buckets + set of models we have actually used.
+// The dashboard Overview breaks down TPS by model, surfacing only seen models.
+const tpsBucketsByModel = new Map(); // model -> [{ time, tokens }]
+const seenModels = new Set();
+let sessionsBroadcastTimer = null;
+let broadcastThrottled = false;
+const SESSION_BROADCAST_MIN_MS = 1000;
+
+function newSessionId() {
+  sessionSeq = (sessionSeq + 1) % 0x100000000;
+  return Date.now().toString(36) + sessionSeq.toString(36).padStart(8, '0');
+}
+
+function estimateTokensFromChars(chars) {
+  // Standard ~4 chars/token heuristic; good enough when upstream omits usage.
+  return Math.floor(chars / 4);
+}
+
+function createSession({ model, stream }) {
+  const id = newSessionId();
+  if (model) seenModels.add(model);
+  const session = {
+    id, model, stream: !!stream,
+    startedAt: Date.now(),
+    status: 'active',        // active | done | error | aborted
+    outputTokens: 0,         // running token count (exact if known)
+    exactTokens: false,      // whether outputTokens is exact or estimated
+    chars: 0,                // observed output chars (for estimation)
+    bytes: 0,                // total bytes forwarded (request + response)
+    // Token breakdown for per-session display:
+    promptTokens: 0,         // total input (prompt) tokens
+    cachedTokens: 0,         // input tokens served from cache
+    completionTokens: 0,     // output (completion) tokens
+    endedAt: null,
+  };
+  sessions.set(id, session);
+  return session;
+}
+
+function finalizeSession(session, status) {
+  if (!session) return;
+  session.status = status;
+  session.endedAt = Date.now();
+  // Keep the entry briefly so the UI can render final state; drop after 5s.
+  setTimeout(() => { sessions.delete(session.id); scheduleSessionsBroadcast(); }, 5000);
+  scheduleSessionsBroadcast();
+}
+
+// Add tokens to per-session, aggregate, and per-model rolling TPS counters.
+function addSessionTokens(session, tokens, { exact = false } = {}) {
+  if (!session) return;
+  if (exact) session.exactTokens = true;
+  if (tokens <= 0) return;
+  session.outputTokens += tokens;
+  const now = Date.now();
+  const cutoff = now - TPS_WINDOW_MS;
+  // Aggregate bucket.
+  tpsBuckets.push({ time: now, tokens });
+  while (tpsBuckets.length && tpsBuckets[0].time < cutoff) tpsBuckets.shift();
+  // Per-model bucket.
+  const model = session.model;
+  if (model) {
+    seenModels.add(model);
+    let buckets = tpsBucketsByModel.get(model);
+    if (!buckets) { buckets = []; tpsBucketsByModel.set(model, buckets); }
+    buckets.push({ time: now, tokens });
+    while (buckets.length && buckets[0].time < cutoff) buckets.shift();
+  }
+}
+function aggregateTps() {
+  const now = Date.now();
+  const cutoff = now - TPS_WINDOW_MS;
+  let tokens = 0;
+  for (const b of tpsBuckets) if (b.time >= cutoff) tokens += b.tokens;
+  // tokens accumulated over TPS_WINDOW_MS → tokens/sec
+  return tokens / (TPS_WINDOW_MS / 1000);
+}
+
+// Per-model rolling TPS. Returns a map of model -> tokens/sec for models
+// we have actually seen (used), sorted by descending TPS.
+function modelTpsBreakdown() {
+  const now = Date.now();
+  const cutoff = now - TPS_WINDOW_MS;
+  const out = [];
+  for (const model of seenModels) {
+    const buckets = tpsBucketsByModel.get(model);
+    if (!buckets) { out.push({ model, tps: 0 }); continue; }
+    let tokens = 0;
+    for (const b of buckets) if (b.time >= cutoff) tokens += b.tokens;
+    out.push({ model, tps: tokens / (TPS_WINDOW_MS / 1000) });
+  }
+  out.sort((a, b) => b.tps - a.tps);
+  return out;
+}
+
+function sessionTps(session) {
+  // Estimate per-session TPS from elapsed active time. For active sessions,
+  // use the rolling char/token rate over the session lifetime (capped to 5s).
+  if (!session) return 0;
+  const now = Date.now();
+  const end = session.endedAt ?? now;
+  const elapsed = Math.max(1, end - session.startedAt);
+  // Use a 5s window for a smoother rate.
+  const window = Math.min(elapsed, TPS_WINDOW_MS);
+  return (session.outputTokens / window) * 1000;
+}
+
+function sessionPublicView(session) {
+  const now = Date.now();
+  const endedAt = session.endedAt;
+  const elapsed = (endedAt ?? now) - session.startedAt;
+  const active = session.status === 'active';
+  return {
+    id: session.id,
+    model: session.model,
+    stream: session.stream,
+    status: session.status,
+    active,
+    startedAt: new Date(session.startedAt).toISOString(),
+    endedAt: endedAt ? new Date(endedAt).toISOString() : null,
+    elapsedMs: elapsed,
+    outputTokens: session.outputTokens,
+    exactTokens: session.exactTokens,
+    // Token breakdown for per-session display.
+    promptTokens: session.promptTokens,
+    cachedTokens: session.cachedTokens,
+    uncachedTokens: Math.max(0, session.promptTokens - session.cachedTokens),
+    completionTokens: session.completionTokens,
+    // Cache hit rate: cached / total prompt tokens. Null when no prompt tokens.
+    cacheHitRate: session.promptTokens > 0 ? Math.round((session.cachedTokens / session.promptTokens) * 1000) / 10 : null,
+    bytes: session.bytes,
+    tps: Math.round(sessionTps(session) * 10) / 10,
+  };
+}
+
+function getSessionsSnapshot() {
+  const list = [...sessions.values()].map(sessionPublicView);
+  // Active first, then most recent.
+  list.sort((a, b) => (a.active === b.active ? b.startedAt.localeCompare(a.startedAt) : a.active ? -1 : 1));
+  // Per-session TPS distribution stats: median and p10 (low). Computed across
+  // all tracked sessions that produced tokens; null when no data yet.
+  const tpsValues = list.map((s) => s.tps).filter((t) => t > 0).sort((a, b) => a - b);
+  const percentile = (arr, p) => {
+    if (!arr.length) return null;
+    const idx = Math.min(arr.length - 1, Math.max(0, Math.floor((arr.length - 1) * p)));
+    return Math.round(arr[idx] * 10) / 10;
+  };
+  const medianTps = percentile(tpsValues, 0.5);
+  const p10Tps = percentile(tpsValues, 0.1);
+  return {
+    sessions: list,
+    aggregate: {
+      tps: Math.round(aggregateTps() * 10) / 10,
+      activeSessions: [...sessions.values()].filter((s) => s.status === 'active').length,
+      totalSessions: sessions.size,
+      medianTps,
+      p10Tps,
+      // Per-model TPS for models actually used, sorted desc by tps.
+      models: modelTpsBreakdown().map((m) => ({ model: m.model, tps: Math.round(m.tps * 10) / 10 })),
+    },
+  };
+}
+
+// Broadcast sessions snapshot on a throttle (at most once per second) while
+// sessions are active. Stops the timer when no active sessions remain.
+function scheduleSessionsBroadcast() {
+  if (broadcastThrottled) return;
+  const hasActive = [...sessions.values()].some((s) => s.status === 'active');
+  if (!hasActive) {
+    if (sessionsBroadcastTimer) { clearInterval(sessionsBroadcastTimer); sessionsBroadcastTimer = null; }
+    // One final broadcast so the UI sees the terminal state.
+    broadcastEvent('sessions', getSessionsSnapshot());
+    return;
+  }
+  broadcastThrottled = true;
+  setTimeout(() => {
+    broadcastThrottled = false;
+    broadcastEvent('sessions', getSessionsSnapshot());
+    // Re-evaluate; if still active, keep polling via interval.
+    if (!sessionsBroadcastTimer) {
+      sessionsBroadcastTimer = setInterval(() => {
+        const stillActive = [...sessions.values()].some((s) => s.status === 'active');
+        broadcastEvent('sessions', getSessionsSnapshot());
+        if (!stillActive && sessionsBroadcastTimer) {
+          clearInterval(sessionsBroadcastTimer);
+          sessionsBroadcastTimer = null;
+        }
+      }, SESSION_BROADCAST_MIN_MS);
+    }
+  }, 0);
+}
+
+// Per-request stream/body tap. Parses SSE chunks (streaming) or a single
+// JSON body (non-streaming) to count output tokens WITHOUT mutating bytes.
+// ASYNC: onChunk is O(1) — it pushes the raw buffer onto a queue and
+// schedules a drain via setImmediate. All JSON.parse / string scanning
+// happens in _drain(), which runs between I/O ticks (during the next
+// reader.read() await), so telemetry never delays bytes reaching the client.
+class ChatTap {
+  constructor(session, { stream }) {
+    this.session = session;
+    this.stream = stream;
+    this.lineBuf = '';     // partial SSE line buffer
+    this.bodyBuf = [];     // non-streaming: full body chunks
+    this.queue = [];       // raw chunks pending async parse
+    this.draining = false;
+    this.ended = false;
+  }
+
+  // O(1) enqueue — never blocks the read loop. Byte counting is trivial
+  // integer addition; parsing is deferred to _drain().
+  onChunk(buf) {
+    if (!this.session || !buf || buf.length === 0) return;
+    this.session.bytes += buf.length;
+    this.queue.push(buf);
+    if (!this.draining) {
+      this.draining = true;
+      setImmediate(() => this._drain());
+    }
+  }
+
+  _drain() {
+    while (this.queue.length) {
+      const buf = this.queue.shift();
+      if (this.stream) {
+        // reader.read() returns Uint8Array, not Buffer. Uint8Array.toString('utf8')
+        // returns comma-separated byte values, so wrap in Buffer.from first.
+        this.lineBuf += Buffer.from(buf).toString('utf8');
+        let idx;
+        while ((idx = this.lineBuf.indexOf('\n')) >= 0) {
+          const line = this.lineBuf.slice(0, idx).replace(/\r$/, '');
+          this.lineBuf = this.lineBuf.slice(idx + 1);
+          this._handleSseLine(line);
+        }
+      } else {
+        this.bodyBuf.push(buf);
+      }
+    }
+    this.draining = false;
+    // If onEnd arrived while draining, finalize now that we're caught up.
+    if (this.ended) this._finish();
+  }
+
+  _handleSseLine(line) {
+    if (!line.startsWith('data:')) return;
+    const data = line.slice(5).trim();
+    if (!data || data === '[DONE]') return;
+    let chunk;
+    try { chunk = JSON.parse(data); } catch { return; }
+    // Exact usage on the final chunk (some providers include it). Once we
+    // have an exact count, stop estimating from chars.
+    const u = chunk?.usage;
+    if (u && (u.completion_tokens != null || u.output_tokens != null)) {
+      const t = Number(u.completion_tokens ?? u.output_tokens ?? 0) || 0;
+      this.session.outputTokens = t;
+      this.session.completionTokens = t;
+      this.session.exactTokens = true;
+      // Token breakdown: prompt (input), cached input, completion (output).
+      const prompt = Number(u.prompt_tokens ?? u.input_tokens ?? 0) || 0;
+      const cached = Number(u.prompt_tokens_details?.cached_tokens ?? u.cached_tokens ?? u.tokens_cached_read ?? 0) || 0;
+      this.session.promptTokens = prompt;
+      this.session.cachedTokens = cached;
+      addSessionTokens(this.session, 0, { exact: true });
+      return;
+    }
+    if (this.session.exactTokens) return; // already have exact count
+    // Accumulate content/reasoning chars and recompute tokens from the TOTAL
+    // so per-chunk remainder truncation doesn't systematically underestimate.
+    let chars = 0;
+    const choices = chunk?.choices;
+    if (Array.isArray(choices)) {
+      for (const c of choices) {
+        const delta = c?.delta || {};
+        if (typeof delta.content === 'string') chars += delta.content.length;
+        if (typeof delta.reasoning_content === 'string') chars += delta.reasoning_content.length;
+      }
+    }
+    if (chars > 0) {
+      this.session.chars += chars;
+      const newTotal = estimateTokensFromChars(this.session.chars);
+      const diff = newTotal - this.session.outputTokens;
+      // addSessionTokens adds the diff to outputTokens AND the TPS buckets.
+      if (diff > 0) addSessionTokens(this.session, diff);
+    }
+  }
+
+  onEnd() {
+    if (!this.session) return;
+    this.ended = true;
+    // If a drain is scheduled (setImmediate pending) but hasn't run yet, the
+    // queue still holds unparsed chunks. Drain them synchronously now so the
+    // final token count is accurate before the session is finalized. If a
+    // drain IS in flight (executing), _drain will call _finish when caught up.
+    if (!this.draining && this.queue.length) this._drain();
+    else if (!this.draining) this._finish();
+  }
+
+  _finish() {
+    if (!this.session) return;
+    // Flush any straggler SSE line without a trailing newline.
+    if (this.stream && this.lineBuf) {
+      const line = this.lineBuf.trim();
+      this.lineBuf = '';
+      if (line) this._handleSseLine(line);
+    }
+    if (!this.stream && this.bodyBuf.length) {
+      // Non-streaming: parse the buffered body once for exact usage.
+      const text = Buffer.concat(this.bodyBuf).toString('utf8');
+      try {
+        const body = JSON.parse(text);
+        const u = body?.usage;
+        if (u && (u.completion_tokens != null || u.output_tokens != null)) {
+          // Replace any estimate with the exact count from the final body.
+          // addSessionTokens adds the diff to outputTokens, so we don't set
+          // outputTokens directly (that would double-count).
+          const exact = Number(u.completion_tokens ?? u.output_tokens ?? 0) || 0;
+          const prev = this.session.outputTokens;
+          this.session.completionTokens = exact;
+          this.session.exactTokens = true;
+          // Token breakdown: prompt (input), cached input, completion (output).
+          const prompt = Number(u.prompt_tokens ?? u.input_tokens ?? 0) || 0;
+          const cached = Number(u.prompt_tokens_details?.cached_tokens ?? u.cached_tokens ?? u.tokens_cached_read ?? 0) || 0;
+          this.session.promptTokens = prompt;
+          this.session.cachedTokens = cached;
+          addSessionTokens(this.session, Math.max(0, exact - prev), { exact: true });
+        } else {
+          // No usage block: estimate from total content chars.
+          let chars = 0;
+          const choices = body?.choices;
+          if (Array.isArray(choices)) {
+            for (const c of choices) {
+              const msg = c?.message || {};
+              if (typeof msg.content === 'string') chars += msg.content.length;
+              if (typeof msg.reasoning_content === 'string') chars += msg.reasoning_content.length;
+            }
+          }
+          if (chars > 0) {
+            this.session.chars += chars;
+            const newTotal = estimateTokensFromChars(this.session.chars);
+            const diff = newTotal - this.session.outputTokens;
+            if (diff > 0) addSessionTokens(this.session, diff);
+          }
+        }
+      } catch { /* non-JSON or partial — ignore */ }
+    }
+    // Clear ref so finalize is idempotent.
+    this.session = null;
+  }
+}
+
+
+
+function readJSON(file) {
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
+  catch (err) {
+    if (err.code === 'ENOENT') return {};
+    console.error(`Failed to load ${file}: ${err.message}`);
+    process.exit(1);
+  }
+}
+
+function cleanKeys(values) {
+  return [...new Set(values.map((key) => String(key || '').trim()).filter(Boolean))];
+}
+
+function fileProxyApiKeys(raw) {
+  return cleanKeys(Array.isArray(raw.API_KEYS) ? raw.API_KEYS.map((entry) => typeof entry === 'string' ? entry : entry?.key) : []);
+}
+
+function envProxyApiKeys() {
+  return cleanKeys((process.env.API_KEYS || '').split(','));
+}
+
+function parseDuration(value) {
+  const raw = String(value || '15m').trim().toLowerCase();
+  const match = raw.match(/^(\d+)(ms|s|m|h)?$/);
+  if (!match) throw new Error('REQUEST_TIMEOUT must be like 30000ms, 30s, 15m, or 1h');
+  const n = Number(match[1]);
+  const unit = match[2] || 'ms';
+  const scale = unit === 'h' ? 3600000 : unit === 'm' ? 60000 : unit === 's' ? 1000 : 1;
+  return n * scale;
+}
+
+function loadConfig() {
+  const raw = readJSON(CONFIG_FILE);
+  const envApiKey = process.env.UMANS_API_KEY || '';
+  const fileApiKey = raw.API_KEY || '';
+  const fileKeys = fileProxyApiKeys(raw);
+  const requestTimeoutRaw = process.env.REQUEST_TIMEOUT || raw.REQUEST_TIMEOUT || '15m';
+  return {
+    listenAddr: process.env.LISTEN_ADDR || raw.LISTEN_ADDR || '127.0.0.1:8084',
+    upstreamBaseURL: DEFAULT_UPSTREAM,
+    apiKey: envApiKey || fileApiKey,
+    fileApiKey,
+    enabledModels: Array.isArray(raw.ENABLED_MODELS) ? raw.ENABLED_MODELS.map(String).map((x) => x.trim()).filter(Boolean) : [],
+    requestTimeout: parseDuration(requestTimeoutRaw),
+    requestTimeoutRaw,
+    overrideConcurrency: Math.max(0, Number(process.env.OVERRIDE_CONCURRENCY || raw.OVERRIDE_CONCURRENCY || 0) || 0),
+    proxyApiKeys: cleanKeys([...envProxyApiKeys(), ...fileKeys]),
+    fileProxyApiKeys: fileKeys,
+  };
+}
+
+function saveConfig(next = config) {
+  if (!fs.existsSync(CONFIG_DIR)) fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
+  fs.chmodSync(CONFIG_DIR, 0o700);
+  fs.writeFileSync(CONFIG_FILE, JSON.stringify({
+    LISTEN_ADDR: next.listenAddr,
+    API_KEY: next.fileApiKey,
+    ENABLED_MODELS: next.enabledModels,
+    API_KEYS: next.fileProxyApiKeys,
+    REQUEST_TIMEOUT: next.requestTimeoutRaw,
+    OVERRIDE_CONCURRENCY: next.overrideConcurrency,
+  }, null, 2) + '\n', { mode: 0o600 });
+  fs.chmodSync(CONFIG_FILE, 0o600);
+}
+
+function parseListenAddr(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return { host: '127.0.0.1', port: 8084 };
+
+  const match = raw.match(/^(.+):(\d+)$/);
+  const portText = match ? match[2] : raw;
+  if (!match && raw.includes(':')) throw new Error('LISTEN_ADDR must be a port or host:port');
+
+  const port = Number(portText);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('LISTEN_ADDR port must be an integer from 1 to 65535');
+  return { host: match ? match[1] : '127.0.0.1', port };
+}
+
+function writeJSON(res, status, body, headers = {}) {
+  const data = Buffer.from(JSON.stringify(body, null, 2));
+  res.writeHead(status, { ...headers, 'Content-Type': 'application/json', 'Content-Length': data.length });
+  res.end(data);
+}
+
+function writeText(res, status, body, contentType = 'text/plain; charset=utf-8') {
+  const data = Buffer.from(body);
+  res.writeHead(status, { 'Content-Type': contentType, 'Content-Length': data.length });
+  res.end(data);
+}
+
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    let tooLarge = false;
+    req.on('data', (chunk) => {
+      if (tooLarge) return;
+      size += chunk.length;
+      if (size > MAX_BODY_SIZE) {
+        tooLarge = true;
+        const err = new Error('request body too large');
+        err.statusCode = 413;
+        reject(err);
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    req.on('error', reject);
+  });
+}
+
+function upstreamURL(suffix) {
+  return `${config.upstreamBaseURL}${suffix}`;
+}
+
+function authHeaders(extra = {}) {
+  const headers = { ...extra };
+  if (config.apiKey) headers.Authorization = `Bearer ${config.apiKey}`;
+  return headers;
+}
+
+function safeHeaders(headers) {
+  const out = {};
+  for (const [key, value] of headers) {
+    const lower = key.toLowerCase();
+    if (['connection', 'content-encoding', 'content-length', 'keep-alive', 'transfer-encoding'].includes(lower)) continue;
+    out[key] = value;
+  }
+  return out;
+}
+
+function openAIError(res, status, message, type = 'server_error') {
+  writeJSON(res, status, { error: { message, type, param: null, code: null } });
+}
+
+// Authorization check for proxy-protected endpoints.
+// NOTE: auth is intentionally DISABLED by default. With an empty API_KEYS
+// list every endpoint is open. This is the chosen default for a localhost
+// single-user tool; set API_KEYS (env or config) to gate access when binding
+// to a non-loopback address. Keep this behavior explicit, not accidental.
+function authorized(req, url) {
+  if (!config.proxyApiKeys.length) return true;
+  const tokens = [req.headers['x-api-key'], req.headers.authorization, url?.searchParams.get('key')]
+    .flatMap((value) => Array.isArray(value) ? value : [value])
+    .map((value) => String(value || '').replace(/^Bearer\s+/i, '').trim())
+    .filter(Boolean);
+  return tokens.some((token) => config.proxyApiKeys.includes(token));
+}
+
+function requiresProxyAuth(pathname) {
+  return pathname === '/api/config' || pathname === '/api/events' || pathname.startsWith('/api/umans/') || pathname.startsWith('/v1/');
+}
+
+function filterModels(models) {
+  if (!config.enabledModels.length) return models;
+  const allowed = new Set(config.enabledModels);
+  return models.filter((model) => allowed.has(model.id || model));
+}
+
+function firstNumber(...values) {
+  for (const value of values) {
+    const n = Number(value);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  return null;
+}
+
+function concurrencyHardLimit(concurrency) {
+  const soft = firstNumber(concurrency.limit);
+  const hard = firstNumber(concurrency.hard_cap);
+  if (hard) return hard;
+  const burst = firstNumber(concurrency.burst, concurrency.burst_limit, concurrency.burst_sessions);
+  if (soft && burst) return soft + burst;
+  const burstPct = firstNumber(concurrency.burst_pct);
+  if (soft && burstPct) return Math.ceil(soft * (1 + burstPct));
+  const burstPercent = firstNumber(concurrency.burst_percent);
+  if (soft && burstPercent) return Math.ceil(soft * (1 + burstPercent / 100));
+  return soft;
+}
+
+function percentValue(...values) {
+  for (const value of values) {
+    const n = Number(value);
+    if (!Number.isFinite(n) || n < 0) continue;
+    return Math.max(0, Math.min(1, n > 1 ? n / 100 : n));
+  }
+  return null;
+}
+
+function burstQuota(concurrency) {
+  return percentValue(
+    concurrency.burst_remaining_pct,
+    concurrency.burst_pct_remaining,
+    concurrency.remaining_burst_pct,
+    concurrency.burst_available_pct,
+    concurrency.burst_remaining_percent,
+    concurrency.remaining_burst_percent,
+    concurrency.burst_percent_remaining,
+    concurrency.burst_pct,
+    concurrency.burst_percent,
+  ) ?? 0;
+}
+
+function concurrencyQuotaLimit(concurrency) {
+  const soft = firstNumber(concurrency.limit);
+  const hard = concurrencyHardLimit(concurrency);
+  if (!soft || !hard || hard <= soft) return hard ?? soft;
+  return Math.max(soft, Math.min(hard, soft + Math.floor((hard - soft) * burstQuota(concurrency))));
+}
+
+function applyOverride(apiLimit, apiSoft, override) {
+  if (override > 0) {
+    return {
+      limit: apiLimit != null ? Math.min(override, apiLimit) : override,
+      softLimit: apiSoft != null ? Math.min(override, apiSoft) : null,
+      overridden: apiLimit === null || override < apiLimit,
+    };
+  }
+  return { limit: apiLimit, softLimit: apiSoft, overridden: false };
+}
+
+function extractThrottle(data) {
+  const usage = data?.usage || data || {};
+  const limits = data?.limits || usage?.limits || {};
+  const concurrency = limits?.concurrency || {};
+  const concurrent = Number(usage.concurrent_sessions ?? usage.concurrent ?? data?.concurrent_sessions ?? 0) || 0;
+  const soft = firstNumber(concurrency.limit);
+  const hard = concurrencyHardLimit(concurrency);
+  const quotaLimit = concurrencyQuotaLimit(concurrency);
+  const { limit, softLimit, overridden } = applyOverride(quotaLimit, soft, config.overrideConcurrency || 0);
+  return {
+    concurrent, soft, hard, softLimit, limit, quotaLimit, overridden,
+    burstQuota: burstQuota(concurrency),
+    active: activeRequests, queued: queuedRequests,
+  };
+}
+
+function logError(context, err) {
+  console.error(`${context}: ${err?.message || err}`);
+}
+
+async function fetchUmansUsage({ force = false } = {}) {
+  if (!config.apiKey) return { ok: false, error: 'UMANS API key is not configured', usage: null, limits: null, throttle: extractThrottle(null) };
+  if (!force && usageCache.data && Date.now() - usageCache.time < USAGE_TTL_MS) return usageCache.data;
+  try {
+    const resp = await fetch(upstreamURL('/usage'), {
+      headers: authHeaders({ Accept: 'application/json' }),
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!resp.ok) throw new Error(`UMANS /usage returned ${resp.status}`);
+    const raw = await resp.json();
+    const result = {
+      ok: true,
+      raw,
+      usage: raw?.usage ?? raw ?? null,
+      limits: raw?.limits ?? null,
+      user_id: raw?.user_id ?? raw?.user?.id ?? null,
+      plan: raw?.plan ?? null,
+      window: raw?.window ?? raw?.usage?.window ?? null,
+      throttle: extractThrottle(raw),
+      fetchedAt: new Date().toISOString(),
+    };
+    usageCache = { data: result, time: Date.now() };
+    concurrencyCache = {
+      concurrent: Number(raw?.usage?.concurrent_sessions ?? 0) || 0,
+      limit: concurrencyQuotaLimit(raw?.limits?.concurrency || {}),
+      softLimit: firstNumber(raw?.limits?.concurrency?.limit),
+      user_id: raw?.user_id ?? null,
+      time: Date.now(),
+    };
+    broadcastEvent('usage', result);
+    return result;
+  } catch (err) {
+    logError('UMANS /usage fetch failed', err);
+    return { ok: false, error: err.message, usage: null, limits: null, throttle: extractThrottle(null) };
+  }
+}
+
+function refreshUsageSoon() {
+  fetchUmansUsage({ force: true }).catch(() => {});
+}
+
+function broadcastEvent(event, data) {
+  const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+  for (const res of sseClients) {
+    try { res.write(payload); } catch { sseClients.delete(res); }
+  }
+}
+
+function getEffectiveConcurrency() {
+  const { limit, softLimit, overridden } = applyOverride(
+    concurrencyCache.limit,
+    concurrencyCache.softLimit,
+    config.overrideConcurrency || 0,
+  );
+  return { concurrent: concurrencyCache.concurrent || 0, limit, softLimit, overridden, user_id: concurrencyCache.user_id || null };
+}
+function canStart(effective) {
+  const limit = effective.limit;
+  if (limit == null) return true;
+  if (activeRequests >= limit) return false;
+  // Prefer staying at/under the soft limit when requests are queued
+  const soft = effective.softLimit;
+  if (soft && activeRequests >= soft && queuedRequests > 0) return false;
+  return true;
+}
+
+async function acquireThrottleSlot(res, signal) {
+  if (signal?.aborted) throw new Error('aborted');
+  let effective = getEffectiveConcurrency();
+  if (effective.limit === null) {
+    await fetchUmansUsage();
+    effective = getEffectiveConcurrency();
+  }
+  // Keep the downstream client alive across long queue waits (>30s idle timeouts).
+  // 102 Processing is an interim response: it does not commit the final status
+  // and is ignored by HTTP clients, but resets their read/idle timers.
+  let keepalive = null;
+  try {
+    while (!canStart(effective)) {
+      if (signal?.aborted) throw new Error('aborted');
+      if (!keepalive && res && !res.headersSent && res.socket && !res.socket.destroyed) {
+        res.socket.write('HTTP/1.1 102 Processing\r\n\r\n');
+        keepalive = setInterval(() => {
+          if (!res.headersSent && res.socket && !res.socket.destroyed) res.socket.write('HTTP/1.1 102 Processing\r\n\r\n');
+        }, 5000);
+      }
+      queuedRequests++;
+      try {
+        await new Promise((resolve, reject) => {
+          const onAbort = () => { cleanup(); reject(new Error('aborted')); };
+          const cleanup = () => {
+            clearTimeout(timeout);
+            signal?.removeEventListener('abort', onAbort);
+          };
+          const timeout = setTimeout(() => { cleanup(); resolve(); }, 1000);
+          signal?.addEventListener('abort', onAbort, { once: true });
+          if (signal?.aborted) onAbort();
+        });
+      } finally {
+        queuedRequests--;
+      }
+      // Re-read the effective limit each iteration so config changes or usage
+      // refreshes (POST /api/config resets concurrencyCache) are honored by
+      // queued requests instead of evaluated against a stale snapshot.
+      effective = getEffectiveConcurrency();
+    }
+  } finally {
+    if (keepalive) clearInterval(keepalive);
+  }
+  if (signal?.aborted) throw new Error('aborted');
+  activeRequests++;
+  refreshUsageSoon();
+  broadcastEvent('session', { type: 'start', active: activeRequests, queued: queuedRequests });
+}
+
+function releaseThrottleSlot() {
+  if (activeRequests > 0) activeRequests--;
+  refreshUsageSoon();
+  broadcastEvent('session', { type: 'end', active: activeRequests, queued: queuedRequests });
+}
+
+// Fetch and cache upstream /models/info (per-model reasoning capabilities).
+// Used to enrich /v1/models and to snap client reasoning_effort values.
+async function fetchModelInfo({ force = false } = {}) {
+  if (!force && modelInfoCache.data && Date.now() - modelInfoCache.time < MODEL_INFO_TTL_MS) return modelInfoCache.data;
+  try {
+    const resp = await fetch(upstreamURL('/models/info'), {
+      headers: authHeaders({ Accept: 'application/json' }),
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!resp.ok) throw new Error(`/models/info returned ${resp.status}`);
+    const data = await resp.json();
+    modelInfoCache = { data, time: Date.now() };
+    return data;
+  } catch (err) {
+    logError('UMANS /models/info fetch failed', err);
+    return modelInfoCache.data; // serve stale if available, else null
+  }
+}
+
+// Resolve a model's reasoning spec from cached /models/info. Returns null when
+// the model is unknown or upstream /models/info is unavailable.
+function getModelReasoning(modelId) {
+  const info = modelInfoCache.data;
+  if (!info || !modelId) return null;
+  const entry = info[modelId];
+  return entry?.capabilities?.reasoning || null;
+}
+
+// Map a client-supplied reasoning_effort to one the model actually supports.
+// Unknown aliases (xhi, xhigh, minimal, off, disabled) normalize first, then
+// snap UP to the nearest supported level so a "max" intent never downgrades.
+// Models that can't disable reasoning (e.g. kimi-k2.7) drop a "none"/"off".
+// Returns the resolved level, or null to leave the field untouched.
+function snapReasoningLevel(modelId, requested) {
+  const reasoning = getModelReasoning(modelId);
+  if (!reasoning || !reasoning.supported) return null;
+  const levels = (reasoning.levels || []).map((l) => String(l).toLowerCase());
+  if (!requested) return null;
+  const req = String(requested).toLowerCase().trim();
+
+  // Model lists its supported levels: snap to nearest.
+  if (levels.length) {
+    if (levels.includes(req)) return requested; // already supported (preserve original casing)
+    const reqRank = REASONING_RANK[req];
+    if (reqRank == null) return null; // genuinely unknown — let upstream handle it
+    const ranked = levels
+      .map((l) => ({ l, r: REASONING_RANK[l] ?? -1 }))
+      .filter((x) => x.r >= 0) // drop any level we can't rank
+      .filter((x) => !(!reasoning.can_disable && x.r === 0)); // skip "none" when not disableable
+    if (!ranked.length) return null;
+    // Snap UP to the nearest supported rank >= requested so a "max" intent
+    // never downgrades. If nothing reaches the requested rank, clamp to the
+    // highest available (the strongest reasoning the model can do).
+    const above = ranked.filter((x) => x.r >= reqRank).sort((a, b) => a.r - b.r);
+    const chosen = above.length ? above[0] : ranked.reduce((m, x) => (x.r > m.r ? x : m));
+    return chosen.l;
+  }
+
+  // Model supports reasoning but publishes no level list (e.g. kimi). Drop a
+  // disable attempt (it can't), otherwise pass through unchanged.
+  if (!reasoning.can_disable && (req === 'none' || req === 'off' || req === 'disabled')) return null;
+  return requested;
+}
+
+// Attach a `reasoning` object (OpenAI-style) to each model in a /v1/models
+// response, derived from cached /models/info.
+function enrichModelsWithReasoning(data) {
+  if (!Array.isArray(data)) return data;
+  return data.map((m) => {
+    const reasoning = getModelReasoning(m.id);
+    if (!reasoning || !reasoning.supported) return m;
+    return {
+      ...m,
+      reasoning: {
+        supported: true,
+        can_disable: reasoning.can_disable,
+        levels: reasoning.levels || [],
+        default_level: reasoning.default_level,
+      },
+    };
+  });
+}
+
+async function handleModels(req, res, modelId = null) {
+  if (req.method !== 'GET') return openAIError(res, 405, 'method not allowed', 'invalid_request_error');
+  if (modelId && config.enabledModels.length && !config.enabledModels.includes(modelId)) {
+    return openAIError(res, 404, `model not found: ${modelId}`, 'invalid_request_error');
+  }
+  if (!config.apiKey) {
+    if (!modelId) return writeJSON(res, 200, { object: 'list', data: enrichModelsWithReasoning(config.enabledModels.map((id) => ({ id, object: 'model', created: 0, owned_by: 'umans' }))) });
+    const model = config.enabledModels.find((id) => id === modelId);
+    if (model) return writeJSON(res, 200, enrichModelsWithReasoning([{ id: model, object: 'model', created: 0, owned_by: 'umans' }])[0]);
+    return openAIError(res, 404, `model not found: ${modelId}`, 'invalid_request_error');
+  }
+
+  // Best-effort: refresh model info so reasoning enrichment is current.
+  await fetchModelInfo();
+
+  try {
+    const upstream = await fetch(upstreamURL(modelId ? `/models/${encodeURIComponent(modelId)}` : '/models'), { headers: authHeaders({ Accept: 'application/json' }) });
+    const text = await upstream.text();
+    let body;
+    try { body = text ? JSON.parse(text) : {}; }
+    catch { return writeText(res, upstream.status, text, upstream.headers.get('content-type') || 'text/plain'); }
+    if (!modelId && Array.isArray(body.data)) body.data = enrichModelsWithReasoning(filterModels(body.data));
+    if (modelId && Array.isArray(body.data)) body.data = enrichModelsWithReasoning(body.data);
+    if (modelId && upstream.status === 404) return openAIError(res, 404, `model not found: ${modelId}`, 'invalid_request_error');
+    writeJSON(res, upstream.status, body, safeHeaders(upstream.headers));
+  } catch (err) {
+    openAIError(res, 502, err.message);
+  }
+}
+
+async function handleModelsInfo(req, res) {
+  if (req.method !== 'GET') return openAIError(res, 405, 'method not allowed', 'invalid_request_error');
+  if (!config.apiKey) return openAIError(res, 400, 'UMANS API key is not configured', 'invalid_request_error');
+  try {
+    const data = await fetchModelInfo({ force: new URL(req.url, 'http://localhost').searchParams.get('force') === '1' });
+    if (!data) return openAIError(res, 502, 'upstream /models/info unavailable');
+    writeJSON(res, 200, data);
+  } catch (err) {
+    openAIError(res, 502, err.message);
+  }
+}
+
+function writeChunk(res, chunk, signal) {
+  if (signal?.aborted) return Promise.reject(new Error('aborted'));
+  if (res.write(chunk)) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      res.off('drain', onDrain);
+      res.off('close', onClose);
+      res.off('error', onError);
+      signal?.removeEventListener('abort', onAbort);
+    };
+    const onDrain = () => { cleanup(); resolve(); };
+    const onClose = () => { cleanup(); resolve(); };
+    const onError = (err) => { cleanup(); reject(err); };
+    const onAbort = () => { cleanup(); reject(new Error('aborted')); };
+    res.once('drain', onDrain);
+    res.once('close', onClose);
+    res.once('error', onError);
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+async function handleChat(req, res) {
+  if (req.method !== 'POST') return openAIError(res, 405, 'method not allowed', 'invalid_request_error');
+  if (!config.apiKey) return openAIError(res, 400, 'UMANS API key is not configured', 'invalid_request_error');
+
+  let text;
+  try { text = await readBody(req); }
+  catch (err) { return openAIError(res, err.statusCode || 400, err.message, 'invalid_request_error'); }
+
+  let payload;
+  try { payload = JSON.parse(text || '{}'); }
+  catch { return openAIError(res, 400, 'request body must be valid JSON', 'invalid_request_error'); }
+
+  if (!payload.model) return openAIError(res, 400, 'model is required', 'invalid_request_error');
+  if (config.enabledModels.length && !config.enabledModels.includes(payload.model)) {
+    return openAIError(res, 400, `model is not enabled: ${payload.model}`, 'invalid_request_error');
+  }
+
+  // Snap reasoning_effort to a level the model actually supports. xhi/xhigh
+  // map to max; values for models that can't disable reasoning are dropped.
+  if (payload.reasoning_effort != null) {
+    await fetchModelInfo();
+    const snapped = snapReasoningLevel(payload.model, payload.reasoning_effort);
+    if (snapped == null) delete payload.reasoning_effort;
+    else payload.reasoning_effort = snapped;
+  }
+  const controller = new AbortController();
+  let closed = res.destroyed;
+  // Telemetry status: done | aborted | error. Set aborted on client close /
+  // timeout, error in catch; defaults to done for normal completion.
+  let sessionStatus = 'done';
+  const onClose = () => { closed = true; sessionStatus = 'aborted'; controller.abort(); };
+  if (closed) { sessionStatus = 'aborted'; controller.abort(); }
+  else res.on('close', onClose);
+
+  try { await acquireThrottleSlot(res, controller.signal); }
+  catch (err) {
+    if (closed) return;
+    return openAIError(res, 503, err.message, 'rate_limit_error');
+  }
+  let timedOut = false;
+  const timeout = setTimeout(() => { timedOut = true; sessionStatus = 'aborted'; controller.abort(); }, config.requestTimeout);
+  // asynchronously (setImmediate drain) and NEVER mutates what the client
+  // receives. Created here so it covers the upstream fetch + streaming.
+  const session = createSession({ model: payload.model, stream: payload.stream });
+  const tap = new ChatTap(session, { stream: payload.stream });
+  broadcastEvent('session', { type: 'start', id: session.id, active: activeRequests, queued: queuedRequests });
+  scheduleSessionsBroadcast();
+
+  try {
+    const upstream = await fetch(upstreamURL('/chat/completions'), {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json', Accept: payload.stream ? 'text/event-stream' : 'application/json' }),
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+    refreshUsageSoon();
+    res.writeHead(upstream.status, safeHeaders(upstream.headers));
+    if (!upstream.body) return res.end();
+
+    const reader = upstream.body.getReader();
+    try {
+      while (!closed) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        // Feed the tap BEFORE writeChunk. onChunk is O(1): it pushes the
+        // buffer onto a queue and schedules an async drain; it does NOT
+        // parse here, so it never delays bytes reaching the client.
+        tap.onChunk(value);
+        await writeChunk(res, value, controller.signal);
+      }
+    } finally {
+      // Always release the upstream reader: on abort/timeout we cancel
+      // promptly, and on stream errors (writeChunk reject) the body would
+      // otherwise linger until upstream GC/timeout.
+      await reader.cancel().catch(() => {});
+    }
+    if (!closed) res.end();
+  } catch (err) {
+    if (!closed) logError('Chat proxy failed', err);
+    if (!res.headersSent && !closed) openAIError(res, timedOut ? 504 : 502, timedOut ? 'upstream request timed out' : err.message);
+    else if (!closed) res.end();
+    sessionStatus = closed || timedOut ? 'aborted' : 'error';
+  }
+  finally {
+    clearTimeout(timeout);
+    res.off('close', onClose);
+    releaseThrottleSlot();
+    // Finalize telemetry. onEnd() is async-safe: if a drain is in flight,
+    // _finish runs when caught up; otherwise it runs now. Never throws.
+    try { tap.onEnd(); } catch {}
+    finalizeSession(session, sessionStatus);
+  }
+}
+
+async function handleConfig(req, res) {
+  if (req.method === 'GET') {
+    return writeJSON(res, 200, {
+      listenAddr: config.listenAddr,
+      upstreamBaseURL: config.upstreamBaseURL,
+      hasApiKey: !!config.apiKey,
+      enabledModels: config.enabledModels,
+      requestTimeout: config.requestTimeoutRaw,
+      overrideConcurrency: config.overrideConcurrency,
+      proxyAuthEnabled: config.proxyApiKeys.length > 0,
+    });
+  }
+
+  if (req.method !== 'POST') return openAIError(res, 405, 'method not allowed', 'invalid_request_error');
+
+  let next;
+  let apiKey = config.apiKey;
+  let fileApiKey = config.fileApiKey;
+  let enabledModels = config.enabledModels;
+  let requestTimeout = config.requestTimeout;
+  let requestTimeoutRaw = config.requestTimeoutRaw;
+  let overrideConcurrency = config.overrideConcurrency;
+  try {
+    next = JSON.parse(await readBody(req) || '{}');
+    if (typeof next.apiKey === 'string' && next.apiKey.trim()) {
+      apiKey = next.apiKey.trim();
+      fileApiKey = apiKey;
+    }
+    if (Array.isArray(next.enabledModels)) enabledModels = next.enabledModels.map((x) => String(x).trim()).filter(Boolean);
+    if (typeof next.requestTimeout === 'string' && next.requestTimeout.trim()) {
+      requestTimeoutRaw = next.requestTimeout.trim();
+      requestTimeout = parseDuration(requestTimeoutRaw);
+    }
+    if (next.overrideConcurrency !== undefined) overrideConcurrency = Math.max(0, Number(next.overrideConcurrency) || 0);
+  } catch (err) {
+    return openAIError(res, err.statusCode || 400, err.message, 'invalid_request_error');
+  }
+
+  const nextConfig = { ...config, apiKey, fileApiKey, enabledModels, requestTimeout, requestTimeoutRaw, overrideConcurrency };
+  saveConfig(nextConfig);
+  config = nextConfig;
+  usageCache = { data: null, time: 0 };
+  concurrencyCache = { concurrent: null, limit: null, softLimit: null, user_id: null, time: 0 };
+  writeJSON(res, 200, { ok: true });
+}
+
+async function handleUsage(req, res) {
+  if (req.method !== 'GET') return openAIError(res, 405, 'method not allowed', 'invalid_request_error');
+  const force = new URL(req.url, 'http://localhost').searchParams.get('force') === '1';
+  writeJSON(res, 200, await fetchUmansUsage({ force }));
+}
+
+async function handleConcurrency(req, res) {
+  if (req.method !== 'GET') return openAIError(res, 405, 'method not allowed', 'invalid_request_error');
+  await fetchUmansUsage();
+  const effective = getEffectiveConcurrency();
+  writeJSON(res, 200, { ...effective, active: activeRequests, queued: queuedRequests });
+}
+
+async function handleSessions(req, res) {
+  if (req.method !== 'GET') return openAIError(res, 405, 'method not allowed', 'invalid_request_error');
+  writeJSON(res, 200, getSessionsSnapshot());
+}
+
+function handleEvents(req, res) {
+  if (req.method !== 'GET') return openAIError(res, 405, 'method not allowed', 'invalid_request_error');
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+  res.write(`event: connected\ndata: ${JSON.stringify({ time: Date.now() })}\n\n`);
+  // Push current sessions so a newly connected dashboard has data immediately.
+  res.write(`event: sessions\ndata: ${JSON.stringify(getSessionsSnapshot())}\n\n`);
+  sseClients.add(res);
+  req.on('close', () => { sseClients.delete(res); });
+}
+async function handleRequest(req, res) {
+  const url = new URL(req.url, 'http://localhost');
+  if (requiresProxyAuth(url.pathname) && !authorized(req, url)) return openAIError(res, 401, 'invalid proxy api key', 'authentication_error');
+  if ((url.pathname === '/' || url.pathname === '/dashboard') && req.method === 'GET') {
+    const file = path.join(__dirname, 'dashboard.html');
+    return writeText(res, 200, fs.readFileSync(file, 'utf8'), 'text/html; charset=utf-8');
+  }
+  if (url.pathname === '/health') return writeJSON(res, 200, { ok: true, upstream: config.upstreamBaseURL, hasApiKey: !!config.apiKey, proxyAuthEnabled: config.proxyApiKeys.length > 0 });
+  if (url.pathname === '/api/events') return handleEvents(req, res);
+  if (url.pathname === '/api/umans/sessions') return handleSessions(req, res);
+  if (url.pathname === '/api/umans/usage') return handleUsage(req, res);
+  if (url.pathname === '/api/umans/concurrency') return handleConcurrency(req, res);
+  if (url.pathname === '/v1/models/info') return handleModelsInfo(req, res);
+  if (url.pathname === '/v1/models') return handleModels(req, res);
+  if (url.pathname.startsWith('/v1/models/')) return handleModels(req, res, decodeURIComponent(url.pathname.slice('/v1/models/'.length)));
+  if (url.pathname === '/v1/chat/completions') return handleChat(req, res);
+  if (url.pathname.startsWith('/v1/')) return openAIError(res, 404, `unsupported endpoint: ${url.pathname}`, 'invalid_request_error');
+  writeText(res, 404, 'Not Found');
+}
+
+let host, port;
+try {
+  ({ host, port } = parseListenAddr(config.listenAddr));
+} catch (err) {
+  console.error(`Startup error: ${err.message}`);
+  process.exit(1);
+}
+const server = http.createServer((req, res) => {
+  handleRequest(req, res).catch((err) => {
+    logError('Request handler failed', err);
+    if (!res.headersSent) openAIError(res, 500, err.message);
+    else res.end();
+  });
+});
+
+server.on('error', (err) => {
+  console.error(`Server error: ${err.message}`);
+  process.exit(1);
+});
+
+function shutdown() {
+  console.log('Shutting down UMANS Proxy');
+  for (const res of sseClients) res.end();
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 2000).unref();
+}
+
+process.once('SIGINT', shutdown);
+process.once('SIGTERM', shutdown);
+
+try {
+  server.listen(port, host, () => {
+    console.log(`UMANS Proxy listening on http://${host}:${port}`);
+    console.log(`Upstream: ${config.upstreamBaseURL}`);
+    console.log(`API key: ${config.apiKey ? 'configured' : 'missing'}`);
+  });
+} catch (err) {
+  console.error(`Startup error: ${err.message}`);
+  process.exit(1);
+}

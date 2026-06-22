@@ -1,0 +1,970 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>UMANS Proxy</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23cc785c'/%3E%3Ctext x='16' y='22' font-family='system-ui,sans-serif' font-size='18' font-weight='700' fill='white' text-anchor='middle'%3EU%3C/text%3E%3C/svg%3E">
+  <script>
+    // Apply theme before first paint to avoid the light→dark flash.
+    try { document.documentElement.setAttribute('data-theme', localStorage.getItem('umans-theme') || 'light'); } catch (e) { document.documentElement.setAttribute('data-theme', 'light'); }
+  </script>
+  <style>
+    /* ---- Anthropic/Claude design language · Material 3 tonal surfaces ---- */
+    :root {
+      color-scheme: light;
+      --bg: #faf9f5;
+      --surface: #ffffff;
+      --surface-2: #f4f3ee;
+      --surface-3: #ecebe3;
+      --text: #1f1e1d;
+      --text-2: #3d3c3a;
+      --muted: #6b6a66;
+      --muted-2: #9c9a92;
+      --line: #e4e2d9;
+      --line-2: #d8d6cc;
+      --good: #2f9e6e;
+      --bad: #c7503f;
+      --warn: #b8862a;
+      --accent: #cc785c;
+      --accent-2: #b5664a;
+      --accent-soft: rgba(204,120,92,.12);
+      --shadow: none;
+      --radius: 4px;
+      --radius-sm: 4px;
+    }
+    [data-theme="dark"] {
+      color-scheme: dark;
+      --bg: #1f1e1d;
+      --surface: #2a2927;
+      --surface-2: #32312e;
+      --surface-3: #3a3935;
+      --text: #f2f0e9;
+      --text-2: #d8d6cd;
+      --muted: #a8a59c;
+      --muted-2: #76746c;
+      --line: #3f3e3a;
+      --line-2: #4a4944;
+      --good: #4cb888;
+      --bad: #e06b5a;
+      --warn: #d4a13d;
+      --accent: #d97757;
+      --accent-2: #c46848;
+      --accent-soft: rgba(217,119,87,.18);
+      --shadow: none;
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; }
+    body {
+      margin: 0;
+      font: 14px/1.6 system-ui, -apple-system, "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      -webkit-font-smoothing: antialiased;
+      transition: background .25s, color .25s;
+    }
+
+    main { width: min(1040px, calc(100% - 48px)); margin: 36px auto 64px; }
+
+    /* ---- header ---- */
+    header { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 20px; flex-wrap: wrap; }
+    .brand { display: flex; align-items: center; gap: 12px; min-width: 0; }
+    .logo {
+      width: 36px; height: 36px; border-radius: var(--radius-sm); flex: none;
+      background: var(--accent); color: #fff;
+      display: grid; place-items: center; font-weight: 700; font-size: 16px;
+    }
+    h1 { margin: 0; font-size: 20px; font-weight: 650; letter-spacing: -0.01em; }
+    .sub { margin: 1px 0 0; color: var(--muted); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .header-actions { display: flex; align-items: center; gap: 8px; flex: none; }
+
+    .seg { display: inline-flex; gap: 0; border: 1px solid var(--line); }
+    .seg button {
+      margin: 0; border: 0; background: transparent; color: var(--muted);
+      padding: 5px 12px; font: inherit; font-size: 12px; font-weight: 600; cursor: pointer; border-radius: 0;
+      transition: background .15s, color .15s; border-right: 1px solid var(--line);
+    }
+    .seg button:last-child { border-right: 0; }
+    .seg button:hover { background: var(--surface-2); color: var(--text); }
+    .seg button[aria-pressed="true"] { background: var(--surface-3); color: var(--text); }
+
+    .badge {
+      display: inline-flex; align-items: center; gap: 7px; font-size: 12px; font-weight: 600; color: var(--muted);
+      white-space: nowrap; line-height: 1;
+    }
+    .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--muted-2); flex: none; }
+    .badge.ok { color: var(--good); }
+    .badge.ok .dot { background: var(--good); }
+    .badge.bad { color: var(--bad); }
+    .badge.bad .dot { background: var(--bad); }
+    .badge.warn { color: var(--warn); }
+    .badge.warn .dot { background: var(--warn); }
+
+    /* ---- tabs ---- */
+    .tabs {
+      display: flex; gap: 0; border-bottom: 1px solid var(--line); margin-bottom: 16px; overflow-x: auto;
+    }
+    .tab {
+      margin: 0; border: 0; background: transparent; color: var(--muted); cursor: pointer;
+      padding: 10px 16px; font: inherit; font-size: 13px; font-weight: 600; border-radius: 0;
+      white-space: nowrap; transition: color .15s; border-bottom: 2px solid transparent; margin-bottom: -1px;
+    }
+    .tab:hover { color: var(--text); }
+    .tab[aria-selected="true"] { color: var(--text); border-bottom-color: var(--accent); }
+    .tabpanel { display: none; }
+    .tabpanel.active { display: block; animation: fade .2s ease; }
+    @keyframes fade { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+
+    /* ---- toolbar ---- */
+    .toolbar {
+      display: flex; align-items: center; gap: 16px; padding: 14px 20px; flex-wrap: wrap;
+      border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); box-shadow: var(--shadow);
+      margin-bottom: 16px;
+    }
+    .toolbar .spacer { flex: 1; }
+    .countdown { color: var(--muted-2); font-size: 12px; font-variant-numeric: tabular-nums; min-width: 100px; font-weight: 500; }
+
+    .switch { display: inline-flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--muted); cursor: pointer; user-select: none; font-weight: 500; }
+    .switch input { display: none; }
+    .switch .track { width: 34px; height: 18px; border-radius: var(--radius-sm); background: var(--surface-3); border: 1px solid var(--line-2); position: relative; transition: background .2s, border-color .2s; }
+    .switch .track::after { content: ""; position: absolute; top: 1px; left: 1px; width: 14px; height: 14px; border-radius: 50%; background: var(--muted); transition: transform .2s, background .2s; }
+    .switch input:checked + .track { background: var(--accent); border-color: var(--accent); }
+    .switch input:checked + .track::after { transform: translateX(16px); background: #fff; }
+
+    /* ---- cards ---- */
+    .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; align-items: start; }
+    section {
+      border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface);
+      padding: 24px; box-shadow: var(--shadow);
+    }
+    section h2 { margin: 0 0 16px; font-size: 14px; font-weight: 650; letter-spacing: .01em; display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+    section h2 .muted { color: var(--muted-2); font-size: 12px; font-weight: 500; }
+
+    label { display: block; margin: 14px 0 5px; color: var(--muted); font-size: 11px; font-weight: 650; letter-spacing: .04em; text-transform: uppercase; }
+    input, textarea {
+      width: 100%; border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--surface-2);
+      color: var(--text); padding: 10px 12px; font: inherit; outline: none; transition: border-color .15s, box-shadow .15s, background .15s;
+    }
+    textarea { min-height: 84px; resize: vertical; }
+    input:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); background: var(--surface); }
+
+    button.btn {
+      border: 0; border-radius: var(--radius-sm); background: var(--accent); color: #fff; padding: 9px 16px;
+      font: inherit; font-weight: 600; cursor: pointer; transition: background .15s, opacity .15s;
+    }
+    button.btn:hover:not(:disabled) { background: var(--accent-2); }
+    button.btn.tonal { background: var(--surface-3); color: var(--text); }
+    button.btn.tonal:hover:not(:disabled) { background: var(--line-2); }
+    button.btn + button.btn, button.btn.tonal + button.btn { margin-left: 8px; }
+    button.btn:disabled { opacity: .5; cursor: progress; }
+    .btn-row { margin-top: 16px; display: flex; gap: 8px; flex-wrap: wrap; }
+    .grow { flex: 1; min-width: 0; }
+    .btn-sm { margin: 0; padding: 6px 12px; font-size: 12px; }
+    .spin { display: inline-block; width: 12px; height: 12px; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: spin .7s linear infinite; vertical-align: -2px; margin-right: 5px; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    ul { padding-left: 18px; margin: 8px 0 0; color: var(--muted); }
+    li { margin: 3px 0; }
+    code { color: var(--accent); font-size: 12.5px; font-weight: 500; }
+    pre {
+      white-space: pre-wrap; word-break: break-word; margin: 14px 0 0; padding: 12px; background: var(--surface-2);
+      border: 1px solid var(--line); border-radius: var(--radius-sm); color: var(--text-2); max-height: 320px; overflow: auto;
+      font-size: 12px; line-height: 1.55;
+    }
+    .full { grid-column: 1 / -1; }
+    .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+
+    /* ---- usage stats ---- */
+    .stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+    .stat { background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 14px 16px; }
+    .stat strong { display: block; font-size: 22px; font-weight: 650; font-variant-numeric: tabular-nums; letter-spacing: -0.02em; margin-bottom: 3px; color: var(--accent); }
+    .stat span { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; font-weight: 600; }
+    .stat .sub { color: var(--muted-2); font-size: 11px; margin-top: 3px; text-transform: none; letter-spacing: 0; font-weight: 400; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .stat .sub.multiline { white-space: normal; overflow: visible; line-height: 1.7; }
+    .stat .sub.multiline > div { display: flex; justify-content: space-between; gap: 8px; }
+
+    .meter { margin: 20px 0 4px; }
+    .meter-track { height: 10px; border-radius: var(--radius-sm); background: var(--surface-3); overflow: hidden; }
+    .meter-fill { height: 100%; border-radius: var(--radius-sm); transition: width .4s cubic-bezier(.2,.7,.3,1), background .3s ease; background: var(--good); }
+    .meter-labels { display: flex; justify-content: space-between; margin-top: 6px; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+    .meter-labels strong { color: var(--text); font-weight: 650; }
+    .livegrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 12px; margin-top: 16px; }
+    .live { background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 14px 12px; text-align: center; }
+    .live strong { display: block; font-size: 22px; font-weight: 650; font-variant-numeric: tabular-nums; color: var(--text); margin-bottom: 3px; }
+    .live span { color: var(--muted); font-size: 10.5px; text-transform: uppercase; letter-spacing: .04em; font-weight: 600; }
+    .live.accent strong { color: var(--accent); }
+
+    /* ---- sessions ---- */
+    .sessions-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 4px; flex-wrap: wrap; }
+    .sessions-head .agg { display: flex; gap: 18px; align-items: baseline; font-variant-numeric: tabular-nums; }
+    .sessions-head .agg strong { font-size: 20px; font-weight: 650; color: var(--accent); }
+    .sessions-head .agg span { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; font-weight: 600; }
+    .sessions-head .agg .pair { display: flex; flex-direction: column; gap: 2px; }
+    .sessiongrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px; margin-top: 16px; }
+    .sessioncard { background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 14px 16px; transition: border-color .15s; position: relative; overflow: hidden; }
+    .sessioncard.active { border-color: var(--accent); }
+    .sessioncard.active::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; background: var(--accent); }
+    .sessioncard.done { opacity: .7; }
+    .sessioncard.aborted { opacity: .6; }
+    .sessioncard.error { border-color: var(--bad); }
+    .sessioncard-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 10px; }
+    .sessioncard-model { font-weight: 650; font-size: 13px; word-break: break-all; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 180px; }
+    .sessioncard-status { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; white-space: nowrap; display: inline-flex; align-items: center; gap: 5px; }
+    .sessioncard-status::before { content: ""; width: 6px; height: 6px; border-radius: 50%; flex: none; }
+    .sessioncard-status.active { color: var(--accent); }
+    .sessioncard-status.active::before { background: var(--accent); }
+    .sessioncard-status.done { color: var(--good); }
+    .sessioncard-status.done::before { background: var(--good); }
+    .sessioncard-status.aborted { color: var(--muted); }
+    .sessioncard-status.aborted::before { background: var(--muted-2); }
+    .sessioncard-status.error { color: var(--bad); }
+    .sessioncard-status.error::before { background: var(--bad); }
+    .sessioncard-tpslabel { color: var(--muted); font-size: 10.5px; text-transform: uppercase; letter-spacing: .04em; font-weight: 600; margin-bottom: 10px; }
+    .sessioncard-meta { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 12px; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+    .sessioncard-meta .k { color: var(--muted-2); }
+    .sessioncard-meta .v { color: var(--text); font-weight: 500; }
+    .sessioncard-id { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 10.5px; color: var(--muted-2); margin-top: 10px; word-break: break-all; }
+
+    .live.warn { border-color: var(--warn); background: transparent; }
+    .live.warn strong { color: var(--warn); }
+    .banner[hidden] { display: none; }
+    .banner {
+      display: inline-flex; align-items: center; gap: 10px; margin-top: 16px; padding: 8px 14px;
+      border-radius: var(--radius-sm); background: transparent; color: var(--warn);
+      border: 1px solid var(--line-2); border-left: 3px solid var(--warn); font-size: 13px; font-weight: 600; width: fit-content;
+    }
+    .banner .spin { border-color: var(--warn); border-right-color: transparent; }
+
+    .chip { font-size: 11.5px; padding: 3px 8px; border-radius: var(--radius-sm); border: 1px solid var(--line); color: var(--muted); font-weight: 600; background: transparent; }
+    .chip.ok { color: var(--good); border-color: var(--line-2); }
+    .chip.warn { color: var(--warn); border-color: var(--line-2); }
+    .chip.bad { color: var(--bad); border-color: var(--line-2); }
+    .icon-warn { font-size: 13px; line-height: 1; }
+    .icon-warn::before { content: "⚠"; }
+
+    .details { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; margin-top: 14px; }
+    .detail-block h3 { margin: 0 0 6px; font-size: 11px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
+    .kv { width: 100%; border-collapse: collapse; }
+    .kv th, .kv td { padding: 3px 0; text-align: left; vertical-align: top; font-size: 12px; }
+    .kv th { color: var(--muted-2); font-weight: 500; padding-right: 12px; white-space: nowrap; }
+    .empty { color: var(--muted-2); padding: 18px; text-align: center; }
+    .kv td .v { font-weight: 600; }
+    .v.num { color: var(--text); }
+    .v.accent { color: var(--accent); }
+    .v.good { color: var(--good); }
+    .v.warn { color: var(--warn); }
+    .v.bad { color: var(--bad); }
+    .v.muted-2 { color: var(--muted-2); font-weight: 400; }
+
+
+    .modelgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 10px; margin-top: 14px; }
+    .modelcard { background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 12px 14px; transition: border-color .15s; }
+    .modelcard:hover { border-color: var(--line-2); }
+    .modelcard.dim { opacity: .55; }
+    .modelcard-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 6px; }
+    .modelname { font-weight: 650; font-size: 13px; word-break: break-all; }
+    .modelcard-meta { display: flex; gap: 10px; flex-wrap: wrap; font-size: 11.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
+
+    .result-msg { background: var(--surface-2); border: 1px solid var(--line); border-left: 3px solid var(--accent); border-radius: var(--radius-sm); padding: 14px 16px; white-space: pre-wrap; word-break: break-word; font-size: 14px; line-height: 1.6; color: var(--text); }
+    .result-reasoning { margin-top: 12px; }
+    .result-reasoning summary { cursor: pointer; color: var(--muted); font-size: 12px; font-weight: 600; padding: 6px 0; }
+    .result-reasoning summary:hover { color: var(--text); }
+    .result-reasoning pre { margin-top: 8px; font-size: 11.5px; max-height: 240px; }
+    .result-meta { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; font-size: 12px; color: var(--muted-2); font-variant-numeric: tabular-nums; }
+    .result-error { background: transparent; border: 1px solid var(--line-2); border-left: 3px solid var(--bad); border-radius: var(--radius-sm); padding: 12px 16px; color: var(--bad); font-size: 13px; }
+    .empty-state { color: var(--muted-2); padding: 28px 18px; text-align: center; font-size: 13px; }
+
+    .footer-note { color: var(--muted-2); font-size: 12px; margin-top: 20px; text-align: center; }
+    .details-wrap { margin-top: 16px; }
+    .details-wrap summary { cursor: pointer; color: var(--muted); font-size: 12px; font-weight: 600; padding: 8px 0; user-select: none; list-style: none; }
+    .details-wrap summary::-webkit-details-marker { display: none; }
+    .details-wrap summary::before { content: "▸"; display: inline-block; margin-right: 8px; transition: transform .15s; }
+    .details-wrap[open] summary::before { transform: rotate(90deg); }
+    .details-wrap summary:hover { color: var(--text); }
+
+
+    @media (max-width: 820px) {
+      header { flex-direction: column; align-items: flex-start; }
+      .grid { display: block; }
+      section, .stat, .toolbar { margin-bottom: 16px; }
+      .stats { grid-template-columns: repeat(2, 1fr); }
+    }
+    @media (max-width: 480px) { .stats, .livegrid { grid-template-columns: 1fr 1fr; } .header-actions { flex-wrap: wrap; } }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div class="brand">
+        <div class="logo">U</div>
+        <div class="brand-text">
+          <h1>UMANS Proxy</h1>
+          <p class="sub" id="planLine">UMANS usage-informed concurrency proxy</p>
+        </div>
+      </div>
+      <div class="header-actions">
+        <div class="seg" role="group" aria-label="Theme">
+          <button id="themeLight" aria-pressed="true">Light</button>
+          <button id="themeDark" aria-pressed="false">Dark</button>
+        </div>
+        <div id="status" class="badge" role="status" aria-live="polite"><span class="dot"></span><span>Checking…</span></div>
+      </div>
+    </header>
+
+    <div class="toolbar full">
+      <div id="usagePill" class="badge"><span class="dot"></span><span>usage—</span></div>
+      <span class="countdown" id="refreshCountdown"></span>
+      <span class="spacer"></span>
+      <button class="btn tonal" id="usageBtn">Refresh now</button>
+    </div>
+
+    <div class="tabs" role="tablist" aria-label="Sections">
+      <button class="tab" role="tab" id="tab-overview" aria-selected="true" aria-controls="panel-overview">Overview</button>
+      <button class="tab" role="tab" id="tab-sessions" aria-selected="false" aria-controls="panel-sessions">Sessions</button>
+      <button class="tab" role="tab" id="tab-test" aria-selected="false" aria-controls="panel-test">Test</button>
+      <button class="tab" role="tab" id="tab-config" aria-selected="false" aria-controls="panel-config">Config</button>
+      <button class="tab" role="tab" id="tab-api" aria-selected="false" aria-controls="panel-api">API</button>
+    </div>
+
+    <!-- Overview: readable info only -->
+    <div id="panel-overview" class="tabpanel active" role="tabpanel" aria-labelledby="tab-overview">
+      <section class="full">
+        <h2>UMANS usage <span class="muted" id="windowLine"></span></h2>
+        <div class="stats">
+          <div class="stat"><strong id="usageRequests">--</strong><span>requests</span><div class="sub" id="usageWindowSub"></div></div>
+          <div class="stat"><strong id="usageTokens">--</strong><span>tokens</span><div class="sub" id="usageTokensSub"></div></div>
+          <div class="stat"><strong id="usageConcurrent">--</strong><span>concurrent</span><div class="sub" id="usageConcSub"></div></div>
+          <div class="stat"><strong id="usageLimit">--</strong><span>limit</span><div class="sub" id="usageLimitSub"></div></div>
+        </div>
+
+        <div class="meter">
+          <div class="meter-track"><div id="concMeter" class="meter-fill" style="width:0%"></div></div>
+          <div class="meter-labels">
+            <span>concurrency <strong id="concUsed">0</strong> / <strong id="concLimit">--</strong></span>
+            <span id="concPct">0%</span>
+          </div>
+        </div>
+
+        <div class="livegrid">
+          <div class="live"><strong id="liveActive">0</strong><span>active (local)</span></div>
+          <div class="live" id="delayedCard"><strong id="liveQueued">0</strong><span>delayed</span></div>
+          <div class="live"><strong id="liveRemaining">--</strong><span>remaining</span></div>
+          <div class="live accent"><strong id="liveTps">0.0</strong><span>tokens/sec</span><div class="sub" id="liveTpsSub" style="text-transform:none;letter-spacing:0;font-weight:400;color:var(--muted-2);font-size:11px;margin-top:3px;">all sessions</div></div>
+          <div class="live"><strong id="liveMedianTps">--</strong><span>median tok/s</span></div>
+          <div class="live"><strong id="liveP10Tps">--</strong><span>p10 low tok/s</span></div>
+        </div>
+
+        <div id="delayBanner" class="banner" role="status" aria-live="polite" hidden><span class="spin"></span><span id="delayBannerText">0 requests delayed — waiting for a concurrency slot</span></div>
+
+        <div class="chips" id="chips"></div>
+        <details id="usageDetails" class="details-wrap"><summary>Raw usage details</summary><div id="usageOut"></div></details>
+      </section>
+    </div>
+
+    <!-- Sessions -->
+    <div id="panel-sessions" class="tabpanel" role="tabpanel" aria-labelledby="tab-sessions">
+      <section class="full">
+        <div class="sessions-head">
+          <h2 style="margin:0;">Sessions</h2>
+          <div class="agg">
+            <div class="pair"><strong id="aggTps">0.0</strong><span>tok/s aggregate</span></div>
+            <div class="pair"><strong id="aggActive">0</strong><span>active</span></div>
+            <div class="pair"><strong id="aggTotal">0</strong><span>total</span></div>
+          </div>
+        </div>
+        <p class="sub" style="margin:4px 0 0;color:var(--muted);font-size:13px;">Per-session tok/s and details for in-flight and recently completed requests.</p>
+        <div class="sessiongrid" id="sessionGrid"></div>
+        <div class="empty-state" id="sessionEmpty">No active sessions. Send a chat request to see live tok/s.</div>
+      </section>
+    </div>
+
+    <!-- Test -->
+    <div id="panel-test" class="tabpanel" role="tabpanel" aria-labelledby="tab-test">
+      <section class="full">
+        <h2>Smoke test</h2>
+        <div class="row">
+          <input id="testModel" class="grow" placeholder="model id (blank = first enabled)">
+          <button class="btn" id="testBtn">Send test</button>
+        </div>
+        <label for="prompt">Prompt</label>
+        <input id="prompt" value="Say OK in one short sentence.">
+        <pre id="testOut"></pre>
+      </section>
+    </div>
+
+    <!-- Config -->
+    <div id="panel-config" class="tabpanel" role="tabpanel" aria-labelledby="tab-config">
+      <section class="full">
+        <h2>Configuration</h2>
+        <label for="proxyKey">Proxy API key</label>
+        <input id="proxyKey" type="password" autocomplete="off" placeholder="Only needed when API_KEYS is configured">
+        <label for="apiKey">UMANS API key</label>
+        <input id="apiKey" type="password" autocomplete="off" placeholder="sk-...">
+        <label for="timeout">Request timeout</label>
+        <input id="timeout" placeholder="15m">
+        <label for="overrideConcurrency">Override concurrency (0 = use UMANS limits)</label>
+        <input id="overrideConcurrency" type="number" min="0" step="1" value="0">
+        <label for="models">Enabled models</label>
+        <textarea id="models" placeholder="One model id per line. Empty exposes upstream models."></textarea>
+        <div class="btn-row">
+          <button class="btn" id="saveBtn">Save</button>
+          <button class="btn tonal" id="reloadBtn">Reload</button>
+        </div>
+        <pre id="configOut"></pre>
+      </section>
+    </div>
+
+    <!-- API -->
+    <div id="panel-api" class="tabpanel" role="tabpanel" aria-labelledby="tab-api">
+      <section class="full">
+        <h2>Endpoints <button class="btn tonal btn-sm" id="modelsBtn">Check models</button></h2>
+        <ul>
+          <li><code>GET /health</code></li>
+          <li><code>GET /api/umans/usage</code></li>
+          <li><code>GET /api/umans/concurrency</code></li>
+          <li><code>GET /api/umans/sessions</code> <span class="muted" style="font-size:11px">live TPS + per-session</span></li>
+          <li><code>GET /v1/models</code></li>
+          <li><code>POST /v1/chat/completions</code></li>
+          <li><code>GET /api/events</code> <span class="muted" style="font-size:11px">SSE stream</span></li>
+        </ul>
+        <pre id="modelsOut"></pre>
+      </section>
+    </div>
+    <p class="footer-note">UMANS Proxy · live updates via SSE; polls every 15s as fallback.</p>
+  </main>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const show = (id, value) => { const el = $(id); if (el) el.textContent = typeof value === 'string' ? value : JSON.stringify(value, null, 2); };
+    let configLoaded = false;
+
+    // ---- theme -------------------------------------------------------------
+    function setTheme(t) {
+      document.documentElement.setAttribute('data-theme', t);
+      $('themeLight').setAttribute('aria-pressed', String(t === 'light'));
+      $('themeDark').setAttribute('aria-pressed', String(t === 'dark'));
+      try { localStorage.setItem('umans-theme', t); } catch {}
+    }
+    (function syncThemeButtons() {
+      const t = document.documentElement.getAttribute('data-theme') || 'light';
+      $('themeLight').setAttribute('aria-pressed', String(t === 'light'));
+      $('themeDark').setAttribute('aria-pressed', String(t === 'dark'));
+    })();
+    $('themeLight').onclick = () => setTheme('light');
+    $('themeDark').onclick = () => setTheme('dark');
+
+    // ---- tabs --------------------------------------------------------------
+    const TABS = ['overview', 'sessions', 'test', 'config', 'api'];
+    function selectTab(name) {
+      TABS.forEach((t) => {
+        const tab = $('tab-' + t), panel = $('panel-' + t);
+        const on = t === name;
+        tab.setAttribute('aria-selected', String(on));
+        tab.tabIndex = on ? 0 : -1;
+        panel.classList.toggle('active', on);
+      });
+      try { localStorage.setItem('umans-tab', name); } catch {}
+    }
+    TABS.forEach((t) => { $('tab-' + t).onclick = () => selectTab(t); });
+    (function initTab() {
+      let t = 'overview';
+      try { t = TABS.includes(localStorage.getItem('umans-tab')) ? localStorage.getItem('umans-tab') : 'overview'; } catch {}
+      selectTab(t);
+    })();
+    document.querySelector('.tabs').addEventListener('keydown', (e) => {
+      if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+      const cur = TABS.findIndex((t) => $('tab-' + t).getAttribute('aria-selected') === 'true');
+      const nxt = e.key === 'ArrowLeft' ? (cur + TABS.length - 1) % TABS.length : (cur + 1) % TABS.length;
+      $('tab-' + TABS[nxt]).focus(); selectTab(TABS[nxt]);
+    });
+
+    let inFlightUsage = false;
+
+    function proxyAuthHeaders() {
+      const key = $('proxyKey')?.value.trim() || sessionStorage.getItem('proxyKey') || '';
+      return key ? { 'x-api-key': key } : {};
+    }
+
+    async function json(path, options = {}) {
+      const headers = { ...proxyAuthHeaders(), ...(options.headers || {}) };
+      const res = await fetch(path, { ...options, headers });
+      const text = await res.text();
+      let body = text;
+      try { body = text ? JSON.parse(text) : null; } catch {}
+      if (!res.ok) throw new Error(body?.error?.message || body?.error || text || res.statusText);
+      return body;
+    }
+
+    function number(value) { const n = Number(value || 0); return Number.isFinite(n) ? n : 0; }
+    function fmt(n) { n = Number(n || 0); return n >= 1000 ? n.toLocaleString() : String(n); }
+    function clampPct(p) { return Math.max(0, Math.min(100, Math.round(p))); }
+    function positive(value) { const n = Number(value); return Number.isFinite(n) && n > 0 ? n : null; }
+
+    function timeUntil(iso) {
+      if (!iso) return '';
+      const ms = new Date(iso).getTime() - Date.now();
+      if (!Number.isFinite(ms) || ms <= 0) return '';
+      const mins = Math.round(ms / 60000);
+      if (mins >= 60) return `${Math.floor(mins / 60)}h ${mins % 60}m`;
+      return `${mins}m`;
+    }
+
+    function setStatus(cls, text) {
+      const s = $('status');
+      s.className = 'badge ' + cls;
+      s.lastElementChild.textContent = text;
+    }
+
+    function updateDelayBanner(queued) {
+      const n = number(queued);
+      $('delayedCard').classList.toggle('warn', n > 0);
+      const banner = $('delayBanner');
+      banner.hidden = n === 0;
+      if (!banner.hidden) $('delayBannerText').textContent = `${fmt(n)} request${n === 1 ? '' : 's'} delayed — waiting for a concurrency slot`;
+    }
+
+    function renderUsage(data) {
+      const usage = data?.usage || {};
+      const limits = data?.limits || {};
+      const throttle = data?.throttle || {};
+      const plan = data?.plan || null;
+      const win = data?.window || {};
+      const conc = limits?.concurrency || {};
+      const concSoft = positive(throttle.soft) ?? throttle.softLimit ?? null;
+      const concHard = positive(throttle.hard);
+      const quotaLimit = positive(throttle.quotaLimit) ?? concSoft;
+      const concLimit = throttle.limit ?? quotaLimit;
+      const upstreamConc = number(usage.concurrent_sessions ?? throttle.concurrent);
+      const localActive = number(throttle.active);
+      const localQueued = number(throttle.queued);
+      const tokensIn = number(usage.tokens_in ?? usage.input_tokens);
+      const tokensOut = number(usage.tokens_out ?? usage.output_tokens);
+      const tokensCached = number(usage.tokens_cached_read ?? usage.tokens_cached ?? usage.cached_tokens);
+
+      $('usageRequests').textContent = fmt(usage.requests_in_window ?? usage.requests ?? usage.request_count);
+      $('usageTokens').textContent = fmt(tokensIn + tokensOut);
+      const uncachedIn = Math.max(0, tokensIn - tokensCached);
+      const total = tokensIn + tokensOut || 1;
+      const cachePct = Math.round((tokensCached / total) * 100);
+      const inPct = Math.round((uncachedIn / total) * 100);
+      const outPct = Math.round((tokensOut / total) * 100);
+      $('usageTokensSub').className = 'sub multiline';
+      $('usageTokensSub').innerHTML = `<div><span>${fmt(tokensCached)} cache</span><span class="v good">${cachePct}%</span></div><div><span>${fmt(uncachedIn)} input</span><span class="v muted-2">${inPct}%</span></div><div><span>${fmt(tokensOut)} output</span><span class="v accent">${outPct}%</span></div>`;
+      $('usageConcurrent').textContent = fmt(upstreamConc);
+      $('usageConcSub').textContent = `${localActive} active · ${localQueued} queued`;
+      $('usageLimit').textContent = concLimit != null ? fmt(concLimit) : '--';
+      const used = Math.max(upstreamConc, localActive);
+      const limitSub = [];
+      if (throttle.overridden) limitSub.push(quotaLimit && quotaLimit !== concLimit ? `overridden from ${fmt(quotaLimit)}` : 'overridden');
+      if (concSoft != null && concSoft !== concLimit) limitSub.push(`soft ${fmt(concSoft)}`);
+      if (concHard != null && concHard !== concLimit) limitSub.push(`hard ${fmt(concHard)}`);
+      if (concHard != null && concSoft != null && concHard > concSoft) {
+        limitSub.push(`burst quota ${Math.round((throttle.burstQuota ?? 0) * 100)}%`);
+      }
+      $('usageLimitSub').textContent = limitSub.join(' · ');
+      $('concUsed').textContent = fmt(used);
+      $('concLimit').textContent = concLimit != null ? fmt(concLimit) : '--';
+      const pct = concLimit ? (used / concLimit) * 100 : 0;
+      const fill = $('concMeter');
+      fill.style.width = clampPct(pct) + '%';
+      // Interpolate between theme --good → --warn → --bad as pct rises.
+      const mix = (c1, c2, t) => c1.map((v, i) => Math.round(v + (c2[i] - v) * t));
+      const hexToRgb = (h) => [1, 3, 5].map((i) => parseInt(h.slice(i, i + 2), 16));
+      const cs = getComputedStyle(document.documentElement);
+      const good = hexToRgb(cs.getPropertyValue('--good').trim());
+      const warn = hexToRgb(cs.getPropertyValue('--warn').trim());
+      const bad = hexToRgb(cs.getPropertyValue('--bad').trim());
+      const p = Math.min(100, Math.max(0, pct)) / 100;
+      const rgb = p < 0.8 ? mix(good, warn, p / 0.8) : mix(warn, bad, (p - 0.8) / 0.2);
+      fill.style.background = `rgb(${rgb[0]}, ${rgb[1]}, ${rgb[2]})`;
+      fill.className = 'meter-fill';
+
+      $('liveActive').textContent = fmt(localActive);
+      $('liveQueued').textContent = fmt(localQueued);
+      $('liveRemaining').textContent = concLimit != null ? fmt(Math.max(0, concLimit - used)) : '--';
+
+      // surface delayed requests prominently
+      updateDelayBanner(localQueued);
+
+      $('windowLine').textContent = win.resets_at ? `resets in ${timeUntil(win.resets_at)}` : '';
+      $('usageWindowSub').textContent = win.remaining_minutes != null ? `window ${win.remaining_minutes}m left` : '';
+      $('planLine').textContent = plan?.display_name ? `${plan.display_name} · UMANS Proxy` : 'UMANS usage-informed concurrency proxy';
+
+      const chips = $('chips'); chips.innerHTML = '';
+      const pri = usage.priority || {};
+      if (pri.low) {
+        const c = document.createElement('span');
+        c.className = 'chip ' + (pri.reason === 'rate_limited' ? 'warn' : 'ok');
+        if (pri.reason === 'rate_limited') {
+          c.innerHTML = `<span class="icon-warn"></span> rate-limited · boxed ${timeUntil(pri.boxed_until) || ''}`.trim();
+        } else {
+          c.textContent = 'low priority';
+        }
+        chips.appendChild(c);
+      }
+      if (throttle.overridden) { const c = document.createElement('span'); c.className = 'chip ok'; c.textContent = `override ${fmt(concLimit)}`; chips.appendChild(c); }
+      if (data?.stale) { const c = document.createElement('span'); c.className = 'chip warn'; c.textContent = 'stale cache'; chips.appendChild(c); }
+
+      const up = $('usagePill');
+      if (data?.ok === false) { up.className = 'badge bad'; up.lastElementChild.textContent = 'usage error'; }
+      else if (data?.stale) { up.className = 'badge warn'; up.lastElementChild.textContent = 'usage stale'; }
+      else { up.className = 'badge ok'; up.lastElementChild.textContent = 'usage live'; }
+
+      renderUsageDetails(data);
+    }
+
+    function renderUsageDetails(data) {
+      const el = $('usageOut');
+      if (!el) return;
+      const usage = data?.usage || {};
+      const limits = data?.limits || {};
+      const win = data?.window || {};
+      const plan = data?.plan || {};
+      const conc = limits?.concurrency || {};
+      const req = limits?.requests || {};
+      const num = (v) => { const n = Number(v); return Number.isFinite(n) ? (n >= 1000 ? n.toLocaleString() : String(n)) : (v ?? '—'); };
+      // value wrappers with color
+      const val = (v, cls = 'v') => `<span class="v ${cls}">${v == null ? '<span class="v muted-2">—</span>' : esc(v)}</span>`;
+      const numv = (v, cls = 'num') => val(num(v), cls);
+      const rows = (items) => items.map(([k, v]) => `<tr><th>${k}</th><td>${v}</td></tr>`).join('');
+      // concurrency color: good under 50%, warn 50-75%, bad 75%+
+      const concCls = (n) => { if (n == null || !conc.limit) return 'num'; const p = n / conc.limit; return p >= 1 ? 'bad' : p >= .75 ? 'bad' : p >= .5 ? 'warn' : 'good'; };
+      el.innerHTML = `
+        <div class="details">
+          ${plan?.display_name ? `<div class="detail-block"><h3>Plan</h3><table class="kv"><tbody>${rows([['name', val(plan.display_name, 'accent')], ['slug', val(plan.slug)]])}</tbody></table></div>` : ''}
+          <div class="detail-block"><h3>Window</h3><table class="kv"><tbody>${rows([
+            ['reset', val(win.resets_at ? timeUntil(win.resets_at) : '—', 'accent')],
+            ['minutes left', numv(win.remaining_minutes)],
+            ['started', val(win.started_at ? new Date(win.started_at).toLocaleString() : '—')],
+          ])}</tbody></table></div>
+          <div class="detail-block"><h3>Requests</h3><table class="kv"><tbody>${rows([
+            ['in window', numv(usage.requests_in_window)],
+            ['weighted', numv(usage.weighted_in_window)],
+            ['remaining', usage.remaining_requests == null ? val('∞', 'good') : numv(usage.remaining_requests, 'good')],
+            ['limit', req.limit == null ? val('∞', 'good') : numv(req.limit)],
+          ])}</tbody></table></div>
+          <div class="detail-block"><h3>Concurrency</h3><table class="kv"><tbody>${rows([
+            ['sessions', numv(usage.concurrent_sessions, concCls(usage.concurrent_sessions))],
+            ['weighted', numv(usage.weighted_concurrent_sessions)],
+            ['limit', numv(conc.limit, 'accent')],
+            ['hard cap', numv(conc.hard_cap)],
+            ['burst', val(conc.burst_pct != null ? `${(conc.burst_pct * 100).toFixed(0)}%` : '—')],
+          ])}</tbody></table></div>
+          <div class="detail-block"><h3>Tokens</h3><table class="kv"><tbody>${rows([
+            ['input', numv(usage.tokens_in, 'accent')],
+            ['output', numv(usage.tokens_out, 'accent')],
+            ['cached', numv(usage.tokens_cached, 'good')],
+          ])}</tbody></table></div>
+          ${usage.priority ? `<div class="detail-block"><h3>Priority</h3><table class="kv"><tbody>${rows([
+            ['low', val(usage.priority.low ? 'yes' : 'no', usage.priority.low ? 'warn' : 'good')],
+            ['boxed until', usage.priority.boxed_until ? `<span class="icon-warn"></span> ${val(new Date(usage.priority.boxed_until).toLocaleString(), 'bad')}` : val('—')],
+            ['reason', val(usage.priority.reason ?? '—', usage.priority.reason ? 'warn' : '')],
+          ])}</tbody></table></div>` : ''}
+        </div>`;
+    }
+
+    function renderModels(data) {
+      const el = $('modelsOut');
+      if (!el) return;
+      const models = Array.isArray(data?.data) ? data.data : [];
+      if (!models.length) { el.innerHTML = '<div class="empty">No models returned.</div>'; return; }
+      const enabled = new Set(($('models').value || '').split(/\r?\n/).map((s) => s.trim()).filter(Boolean));
+      el.innerHTML = `<div class="modelgrid">${models.map((m) => {
+        const ctx = m.context_length ? (m.context_length >= 1024 ? `${Math.round(m.context_length / 1024)}K` : m.context_length) : '—';
+        const p = m.pricing || {};
+        const in$ = p.input != null ? `$${Number(p.input).toFixed(2)}` : null;
+        const out$ = p.output != null ? `$${Number(p.output).toFixed(2)}` : null;
+        const on = enabled.size === 0 || enabled.has(m.id);
+        return `<div class="modelcard${on ? '' : ' dim'}">
+          <div class="modelcard-head"><span class="modelname">${esc(m.id)}</span>${enabled.size ? `<span class="chip ${on ? 'ok' : ''}">${on ? 'enabled' : 'hidden'}</span>` : ''}</div>
+          <div class="modelcard-meta">
+            <span>${ctx} ctx</span>${in$ ? `<span>in ${in$}</span>` : ''}${out$ ? `<span>out ${out$}</span>` : ''}<span>${esc(m.owned_by ?? '—')}</span>
+          </div>
+        </div>`;
+      }).join('')}</div>`;
+    }
+
+    function esc(s) { return String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
+
+    function renderTestResult(data) {
+      const el = $('testOut');
+      if (!el) return;
+      if (data?.error) { el.innerHTML = `<div class="result-error">${esc(data.error.message || data.error)}</div>`; return; }
+      const choice = data?.choices?.[0];
+      const msg = choice?.message || {};
+      const usage = data?.usage || {};
+      const tokens = usage.completion_tokens_details || {};
+      el.innerHTML = `
+        ${msg.content ? `<div class="result-msg">${esc(msg.content)}</div>` : ''}
+        ${msg.reasoning_content ? `<details class="result-reasoning"><summary>Reasoning (${tokens.reasoning_tokens ?? '?'} tok)</summary><pre>${esc(msg.reasoning_content)}</pre></details>` : ''}
+        <div class="result-meta">
+          <span>${esc(data.model ?? '—')}</span>
+          ${choice?.finish_reason ? `<span>· ${esc(choice.finish_reason)}</span>` : ''}
+          ${usage.prompt_tokens != null ? `<span>· ${usage.prompt_tokens} in / ${usage.completion_tokens ?? 0} out</span>` : ''}
+          ${tokens.text_tokens != null ? `<span>· ${tokens.text_tokens} text tok</span>` : ''}
+        </div>`;
+    }
+
+    function renderConfig(config) {
+      const el = $('configOut');
+      if (!el) return;
+      const kv = (rows) => rows.map(([k, v]) => `<tr><th>${k}</th><td>${v ?? '—'}</td></tr>`).join('');
+      const bool = (v) => v ? 'yes' : 'no';
+      el.innerHTML = `<div class="details"><div class="detail-block"><h3>Live config</h3><table class="kv"><tbody>${kv([
+        ['listen addr', esc(config.listenAddr ?? '—')],
+        ['upstream', esc(config.upstreamBaseURL ?? '—')],
+        ['api key', config.hasApiKey ? 'configured' : 'missing'],
+        ['proxy auth', bool(config.proxyAuthEnabled)],
+        ['timeout', esc(config.requestTimeout ?? '—')],
+        ['override concurrency', config.overrideConcurrency ?? 0],
+        ['enabled models', (config.enabledModels?.length ? config.enabledModels : []).join(', ') || 'all (no filter)'],
+      ])}</tbody></table></div></div>`;
+    }
+
+    // ---- sessions + TPS ----------------------------------------------------
+    let lastSessionsData = null;
+    let sessionsTimer = null;
+
+    function fmtTps(n) { n = Number(n || 0); return (n >= 100 ? Math.round(n) : n.toFixed(1)); }
+    function fmtElapsed(ms) {
+      ms = Math.max(0, Number(ms || 0));
+      const s = Math.floor(ms / 1000);
+      if (s < 60) return s + 's';
+      const m = Math.floor(s / 60);
+      return m + 'm ' + (s % 60) + 's';
+    }
+    function fmtBytes(n) {
+      n = Number(n || 0);
+      if (n < 1024) return n + ' B';
+      if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
+      return (n / 1048576).toFixed(1) + ' MB';
+    }
+
+    function sessionCardHtml(s) {
+      const statusCls = s.status || 'active';
+      const cardCls = s.active ? 'active' : statusCls;
+      const tpsLabel = s.exactTokens ? 'tok/s (exact)' : 'tok/s (est.)';
+      const cacheRate = s.cacheHitRate != null ? s.cacheHitRate + '%' : '—';
+      const cacheCls = s.cacheHitRate == null ? '' : s.cacheHitRate >= 50 ? 'good' : s.cacheHitRate > 0 ? 'warn' : '';
+      return `<div class="sessioncard ${cardCls}">
+        <div class="sessioncard-head">
+          <span class="sessioncard-model" title="${esc(s.model)}">${esc(s.model)}</span>
+          <span class="sessioncard-status ${statusCls}">${esc(statusCls)}</span>
+        </div>
+        <div class="sessioncard-tps">${fmtTps(s.tps)}<span class="unit">tok/s</span></div>
+        <div class="sessioncard-tpslabel">${tpsLabel}</div>
+        <div class="sessioncard-meta">
+          <span class="k">input cached</span><span class="v">${fmt(s.cachedTokens)}</span>
+          <span class="k">input new</span><span class="v">${fmt(s.uncachedTokens)}</span>
+          <span class="k">output</span><span class="v">${fmt(s.completionTokens)}</span>
+          <span class="k">cache hit</span><span class="v ${cacheCls}">${cacheRate}</span>
+          <span class="k">elapsed</span><span class="v">${fmtElapsed(s.elapsedMs)}</span>
+          <span class="k">mode</span><span class="v">${s.stream ? 'stream' : 'sync'}</span>
+          <span class="k">bytes</span><span class="v">${fmtBytes(s.bytes)}</span>
+        </div>
+        <div class="sessioncard-id">${esc(s.id)}</div>
+      </div>`;
+    }
+
+    function renderAggregate(agg) {
+      if ($('liveTps')) $('liveTps').textContent = fmtTps(agg.tps);
+      if ($('liveMedianTps')) $('liveMedianTps').textContent = agg.medianTps != null ? fmtTps(agg.medianTps) : '--';
+      if ($('liveP10Tps')) $('liveP10Tps').textContent = agg.p10Tps != null ? fmtTps(agg.p10Tps) : '--';
+      if ($('aggTps')) $('aggTps').textContent = fmtTps(agg.tps);
+      if ($('aggActive')) $('aggActive').textContent = fmt(agg.activeSessions ?? 0);
+      if ($('aggTotal')) $('aggTotal').textContent = fmt(agg.totalSessions ?? 0);
+      renderModelTps(agg.models || []);
+    }
+
+    function renderSessions(data) {
+      lastSessionsData = data;
+      const grid = $('sessionGrid');
+      const empty = $('sessionEmpty');
+      if (!grid) return;
+      const list = data?.sessions || [];
+      const agg = data?.aggregate || {};
+      renderAggregate(agg);
+      if (!list.length) {
+        grid.innerHTML = '';
+        if (empty) empty.style.display = '';
+      } else {
+        if (empty) empty.style.display = 'none';
+        grid.innerHTML = list.map(sessionCardHtml).join('');
+      }
+      scheduleSessionsTimer();
+    }
+
+    // Overview: per-model TPS breakdown. Only surfaces models we have actually
+    // used (server-side seenModels). Rendered as chips beneath the livegrid.
+    function renderModelTps(models) {
+      let el = $('modelTpsRow');
+      if (!el) {
+        // Lazily create the container if not present yet.
+        const livegrid = document.querySelector('#panel-overview .livegrid');
+        if (!livegrid) return;
+        el = document.createElement('div');
+        el.id = 'modelTpsRow';
+        el.className = 'chips';
+        el.style.marginTop = '16px';
+        livegrid.parentNode.insertBefore(el, livegrid.nextSibling);
+      }
+      const used = models.filter((m) => m.tps > 0 || lastSessionsData?.sessions?.some((s) => s.model === m.model && s.active));
+      if (!used.length) { el.innerHTML = ''; return; }
+      el.innerHTML = used.map((m) => `<span class="chip ${m.tps > 0 ? 'ok' : ''}">${esc(m.model)} · ${fmtTps(m.tps)} tok/s</span>`).join('');
+    }
+
+    // Local timer: between SSE updates, re-render with a smooth TPS decay.
+    // The server pushes ~1/sec; this keeps the numbers feeling live at 2fps.
+    function scheduleSessionsTimer() {
+      const hasActive = lastSessionsData?.sessions?.some((s) => s.active);
+      if (hasActive && !sessionsTimer) {
+        sessionsTimer = setInterval(() => {
+          if (!lastSessionsData) return;
+          // Refresh elapsed times; TPS values come from the server's rolling
+          // window so we just re-render the last snapshot with updated elapsed.
+          const data = lastSessionsData;
+          const now = Date.now();
+          data.sessions = data.sessions.map((s) => ({
+            ...s,
+            elapsedMs: s.active ? (now - new Date(s.startedAt).getTime()) : s.elapsedMs,
+          }));
+          renderSessionsInner(data);
+        }, 500);
+      } else if (!hasActive && sessionsTimer) {
+        clearInterval(sessionsTimer);
+        sessionsTimer = null;
+      }
+    }
+    // Inner render without re-scheduling (avoids timer recursion).
+    function renderSessionsInner(data) {
+      const grid = $('sessionGrid');
+      if (!grid) return;
+      const list = data?.sessions || [];
+      const agg = data?.aggregate || {};
+      renderAggregate(agg);
+      if (!list.length) { if ($('sessionEmpty')) $('sessionEmpty').style.display = ''; return; }
+      if ($('sessionEmpty')) $('sessionEmpty').style.display = 'none';
+      grid.innerHTML = list.map(sessionCardHtml).join('');
+    }
+
+    async function refreshUsage(force = false) {
+      if (inFlightUsage) return;
+      inFlightUsage = true;
+      const btn = $('usageBtn');
+      const old = btn.innerHTML; btn.disabled = true; btn.innerHTML = '<span class="spin"></span>Refreshing';
+      try {
+        const data = await json('/api/umans/usage' + (force ? '?force=1' : ''));
+        renderUsage(data);
+      } catch (err) {
+        show('usageOut', err.message);
+        const up = $('usagePill'); up.className = 'badge bad'; up.lastElementChild.textContent = 'usage error';
+      } finally {
+        btn.disabled = false; btn.innerHTML = old; inFlightUsage = false;
+      }
+    }
+
+    function tickCountdown() {
+      $('refreshCountdown').textContent = sseConnected ? 'live' : 'connecting…';
+    }
+
+    // ---- config / models / smoke -------------------------------------------
+    async function refresh() {
+      try {
+        const [health, config, sessionsData] = await Promise.all([json('/health'), json('/api/config').catch(() => null), json('/api/umans/sessions').catch(() => null)]);
+        setStatus(health.ok ? 'ok' : 'warn', health.ok ? 'Online' : 'Degraded');
+        if (config) {
+          $('apiKey').placeholder = config.hasApiKey ? 'Configured; leave blank to keep' : 'sk-...';
+          $('timeout').value = config.requestTimeout || '15m';
+          $('overrideConcurrency').value = config.overrideConcurrency || 0;
+          $('models').value = (config.enabledModels || []).join('\n');
+          renderConfig(config);
+        }
+        if ($('proxyKey').value.trim()) sessionStorage.setItem('proxyKey', $('proxyKey').value.trim());
+        configLoaded = true;
+        if (sessionsData) renderSessions(sessionsData);
+        refreshUsage(false);
+      } catch (err) {
+        setStatus('bad', err.message === 'invalid proxy api key' ? 'Auth required' : 'Offline');
+        show('configOut', err.message);
+      }
+    }
+
+    async function save() {
+      $('saveBtn').disabled = true;
+      try {
+        const payload = {
+          requestTimeout: $('timeout').value.trim(),
+          overrideConcurrency: Number($('overrideConcurrency').value || 0)
+        };
+        if (configLoaded) payload.enabledModels = $('models').value.split(/\r?\n/).map(x => x.trim()).filter(Boolean);
+        if ($('apiKey').value.trim()) payload.apiKey = $('apiKey').value.trim();
+        if ($('proxyKey').value.trim()) sessionStorage.setItem('proxyKey', $('proxyKey').value.trim());
+        renderConfig(await json('/api/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) }));
+        await refresh();
+      } catch (err) { show('configOut', err.message); }
+      finally { $('saveBtn').disabled = false; }
+    }
+
+    async function checkModels() {
+      $('modelsBtn').disabled = true;
+      try { renderModels(await json('/v1/models')); }
+      catch (err) { show('modelsOut', err.message); }
+      finally { $('modelsBtn').disabled = false; }
+    }
+    async function testChat() {
+      $('testBtn').disabled = true;
+      await refreshUsage(true);
+      try {
+        const model = $('testModel').value.trim() || $('models').value.split(/\r?\n/).map(x => x.trim()).filter(Boolean)[0];
+        if (!model) throw new Error('Enter a model id first.');
+        const body = { model, stream: false, messages: [{ role: 'user', content: $('prompt').value }] };
+        renderTestResult(await json('/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }));
+      } catch (err) { show('testOut', err.message); }
+      finally { $('testBtn').disabled = false; await refreshUsage(true); }
+    }
+
+    // ---- wiring ------------------------------------------------------------
+    $('saveBtn').onclick = save;
+    $('reloadBtn').onclick = refresh;
+    $('modelsBtn').onclick = checkModels;
+    $('usageBtn').onclick = () => refreshUsage(true);
+    $('testBtn').onclick = testChat;
+
+    // ---- SSE: live updates from the proxy ---------------------------------
+    let sse = null;
+    let sseConnected = false;
+    function connectSSE() {
+      const key = $('proxyKey')?.value.trim() || sessionStorage.getItem('proxyKey') || '';
+      const qs = key ? `?key=${encodeURIComponent(key)}` : '';
+      sse = new EventSource('/api/events' + qs);
+      sse.addEventListener('open', () => { sseConnected = true; tickCountdown(); });
+      sse.addEventListener('connected', () => { sseConnected = true; tickCountdown(); });
+      sse.addEventListener('usage', (e) => {
+        try { renderUsage(JSON.parse(e.data)); } catch {}
+      });
+      sse.addEventListener('session', (e) => {
+        try {
+          const d = JSON.parse(e.data);
+          $('liveActive').textContent = fmt(d.active ?? 0);
+          $('liveQueued').textContent = fmt(d.queued ?? 0);
+          updateDelayBanner(d.queued ?? 0);
+        } catch {}
+      });
+      sse.addEventListener('sessions', (e) => {
+        try { renderSessions(JSON.parse(e.data)); } catch {}
+      });
+      sse.addEventListener('error', () => {
+        sseConnected = false;
+        tickCountdown();
+        try { sse.close(); } catch {}
+        sse = null;
+        setTimeout(connectSSE, 5000);
+      });
+    }
+    connectSSE();
+
+    refresh();
+    tickCountdown();
+  </script>
+</body>
+</html>

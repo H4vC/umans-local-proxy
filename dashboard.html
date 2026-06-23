@@ -925,7 +925,7 @@
             if (summary) group.summary = summary;
           }
           // Also show summary-only groups (all sessions expired but conversation
-          // is still within the 5-min TTL). Sort by lastSeenAt desc.
+          // is still within the 1h TTL). Sort by lastSeenAt desc.
           for (const [key, summary] of summaries) {
             if (!groups.has(key)) groups.set(key, { groupKey: key, sessions: [], summary });
           }

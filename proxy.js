@@ -49,7 +49,7 @@ function logCoalesce(entry) {
 // aggregate stats even when older sessions have been cleaned up. Keyed by
 // groupKey; entries expire after GROUP_SUMMARY_TTL_MS of inactivity.
 const groupSummaries = new Map();
-const GROUP_SUMMARY_TTL_MS = 5 * 60 * 1000; // match COALESCE_TTL_MS
+const GROUP_SUMMARY_TTL_MS = 60 * 60 * 1000; // match COALESCE_TTL_MS (1h idle window)
 let sessionsBroadcastTimer = null;
 let broadcastThrottled = false;
 const SESSION_BROADCAST_MIN_MS = 1000;
@@ -87,7 +87,7 @@ function updateModelRatio(model, chars, tokens) {
 // cache avoids re-hashing large system prompts on every turn.
 const messageHashCache = new Map(); // JSON.stringify(message) -> fnv1a hex
 const stateMap = new Map();         // chainHash -> groupKey (logical session)
-const COALESCE_TTL_MS = 5 * 60 * 1000; // match upstream cache lifetime
+const COALESCE_TTL_MS = 60 * 60 * 1000; // evict chain nodes after 1h idle; telemetry-only (independent of upstream prompt cache)
 
 // FNV-1a 32-bit. Returns hex string. ~1ns/byte, no allocation beyond output.
 function fnv1a(str) {
@@ -248,8 +248,9 @@ function finalizeSession(session, status) {
   }
   updateGroupSummary(session);
   // Keep the entry so the dashboard can show completed sessions and group
-  // multi-turn conversations. 120s covers typical inter-turn gaps; the
-  // stateMap (5 min TTL) handles prefix→groupKey coalescing independently.
+  // multi-turn conversations. 120s is a display-freshness window for the
+  // individual entry; coalescing (groupKey linkage) lives in the stateMap
+  // and groupSummaries, both with a 1h idle TTL.
   setTimeout(() => { sessions.delete(session.id); scheduleSessionsBroadcast(); }, 120000);
   scheduleSessionsBroadcast();
 }

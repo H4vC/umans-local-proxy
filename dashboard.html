@@ -413,6 +413,7 @@
     <div id="panel-config" class="tabpanel" role="tabpanel" aria-labelledby="tab-config">
       <section class="full">
         <h2>Configuration</h2>
+        <p class="sub" style="margin:0 0 12px;color:var(--muted);font-size:13px;">Both backend shapes are always live: <code>POST /v1/chat/completions</code> (OpenAI, <code>Authorization: Bearer</code>) and <code>POST /v1/messages</code> (Anthropic, <code>x-api-key</code>). Point your client at whichever it speaks — no toggle needed.</p>
         <label for="proxyKey">Proxy API key</label>
         <input id="proxyKey" type="password" autocomplete="off" placeholder="Only needed when API_KEYS is configured">
         <label for="apiKey">UMANS API key</label>
@@ -441,7 +442,8 @@
           <li><code>GET /api/umans/concurrency</code></li>
           <li><code>GET /api/umans/sessions</code> <span class="muted" style="font-size:11px">live TPS + per-session</span></li>
           <li><code>GET /v1/models</code></li>
-          <li><code>POST /v1/chat/completions</code></li>
+          <li><code>POST /v1/chat/completions</code> <span class="muted" style="font-size:11px">OpenAI shape</span></li>
+          <li><code>POST /v1/messages</code> <span class="muted" style="font-size:11px">Anthropic shape</span></li>
           <li><code>GET /api/events</code> <span class="muted" style="font-size:11px">SSE stream</span></li>
           <li><code>GET /api/system/info</code> <span class="muted" style="font-size:11px">pid, uptime</span></li>
           <li><code>POST /api/restart</code> · <code>POST /api/clear-state</code> · <code>POST /api/shutdown</code></li>
@@ -765,16 +767,22 @@
         </div>`;
     }
 
-    function renderConfig(config) {
+    function renderConfig(config, routes) {
       const el = $('configOut');
       if (!el) return;
       const kv = (rows) => rows.map(([k, v]) => `<tr><th>${k}</th><td>${v ?? '—'}</td></tr>`).join('');
       const bool = (v) => v ? 'yes' : 'no';
+      // Both backend shapes are always available (dual passthrough); show
+      // which routes are live so users know where to point their client.
+      const routeStr = (routes && routes.length)
+        ? routes.map((r) => `<code>${esc(r)}</code>`).join(' · ')
+        : '<code>/v1/chat/completions</code> · <code>/v1/messages</code>';
       el.innerHTML = `<div class="details"><div class="detail-block"><h3>Live config</h3><table class="kv"><tbody>${kv([
         ['listen addr', esc(config.listenAddr ?? '—')],
         ['upstream', esc(config.upstreamBaseURL ?? '—')],
         ['api key', config.hasApiKey ? 'configured' : 'missing'],
         ['proxy auth', bool(config.proxyAuthEnabled)],
+        ['backend routes', routeStr],
         ['timeout', esc(config.requestTimeout ?? '—')],
         ['override concurrency', config.overrideConcurrency ?? 0],
         ['enabled models', (config.enabledModels?.length ? config.enabledModels : []).join(', ') || 'all (no filter)'],
@@ -1115,13 +1123,12 @@
     async function refresh() {
       try {
         const [health, config, sessionsData] = await Promise.all([json('/health'), json('/api/config').catch(() => null), json('/api/umans/sessions').catch(() => null)]);
-        setStatus(health.ok ? 'ok' : 'warn', health.ok ? 'Online' : 'Degraded');
         if (config) {
           $('apiKey').placeholder = config.hasApiKey ? 'Configured; leave blank to keep' : 'sk-...';
           $('timeout').value = config.requestTimeout || '15m';
           $('overrideConcurrency').value = config.overrideConcurrency || 0;
           $('models').value = (config.enabledModels || []).join('\n');
-          renderConfig(config);
+          renderConfig(config, health.routes);
         }
         if ($('proxyKey').value.trim()) sessionStorage.setItem('proxyKey', $('proxyKey').value.trim());
         configLoaded = true;

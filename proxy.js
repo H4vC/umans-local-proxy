@@ -445,9 +445,10 @@ function scheduleSessionsBroadcast() {
 // happens in _drain(), which runs between I/O ticks (during the next
 // reader.read() await), so telemetry never delays bytes reaching the client.
 class ChatTap {
-  constructor(session, { stream, onFinalize }) {
+  constructor(session, { stream, onFinalize, shape = 'openai' }) {
     this.session = session;
     this.stream = stream;
+    this.shape = shape; // 'openai' | 'anthropic'
     this.onFinalize = onFinalize || null; // called from _finish after responseContent is set
     this.lineBuf = '';     // partial SSE line buffer
     this.bodyBuf = [];     // non-streaming: full body chunks
@@ -496,6 +497,8 @@ class ChatTap {
     if (!data || data === '[DONE]') return;
     let chunk;
     try { chunk = JSON.parse(data); } catch { return; }
+    if (this.shape === 'anthropic') return this._handleAnthropicEvent(chunk);
+    // ---- OpenAI shape ----
     // Exact usage on the final chunk (some providers include it). Once we
     // have an exact count, stop estimating from chars.
     const u = chunk?.usage;
@@ -539,6 +542,57 @@ class ChatTap {
       this.session.outputTokens = estimateTokensFromChars(this.session.model, this.session.chars);
     }
   }
+  // ---- Anthropic Messages shape ----
+  // Stream events: message_start (input usage), content_block_delta (text/thinking),
+  // message_delta (final output_tokens). Non-streaming handled in _finish.
+  _handleAnthropicEvent(chunk) {
+    const type = chunk?.type;
+    if (type === 'message_start') {
+      const u = chunk?.message?.usage;
+      if (u) {
+        this.session.promptTokens = Number(u.input_tokens ?? 0) || 0;
+        this.session.cachedTokens = Number(u.cache_read_input_tokens ?? 0) || 0;
+      }
+      return;
+    }
+    if (type === 'message_delta') {
+      // Final token counts arrive here. message_start reports input_tokens
+      // as 0; the authoritative counts come in this event's usage.
+      const u = chunk?.usage;
+      if (u && u.output_tokens != null) {
+        const t = Number(u.output_tokens) || 0;
+        const prev = this.session.outputTokens;
+        this.session.outputTokens = t;
+        this.session.completionTokens = t;
+        this.session.exactTokens = true;
+        // input_tokens may be 0 at message_start and finalized here.
+        if (u.input_tokens != null) {
+          this.session.promptTokens = Number(u.input_tokens) || 0;
+          this.session.cachedTokens = Number(u.cache_read_input_tokens ?? 0) || 0;
+        }
+        updateModelRatio(this.session.model, this.session.chars, t);
+        addSessionTokens(this.session, Math.max(0, t - prev), { exact: true });
+      }
+      return;
+    }
+    if (this.session.exactTokens) return;
+    // Interim: accumulate chars from text/thinking deltas for the live estimate.
+    if (type === 'content_block_delta') {
+      const delta = chunk?.delta || {};
+      let chars = 0;
+      if (delta.type === 'text_delta' && typeof delta.text === 'string') {
+        chars += delta.text.length;
+        this.session.responseContent += delta.text;
+      } else if (delta.type === 'thinking_delta' && typeof delta.thinking === 'string') {
+        chars += delta.thinking.length;
+      }
+      if (chars > 0) {
+        if (!this.session.firstTokenAt) this.session.firstTokenAt = Date.now();
+        this.session.chars += chars;
+        this.session.outputTokens = estimateTokensFromChars(this.session.model, this.session.chars);
+      }
+    }
+  }
 
   onEnd() {
     if (!this.session) return;
@@ -564,52 +618,8 @@ class ChatTap {
       const text = Buffer.concat(this.bodyBuf).toString('utf8');
       try {
         const body = JSON.parse(text);
-        const u = body?.usage;
-        if (u && (u.completion_tokens != null || u.output_tokens != null)) {
-          // Replace any estimate with the exact count from the final body.
-          const exact = Number(u.completion_tokens ?? u.output_tokens ?? 0) || 0;
-          const prev = this.session.outputTokens;
-          this.session.outputTokens = exact;
-          this.session.completionTokens = exact;
-          this.session.exactTokens = true;
-          const prompt = Number(u.prompt_tokens ?? u.input_tokens ?? 0) || 0;
-          const cached = Number(u.prompt_tokens_details?.cached_tokens ?? u.cached_tokens ?? u.tokens_cached_read ?? 0) || 0;
-          this.session.promptTokens = prompt;
-          this.session.cachedTokens = cached;
-          // Learn the real char→token ratio for this model from exact data.
-          updateModelRatio(this.session.model, this.session.chars, exact);
-          // Accumulate response content for coalescing (non-streaming).
-          const choices = body?.choices;
-          if (Array.isArray(choices)) {
-            for (const c of choices) {
-              const msg = c?.message || {};
-              if (typeof msg.content === 'string') this.session.responseContent += msg.content;
-            }
-          }
-          addSessionTokens(this.session, Math.max(0, exact - prev), { exact: true });
-        } else {
-          // No usage block: estimate from total content chars and feed the
-          // bucket once at finish time (interim never touched it).
-          let chars = 0;
-          const choices = body?.choices;
-          if (Array.isArray(choices)) {
-            for (const c of choices) {
-              const msg = c?.message || {};
-              if (typeof msg.content === 'string') {
-                chars += msg.content.length;
-                this.session.responseContent += msg.content;
-              }
-              if (typeof msg.reasoning_content === 'string') chars += msg.reasoning_content.length;
-            }
-          }
-          if (chars > 0) {
-            this.session.chars += chars;
-            const est = estimateTokensFromChars(this.session.model, this.session.chars);
-            const prev = this.session.outputTokens;
-            this.session.outputTokens = est;
-            addSessionTokens(this.session, Math.max(0, est - prev));
-          }
-        }
+        if (this.shape === 'anthropic') this._finishAnthropicBody(body);
+        else this._finishOpenAIBody(body);
       } catch { /* non-JSON or partial — ignore */ }
     }
     // Coalesce: store the conversation state now that responseContent is
@@ -618,6 +628,95 @@ class ChatTap {
     if (this.onFinalize) { try { this.onFinalize(this.session); } catch {} }
     // Clear ref so finalize is idempotent.
     this.session = null;
+  }
+  // Non-streaming OpenAI body: extract exact usage + content from choices.
+  _finishOpenAIBody(body) {
+    const u = body?.usage;
+    if (u && (u.completion_tokens != null || u.output_tokens != null)) {
+      const exact = Number(u.completion_tokens ?? u.output_tokens ?? 0) || 0;
+      const prev = this.session.outputTokens;
+      this.session.outputTokens = exact;
+      this.session.completionTokens = exact;
+      this.session.exactTokens = true;
+      const prompt = Number(u.prompt_tokens ?? u.input_tokens ?? 0) || 0;
+      const cached = Number(u.prompt_tokens_details?.cached_tokens ?? u.cached_tokens ?? u.tokens_cached_read ?? 0) || 0;
+      this.session.promptTokens = prompt;
+      this.session.cachedTokens = cached;
+      updateModelRatio(this.session.model, this.session.chars, exact);
+      const choices = body?.choices;
+      if (Array.isArray(choices)) {
+        for (const c of choices) {
+          const msg = c?.message || {};
+          if (typeof msg.content === 'string') this.session.responseContent += msg.content;
+        }
+      }
+      addSessionTokens(this.session, Math.max(0, exact - prev), { exact: true });
+    } else {
+      // No usage block: estimate from total content chars and feed the
+      // bucket once at finish time (interim never touched it).
+      let chars = 0;
+      const choices = body?.choices;
+      if (Array.isArray(choices)) {
+        for (const c of choices) {
+          const msg = c?.message || {};
+          if (typeof msg.content === 'string') {
+            chars += msg.content.length;
+            this.session.responseContent += msg.content;
+          }
+          if (typeof msg.reasoning_content === 'string') chars += msg.reasoning_content.length;
+        }
+      }
+      if (chars > 0) {
+        this.session.chars += chars;
+        const est = estimateTokensFromChars(this.session.model, this.session.chars);
+        const prev = this.session.outputTokens;
+        this.session.outputTokens = est;
+        addSessionTokens(this.session, Math.max(0, est - prev));
+      }
+    }
+  }
+  // Non-streaming Anthropic body: usage at top level, content is a block array.
+  _finishAnthropicBody(body) {
+    const u = body?.usage;
+    if (u && u.output_tokens != null) {
+      const exact = Number(u.output_tokens) || 0;
+      const prev = this.session.outputTokens;
+      this.session.outputTokens = exact;
+      this.session.completionTokens = exact;
+      this.session.exactTokens = true;
+      this.session.promptTokens = Number(u.input_tokens ?? 0) || 0;
+      this.session.cachedTokens = Number(u.cache_read_input_tokens ?? 0) || 0;
+      updateModelRatio(this.session.model, this.session.chars, exact);
+      // Accumulate text blocks for coalescing (skip thinking blocks).
+      const blocks = body?.content;
+      if (Array.isArray(blocks)) {
+        for (const b of blocks) {
+          if (b?.type === 'text' && typeof b.text === 'string') this.session.responseContent += b.text;
+        }
+      }
+      addSessionTokens(this.session, Math.max(0, exact - prev), { exact: true });
+    } else {
+      // No usage: estimate from text block chars.
+      let chars = 0;
+      const blocks = body?.content;
+      if (Array.isArray(blocks)) {
+        for (const b of blocks) {
+          if (b?.type === 'text' && typeof b.text === 'string') {
+            chars += b.text.length;
+            this.session.responseContent += b.text;
+          } else if (b?.type === 'thinking' && typeof b.thinking === 'string') {
+            chars += b.thinking.length;
+          }
+        }
+      }
+      if (chars > 0) {
+        this.session.chars += chars;
+        const est = estimateTokensFromChars(this.session.model, this.session.chars);
+        const prev = this.session.outputTokens;
+        this.session.outputTokens = est;
+        addSessionTokens(this.session, Math.max(0, est - prev));
+      }
+    }
   }
 }
 
@@ -743,9 +842,15 @@ function upstreamURL(suffix) {
   return `${config.upstreamBaseURL}${suffix}`;
 }
 
-function authHeaders(extra = {}) {
+function authHeaders(extra = {}, { anthropic = false } = {}) {
   const headers = { ...extra };
-  if (config.apiKey) headers.Authorization = `Bearer ${config.apiKey}`;
+  if (anthropic) {
+    // Anthropic Messages API: x-api-key + version header. No Bearer.
+    if (config.apiKey) headers['x-api-key'] = config.apiKey;
+    headers['anthropic-version'] = '2023-06-01';
+  } else if (config.apiKey) {
+    headers.Authorization = `Bearer ${config.apiKey}`;
+  }
   return headers;
 }
 
@@ -763,6 +868,10 @@ function safeHeaders(headers) {
 
 function openAIError(res, status, message, type = 'server_error') {
   writeJSON(res, status, { error: { message, type, param: null, code: null } });
+}
+function anthropicError(res, status, message, type = 'invalid_request_error') {
+  // Anthropic error shape: { type: "error", error: { type, message } }
+  writeJSON(res, status, { type: 'error', error: { type, message } });
 }
 
 // Authorization check for proxy-protected endpoints.
@@ -1330,6 +1439,136 @@ async function handleChat(req, res) {
   }
 }
 
+// Anthropic Messages API passthrough (POST /v1/messages → upstream /messages).
+// Mirrors handleChat: throttling, coalescing, and telemetry apply identically.
+// Differences from the OpenAI route:
+//   - Auth: x-api-key + anthropic-version (no Bearer)
+//   - No reasoning_effort snapping (Anthropic uses the `thinking` object,
+//     which UMANS normalizes server-side; we forward bytes verbatim)
+//   - No stream_options.include_usage injection (Anthropic always emits
+//     usage in the message_delta event)
+//   - ChatTap parses the Anthropic stream/non-stream shapes
+async function handleMessages(req, res) {
+  if (req.method !== 'POST') return anthropicError(res, 405, 'method not allowed', 'invalid_request_error');
+  if (!config.apiKey) return anthropicError(res, 400, 'UMANS API key is not configured', 'invalid_request_error');
+
+  let rawBody;
+  try { rawBody = await readBody(req); }
+  catch (err) { return anthropicError(res, err.statusCode || 400, err.message, 'invalid_request_error'); }
+
+  let payload;
+  try { payload = JSON.parse(rawBody || '{}'); }
+  catch { return anthropicError(res, 400, 'request body must be valid JSON', 'invalid_request_error'); }
+
+  if (!payload.model) return anthropicError(res, 400, 'model is required', 'invalid_request_error');
+  if (config.enabledModels.length && !config.enabledModels.includes(payload.model)) {
+    return anthropicError(res, 400, `model is not enabled: ${payload.model}`, 'invalid_request_error');
+  }
+
+  const controller = new AbortController();
+  let closed = res.destroyed;
+  let sessionStatus = 'done';
+  const onClose = () => { closed = true; sessionStatus = 'aborted'; controller.abort(); };
+  if (closed) { sessionStatus = 'aborted'; controller.abort(); }
+  else res.on('close', onClose);
+
+  const isStream = !!payload.stream;
+  let headersSentEarly = false;
+  if (isStream && !closed) {
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+      'X-Accel-Buffering': 'no',
+    });
+    headersSentEarly = true;
+  }
+
+  try {
+    await acquireThrottleSlot(res, controller.signal, {
+      keepalive: headersSentEarly ? () => {
+        if (!closed && !res.destroyed) {
+          try { res.write(': queued\n\n'); } catch {}
+        }
+      } : undefined,
+    });
+  } catch (err) {
+    if (closed) return;
+    if (headersSentEarly) {
+      try { res.write(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: err.message } })}\n\n`); } catch {}
+      res.end();
+    } else {
+      return anthropicError(res, 503, err.message, 'rate_limit_error');
+    }
+    return;
+  }
+  let timedOut = false;
+  const timeout = setTimeout(() => { timedOut = true; sessionStatus = 'aborted'; controller.abort(); }, config.requestTimeout);
+  const { groupKey, prefixChain } = resolveGroupKey(payload.model, payload.messages || []);
+  const session = createSession({ model: payload.model, stream: payload.stream, groupKey });
+  const tap = new ChatTap(session, { stream: payload.stream, shape: 'anthropic', onFinalize: (s) => {
+    if (sessionStatus === 'done') {
+      try { storeStateKey(payload.model, payload.messages || [], s.responseContent, s.groupKey, prefixChain); } catch {}
+    }
+    s.responseContent = '';
+  }});
+  broadcastEvent('session', { type: 'start', id: session.id, active: activeRequests, queued: queuedRequests });
+  scheduleSessionsBroadcast();
+
+  try {
+    const upstream = await fetch(upstreamURL('/messages'), {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json', Accept: payload.stream ? 'text/event-stream' : 'application/json' }, { anthropic: true }),
+      body: rawBody,
+      signal: controller.signal,
+    });
+    refreshUsageSoon();
+
+    if (headersSentEarly) {
+      if (!upstream.ok) {
+        const errText = await upstream.text().catch(() => upstream.statusText);
+        try { res.write(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'upstream_error', message: `upstream ${upstream.status}: ${errText.slice(0, 500)}` } })}\n\n`); } catch {}
+        res.end();
+        sessionStatus = 'error';
+        return;
+      }
+    } else {
+      res.writeHead(upstream.status, safeHeaders(upstream.headers));
+    }
+    if (!upstream.body) return res.end();
+
+    const reader = upstream.body.getReader();
+    try {
+      while (!closed) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        tap.onChunk(value);
+        await writeChunk(res, value, controller.signal);
+      }
+    } finally {
+      await reader.cancel().catch(() => {});
+    }
+    if (!closed) res.end();
+  } catch (err) {
+    if (!closed) logError('Messages proxy failed', err);
+    if (!res.headersSent && !headersSentEarly && !closed) anthropicError(res, timedOut ? 504 : 502, timedOut ? 'upstream request timed out' : err.message, 'api_error');
+    else if (!closed) {
+      if (headersSentEarly) {
+        try { res.write(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'api_error', message: timedOut ? 'upstream request timed out' : err.message } })}\n\n`); } catch {}
+      }
+      res.end();
+    }
+    sessionStatus = closed || timedOut ? 'aborted' : 'error';
+  }
+  finally {
+    clearTimeout(timeout);
+    res.off('close', onClose);
+    releaseThrottleSlot();
+    try { tap.onEnd(); } catch {}
+    finalizeSession(session, sessionStatus);
+  }
+}
+
 async function handleConfig(req, res) {
   if (req.method === 'GET') {
     return writeJSON(res, 200, {
@@ -1482,8 +1721,9 @@ async function handleRequest(req, res) {
     const file = path.join(__dirname, 'dashboard.html');
     return writeText(res, 200, fs.readFileSync(file, 'utf8'), 'text/html; charset=utf-8');
   }
-  if (url.pathname === '/health') return writeJSON(res, 200, { ok: true, upstream: config.upstreamBaseURL, hasApiKey: !!config.apiKey, proxyAuthEnabled: config.proxyApiKeys.length > 0 });
+  if (url.pathname === '/health') return writeJSON(res, 200, { ok: true, upstream: config.upstreamBaseURL, hasApiKey: !!config.apiKey, proxyAuthEnabled: config.proxyApiKeys.length > 0, routes: ['/v1/chat/completions', '/v1/messages'] });
   if (url.pathname === '/api/events') return handleEvents(req, res);
+  if (url.pathname === '/api/config') return handleConfig(req, res);
   if (url.pathname === '/api/umans/sessions') return handleSessions(req, res);
   if (url.pathname === '/api/umans/usage') return handleUsage(req, res);
   if (url.pathname === '/api/umans/concurrency') return handleConcurrency(req, res);
@@ -1491,6 +1731,7 @@ async function handleRequest(req, res) {
   if (url.pathname === '/v1/models') return handleModels(req, res);
   if (url.pathname.startsWith('/v1/models/')) return handleModels(req, res, decodeURIComponent(url.pathname.slice('/v1/models/'.length)));
   if (url.pathname === '/v1/chat/completions') return handleChat(req, res);
+  if (url.pathname === '/v1/messages') return handleMessages(req, res);
   if (url.pathname.startsWith('/v1/')) return openAIError(res, 404, `unsupported endpoint: ${url.pathname}`, 'invalid_request_error');
   if (url.pathname === '/api/shutdown') return handleShutdown(req, res);
   if (url.pathname === '/api/restart') return handleRestart(req, res);

@@ -1,6 +1,6 @@
 # UMANS Proxy
 
-Minimal OpenAI-compatible proxy for [UMANS AI](https://app.umans.ai/offers/code/docs) (upstream `https://api.code.umans.ai/v1`) with UMANS `/usage`-informed concurrency throttling.
+Minimal OpenAI- and Anthropic-compatible proxy for [UMANS AI](https://app.umans.ai/offers/code/docs) (upstream `https://api.code.umans.ai/v1`) with UMANS `/usage`-informed concurrency throttling.
 
 ## Requirements
 
@@ -59,6 +59,15 @@ Add `--no-start` to save settings without starting the proxy.
 
 `GET /v1/models` and `GET /v1/models/info` forward the upstream model list enriched with each model's supported `reasoning` levels (from UMANS `/models/info`). On `POST /v1/chat/completions`, a `reasoning_effort` the requested model does not support is snapped to the nearest supported level, preferring **up** so a max-effort intent never silently downgrades. Common aliases are mapped: `xhi`/`xhigh` → `max`. Requests to disable reasoning on a model that can't disable it (e.g. `umans-kimi-k2.7`) have the field dropped rather than erroring.
 
+
+## Backend shapes
+
+Both API shapes are always live as passthrough routes — point your client at whichever it speaks:
+
+- **OpenAI**: `POST /v1/chat/completions` with `Authorization: Bearer <key>`. The proxy snaps `reasoning_effort` to the model's supported levels.
+- **Anthropic**: `POST /v1/messages` with `x-api-key: <key>` and `anthropic-version: 2023-06-01`. The `thinking` object is forwarded verbatim (UMANS normalizes it server-side).
+
+Throttling, session tracking, and live tok/s telemetry apply to both shapes. Claude Code (`ANTHROPIC_BASE_URL=http://127.0.0.1:8084`) and OpenAI-compatible clients (omp, Cursor, OpenCode) can both use the same proxy simultaneously.
 ## Throttling and usage
 
 Before chat requests, the proxy reads the concurrency limit from UMANS `/usage` (`limits.concurrency.limit`) and queues requests when **local** in-flight requests reach that limit. Queued requests re-read the effective limit each iteration, so config changes or usage refreshes are honored without restarting. `OVERRIDE_CONCURRENCY` caps below the upstream limit. The upstream-reported `concurrent_sessions` count is shown for insight but does not gate the proxy — only locally-tracked requests do, so other clients on the same key don't throttle you.
@@ -93,8 +102,8 @@ Sessions are pushed via the `/api/events` SSE stream (event: `sessions`) at most
 - `GET /api/umans/sessions` (live TPS + per-session tracking)
 - `GET /v1/models/info` (upstream per-model capabilities)
 - `GET /v1/models/:id`
-- `POST /v1/chat/completions` (snaps `reasoning_effort` to supported levels)
-- `GET /api/events` (SSE stream)
+- `POST /v1/chat/completions` (OpenAI shape; snaps `reasoning_effort` to supported levels)
+- `POST /v1/messages` (Anthropic shape; `x-api-key` + `anthropic-version`)
 - `GET /api/config`
 - `POST /api/config`
 

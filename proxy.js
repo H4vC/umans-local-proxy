@@ -1,6 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const http = require('http');
+const { spawn } = require('child_process');
 
 const CONFIG_DIR = path.join(__dirname, '.config');
 const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json');
@@ -16,6 +17,7 @@ const MODEL_INFO_TTL_MS = 60 * 1000;
 const REASONING_RANK = { none: 0, off: 0, disabled: 0, minimal: 1, low: 2, medium: 3, high: 4, xhi: 5, xhigh: 5, max: 5 };
 
 let config = loadConfig();
+const startedAt = Date.now();
 let usageCache = { data: null, time: 0 };
 let concurrencyCache = { concurrent: null, limit: null, softLimit: null, user_id: null, time: 0 };
 let activeRequests = 0;
@@ -43,16 +45,108 @@ function newSessionId() {
   return Date.now().toString(36) + sessionSeq.toString(36).padStart(8, '0');
 }
 
-function estimateTokensFromChars(chars) {
-  // Standard ~4 chars/token heuristic; good enough when upstream omits usage.
+// Per-model learned char→token ratio, accumulated from completed requests
+// that returned exact usage. Used to estimate tok/s DURING streaming
+// (before the final usage chunk arrives). The rolling TPS bucket is
+// NEVER fed from this estimate — only from the final exact count at _finish.
+const modelCharRatio = new Map(); // model -> { chars, tokens }
+
+function estimateTokensFromChars(model, chars) {
+  const r = modelCharRatio.get(model);
+  if (r && r.chars > 0) return Math.round(chars * (r.tokens / r.chars));
+  // Cold start: 4 chars/token until the first exact-usage request teaches us.
   return Math.floor(chars / 4);
 }
 
-function createSession({ model, stream }) {
+function updateModelRatio(model, chars, tokens) {
+  if (!model || chars <= 0 || tokens <= 0) return;
+  const r = modelCharRatio.get(model) || { chars: 0, tokens: 0 };
+  r.chars += chars;
+  r.tokens += tokens;
+  modelCharRatio.set(model, r);
+}
+
+// ---- session coalescing: glue requests that share an upstream KV cache ----
+// Conversations grow append-only; upstream caches by content-addressed prefix.
+// We hash the message prefix to find the logical session a request belongs to.
+// All hashing is FNV-1a (fast, non-crypto, zero-dep). The per-message hash
+// cache avoids re-hashing large system prompts on every turn.
+const messageHashCache = new Map(); // JSON.stringify(message) -> fnv1a hex
+const stateMap = new Map();         // chainHash -> groupKey (logical session)
+const COALESCE_TTL_MS = 5 * 60 * 1000; // match upstream cache lifetime
+
+// FNV-1a 32-bit. Returns hex string. ~1ns/byte, no allocation beyond output.
+function fnv1a(str) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0).toString(16).padStart(8, '0');
+}
+
+// Cached per-message hash. JSON.stringify is the expensive part; cache it so
+// a system prompt reused across 50 turns is stringified+hashed exactly once.
+// True LRU: on a hit, delete + re-insert to move to end (most-recently-used).
+// Map iteration order is insertion order, so keys().next() returns the LRU.
+function messageHash(message) {
+  const json = JSON.stringify(message);
+  let h = messageHashCache.get(json);
+  if (h !== undefined) {
+    // Promote to most-recently-used by re-inserting.
+    messageHashCache.delete(json);
+    messageHashCache.set(json, h);
+    return h;
+  }
+  h = fnv1a(json);
+  messageHashCache.set(json, h);
+  // Bound the cache: drop LRU if it grows beyond a few thousand entries.
+  if (messageHashCache.size > 5000) {
+    const lru = messageHashCache.keys().next().value;
+    messageHashCache.delete(lru);
+  }
+  return h;
+}
+
+// Rolling chain hash over [model, ...messages]. Each step is H(prev, msgHash)
+// — O(1) per message, O(n) per request (n = message count, not token count).
+// Returns { hash, chain } so the caller can extend without re-walking.
+function chainHash(model, messages, fromChain) {
+  let chain = fromChain || fnv1a(model || '');
+  for (let i = 0; i < messages.length; i++) {
+    chain = fnv1a(chain + messageHash(messages[i]));
+  }
+  return chain;
+}
+
+// Resolve the logical session for an incoming request. Called at arrival,
+// before createSession. Returns { groupKey, prefixChain } so storeStateKey
+// can extend the chain without re-walking the prefix.
+function resolveGroupKey(model, messages) {
+  const prefix = messages.slice(0, -1);
+  const prefixChain = chainHash(model, prefix);
+  const groupKey = stateMap.get(prefixChain) || newSessionId();
+  return { groupKey, prefixChain };
+}
+
+// Store the conversation state after a request completes, so the NEXT request
+// whose prefix matches this state hits the stateMap and coalesces. Called at
+// session completion — never in the streaming hot path. Accepts the saved
+// prefixChain from resolveGroupKey to avoid re-walking the prefix.
+function storeStateKey(model, messages, responseContent, groupKey, prefixChain) {
+  const responseMsg = { role: 'assistant', content: responseContent || '' };
+  // Extend the saved prefix chain with the final user turn + the response.
+  const stateChain = chainHash(model, [messages[messages.length - 1], responseMsg], prefixChain);
+  stateMap.set(stateChain, groupKey);
+  setTimeout(() => { stateMap.delete(stateChain); }, COALESCE_TTL_MS).unref();
+}
+
+function createSession({ model, stream, groupKey }) {
   const id = newSessionId();
   if (model) seenModels.add(model);
   const session = {
     id, model, stream: !!stream,
+    groupKey: groupKey || id,  // logical session; defaults to own id (new conversation)
     startedAt: Date.now(),
     status: 'active',        // active | done | error | aborted
     outputTokens: 0,         // running token count (exact if known)
@@ -63,6 +157,7 @@ function createSession({ model, stream }) {
     promptTokens: 0,         // total input (prompt) tokens
     cachedTokens: 0,         // input tokens served from cache
     completionTokens: 0,     // output (completion) tokens
+    responseContent: '',    // accumulated assistant reply (for coalescing stateKey)
     endedAt: null,
   };
   sessions.set(id, session);
@@ -78,12 +173,14 @@ function finalizeSession(session, status) {
   scheduleSessionsBroadcast();
 }
 
-// Add tokens to per-session, aggregate, and per-model rolling TPS counters.
+// Feed tokens into the aggregate and per-model rolling TPS counters.
+// Callers own session.outputTokens — this function only touches the TPS
+// buckets, never the session's token count (it used to, which double-counted
+// on the exact path where callers set outputTokens before calling this).
 function addSessionTokens(session, tokens, { exact = false } = {}) {
   if (!session) return;
   if (exact) session.exactTokens = true;
   if (tokens <= 0) return;
-  session.outputTokens += tokens;
   const now = Date.now();
   const cutoff = now - TPS_WINDOW_MS;
   // Aggregate bucket.
@@ -144,6 +241,7 @@ function sessionPublicView(session) {
   const active = session.status === 'active';
   return {
     id: session.id,
+    groupKey: session.groupKey,
     model: session.model,
     stream: session.stream,
     status: session.status,
@@ -229,9 +327,10 @@ function scheduleSessionsBroadcast() {
 // happens in _drain(), which runs between I/O ticks (during the next
 // reader.read() await), so telemetry never delays bytes reaching the client.
 class ChatTap {
-  constructor(session, { stream }) {
+  constructor(session, { stream, onFinalize }) {
     this.session = session;
     this.stream = stream;
+    this.onFinalize = onFinalize || null; // called from _finish after responseContent is set
     this.lineBuf = '';     // partial SSE line buffer
     this.bodyBuf = [];     // non-streaming: full body chunks
     this.queue = [];       // raw chunks pending async parse
@@ -284,35 +383,41 @@ class ChatTap {
     const u = chunk?.usage;
     if (u && (u.completion_tokens != null || u.output_tokens != null)) {
       const t = Number(u.completion_tokens ?? u.output_tokens ?? 0) || 0;
+      // Feed the rolling TPS bucket ONLY here, at final-usage time, with
+      // the delta between exact and whatever the interim estimate held.
+      // The bucket is never fed from interim char estimates.
+      const prev = this.session.outputTokens;
       this.session.outputTokens = t;
       this.session.completionTokens = t;
       this.session.exactTokens = true;
-      // Token breakdown: prompt (input), cached input, completion (output).
       const prompt = Number(u.prompt_tokens ?? u.input_tokens ?? 0) || 0;
       const cached = Number(u.prompt_tokens_details?.cached_tokens ?? u.cached_tokens ?? u.tokens_cached_read ?? 0) || 0;
       this.session.promptTokens = prompt;
       this.session.cachedTokens = cached;
-      addSessionTokens(this.session, 0, { exact: true });
+      // Learn the real char→token ratio for this model from exact data.
+      updateModelRatio(this.session.model, this.session.chars, t);
+      addSessionTokens(this.session, Math.max(0, t - prev), { exact: true });
       return;
     }
     if (this.session.exactTokens) return; // already have exact count
-    // Accumulate content/reasoning chars and recompute tokens from the TOTAL
-    // so per-chunk remainder truncation doesn't systematically underestimate.
+    // Interim: accumulate chars and estimate outputTokens for the live
+    // readout. This does NOT touch the TPS bucket — that happens only at
+    // _finish / final-usage time with the exact count.
     let chars = 0;
     const choices = chunk?.choices;
     if (Array.isArray(choices)) {
       for (const c of choices) {
         const delta = c?.delta || {};
-        if (typeof delta.content === 'string') chars += delta.content.length;
+        if (typeof delta.content === 'string') {
+          chars += delta.content.length;
+          this.session.responseContent += delta.content;
+        }
         if (typeof delta.reasoning_content === 'string') chars += delta.reasoning_content.length;
       }
     }
     if (chars > 0) {
       this.session.chars += chars;
-      const newTotal = estimateTokensFromChars(this.session.chars);
-      const diff = newTotal - this.session.outputTokens;
-      // addSessionTokens adds the diff to outputTokens AND the TPS buckets.
-      if (diff > 0) addSessionTokens(this.session, diff);
+      this.session.outputTokens = estimateTokensFromChars(this.session.model, this.session.chars);
     }
   }
 
@@ -343,38 +448,55 @@ class ChatTap {
         const u = body?.usage;
         if (u && (u.completion_tokens != null || u.output_tokens != null)) {
           // Replace any estimate with the exact count from the final body.
-          // addSessionTokens adds the diff to outputTokens, so we don't set
-          // outputTokens directly (that would double-count).
           const exact = Number(u.completion_tokens ?? u.output_tokens ?? 0) || 0;
           const prev = this.session.outputTokens;
+          this.session.outputTokens = exact;
           this.session.completionTokens = exact;
           this.session.exactTokens = true;
-          // Token breakdown: prompt (input), cached input, completion (output).
           const prompt = Number(u.prompt_tokens ?? u.input_tokens ?? 0) || 0;
           const cached = Number(u.prompt_tokens_details?.cached_tokens ?? u.cached_tokens ?? u.tokens_cached_read ?? 0) || 0;
           this.session.promptTokens = prompt;
           this.session.cachedTokens = cached;
+          // Learn the real char→token ratio for this model from exact data.
+          updateModelRatio(this.session.model, this.session.chars, exact);
+          // Accumulate response content for coalescing (non-streaming).
+          const choices = body?.choices;
+          if (Array.isArray(choices)) {
+            for (const c of choices) {
+              const msg = c?.message || {};
+              if (typeof msg.content === 'string') this.session.responseContent += msg.content;
+            }
+          }
           addSessionTokens(this.session, Math.max(0, exact - prev), { exact: true });
         } else {
-          // No usage block: estimate from total content chars.
+          // No usage block: estimate from total content chars and feed the
+          // bucket once at finish time (interim never touched it).
           let chars = 0;
           const choices = body?.choices;
           if (Array.isArray(choices)) {
             for (const c of choices) {
               const msg = c?.message || {};
-              if (typeof msg.content === 'string') chars += msg.content.length;
+              if (typeof msg.content === 'string') {
+                chars += msg.content.length;
+                this.session.responseContent += msg.content;
+              }
               if (typeof msg.reasoning_content === 'string') chars += msg.reasoning_content.length;
             }
           }
           if (chars > 0) {
             this.session.chars += chars;
-            const newTotal = estimateTokensFromChars(this.session.chars);
-            const diff = newTotal - this.session.outputTokens;
-            if (diff > 0) addSessionTokens(this.session, diff);
+            const est = estimateTokensFromChars(this.session.model, this.session.chars);
+            const prev = this.session.outputTokens;
+            this.session.outputTokens = est;
+            addSessionTokens(this.session, Math.max(0, est - prev));
           }
         }
       } catch { /* non-JSON or partial — ignore */ }
     }
+    // Coalesce: store the conversation state now that responseContent is
+    // fully populated. Runs inside _finish (which may be deferred by an
+    // in-flight drain) so the state is always complete when stored.
+    if (this.onFinalize) { try { this.onFinalize(this.session); } catch {} }
     // Clear ref so finalize is idempotent.
     this.session = null;
   }
@@ -477,6 +599,9 @@ function readBody(req) {
     const chunks = [];
     let size = 0;
     let tooLarge = false;
+    let settled = false;
+    const finish = (fn) => { if (settled) return; settled = true; req.off('close', onClose); fn(); };
+    const onClose = () => finish(() => reject(new Error('client disconnected')));
     req.on('data', (chunk) => {
       if (tooLarge) return;
       size += chunk.length;
@@ -484,13 +609,14 @@ function readBody(req) {
         tooLarge = true;
         const err = new Error('request body too large');
         err.statusCode = 413;
-        reject(err);
+        finish(() => reject(err));
         return;
       }
       chunks.push(chunk);
     });
-    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
-    req.on('error', reject);
+    req.on('end', () => finish(() => resolve(Buffer.concat(chunks).toString('utf8'))));
+    req.on('error', (err) => finish(() => reject(err)));
+    req.on('close', onClose);
   });
 }
 
@@ -508,7 +634,9 @@ function safeHeaders(headers) {
   const out = {};
   for (const [key, value] of headers) {
     const lower = key.toLowerCase();
-    if (['connection', 'content-encoding', 'content-length', 'keep-alive', 'transfer-encoding'].includes(lower)) continue;
+    // Strip hop-by-hop headers; keep content-length since we forward the
+    // upstream body byte-for-byte (both streaming and non-streaming).
+    if (['connection', 'content-encoding', 'keep-alive', 'transfer-encoding'].includes(lower)) continue;
     out[key] = value;
   }
   return out;
@@ -533,7 +661,7 @@ function authorized(req, url) {
 }
 
 function requiresProxyAuth(pathname) {
-  return pathname === '/api/config' || pathname === '/api/events' || pathname.startsWith('/api/umans/') || pathname.startsWith('/v1/');
+  return pathname === '/api/config' || pathname === '/api/events' || pathname === '/api/shutdown' || pathname === '/api/restart' || pathname === '/api/clear-state' || pathname === '/api/system/info' || pathname.startsWith('/api/umans/') || pathname.startsWith('/v1/');
 }
 
 function filterModels(models) {
@@ -661,8 +789,20 @@ async function fetchUmansUsage({ force = false } = {}) {
   }
 }
 
+let refreshUsageInFlight = false;
+let refreshUsageTimer = null;
+const REFRESH_USAGE_MIN_MS = 10000; // coalesce: at most one forced /usage per 10s
 function refreshUsageSoon() {
-  fetchUmansUsage({ force: true }).catch(() => {});
+  // Coalesce: if a refresh is in flight or ran recently, skip. The 10s TTL
+  // cache means a fresh fetch this soon would return the same data anyway.
+  if (refreshUsageInFlight) return;
+  if (refreshUsageTimer) return;
+  if (usageCache.data && Date.now() - usageCache.time < REFRESH_USAGE_MIN_MS) return;
+  refreshUsageInFlight = true;
+  refreshUsageTimer = setTimeout(() => { refreshUsageTimer = null; }, REFRESH_USAGE_MIN_MS);
+  fetchUmansUsage({ force: true })
+    .catch(() => {})
+    .finally(() => { refreshUsageInFlight = false; });
 }
 
 function broadcastEvent(event, data) {
@@ -683,19 +823,28 @@ function getEffectiveConcurrency() {
 function canStart(effective) {
   const limit = effective.limit;
   if (limit == null) return true;
-  if (activeRequests >= limit) return false;
+  // Use the upstream-reported concurrent_sessions as a floor so external tools
+  // hitting the same account are counted. The upstream count is polled and
+  // stale (up to USAGE_TTL_MS), so this prevents gross overage, not bursts.
+  const known = Math.max(activeRequests, effective.concurrent || 0);
+  if (known >= limit) return false;
   // Prefer staying at/under the soft limit when requests are queued
   const soft = effective.softLimit;
-  if (soft && activeRequests >= soft && queuedRequests > 0) return false;
+  if (soft && known >= soft && queuedRequests > 0) return false;
   return true;
 }
 
 async function acquireThrottleSlot(res, signal) {
   if (signal?.aborted) throw new Error('aborted');
   let effective = getEffectiveConcurrency();
+  // Cold cache: if the concurrency limit is unknown, we need it before
+  // starting MORE requests — but the very first request (no active) can
+  // never exceed any limit, so let it through immediately and populate
+  // the cache in the background. If active requests exist, block on the
+  // fetch so we don't burst past the limit.
   if (effective.limit === null) {
-    await fetchUmansUsage();
-    effective = getEffectiveConcurrency();
+    if (activeRequests === 0) refreshUsageSoon();
+    else { await fetchUmansUsage(); effective = getEffectiveConcurrency(); }
   }
   // Keep the downstream client alive across long queue waits (>30s idle timeouts).
   // 102 Processing is an interim response: it does not commit the final status
@@ -895,12 +1044,15 @@ async function handleChat(req, res) {
   if (req.method !== 'POST') return openAIError(res, 405, 'method not allowed', 'invalid_request_error');
   if (!config.apiKey) return openAIError(res, 400, 'UMANS API key is not configured', 'invalid_request_error');
 
-  let text;
-  try { text = await readBody(req); }
+  // Read the raw body once. We parse it for validation + telemetry, but
+  // forward the original bytes to upstream unless we actually mutated the
+  // payload — avoiding a redundant JSON.stringify of a potentially huge body.
+  let rawBody;
+  try { rawBody = await readBody(req); }
   catch (err) { return openAIError(res, err.statusCode || 400, err.message, 'invalid_request_error'); }
 
   let payload;
-  try { payload = JSON.parse(text || '{}'); }
+  try { payload = JSON.parse(rawBody || '{}'); }
   catch { return openAIError(res, 400, 'request body must be valid JSON', 'invalid_request_error'); }
 
   if (!payload.model) return openAIError(res, 400, 'model is required', 'invalid_request_error');
@@ -908,13 +1060,17 @@ async function handleChat(req, res) {
     return openAIError(res, 400, `model is not enabled: ${payload.model}`, 'invalid_request_error');
   }
 
+  // Track whether we mutate the payload. If we don't, we forward the raw
+  // bytes as-is — no re-serialization of a potentially 100K+ token prompt.
+  let mutated = false;
+
   // Snap reasoning_effort to a level the model actually supports. xhi/xhigh
   // map to max; values for models that can't disable reasoning are dropped.
   if (payload.reasoning_effort != null) {
     await fetchModelInfo();
     const snapped = snapReasoningLevel(payload.model, payload.reasoning_effort);
-    if (snapped == null) delete payload.reasoning_effort;
-    else payload.reasoning_effort = snapped;
+    if (snapped == null) { delete payload.reasoning_effort; mutated = true; }
+    else if (snapped !== payload.reasoning_effort) { payload.reasoning_effort = snapped; mutated = true; }
   }
   const controller = new AbortController();
   let closed = res.destroyed;
@@ -934,16 +1090,37 @@ async function handleChat(req, res) {
   const timeout = setTimeout(() => { timedOut = true; sessionStatus = 'aborted'; controller.abort(); }, config.requestTimeout);
   // asynchronously (setImmediate drain) and NEVER mutates what the client
   // receives. Created here so it covers the upstream fetch + streaming.
-  const session = createSession({ model: payload.model, stream: payload.stream });
-  const tap = new ChatTap(session, { stream: payload.stream });
+  // Coalesce: resolve the logical session from the message prefix before
+  // creating the per-request session. Runs at arrival — never in the stream.
+  const { groupKey, prefixChain } = resolveGroupKey(payload.model, payload.messages || []);
+  const session = createSession({ model: payload.model, stream: payload.stream, groupKey });
+  const tap = new ChatTap(session, { stream: payload.stream, onFinalize: (s) => {
+    if (sessionStatus === 'done') {
+      try { storeStateKey(payload.model, payload.messages || [], s.responseContent, s.groupKey, prefixChain); } catch {}
+    }
+    // Release the accumulated response text — it was only needed for the
+    // coalescing stateKey. Prevents holding large responses in memory for
+    // the 5s session retention window.
+    s.responseContent = '';
+  }});
   broadcastEvent('session', { type: 'start', id: session.id, active: activeRequests, queued: queuedRequests });
   scheduleSessionsBroadcast();
 
   try {
+    // Inject stream_options.include_usage to get exact token counts on the
+    // final stream chunk. Only re-serialize if this actually changes the
+    // payload — if the client already set it, forward raw bytes.
+    if (payload.stream && !payload.stream_options?.include_usage) {
+      payload.stream_options = { ...(payload.stream_options || {}), include_usage: true };
+      mutated = true;
+    }
+    // Forward the raw bytes unless we mutated the payload — avoids a full
+    // JSON.stringify of a potentially huge body on the hot path.
+    const body = mutated ? JSON.stringify(payload) : rawBody;
     const upstream = await fetch(upstreamURL('/chat/completions'), {
       method: 'POST',
       headers: authHeaders({ 'Content-Type': 'application/json', Accept: payload.stream ? 'text/event-stream' : 'application/json' }),
-      body: JSON.stringify(payload),
+      body,
       signal: controller.signal,
     });
     refreshUsageSoon();
@@ -981,6 +1158,9 @@ async function handleChat(req, res) {
     // Finalize telemetry. onEnd() is async-safe: if a drain is in flight,
     // _finish runs when caught up; otherwise it runs now. Never throws.
     try { tap.onEnd(); } catch {}
+    // Coalescing is handled by the onFinalize callback inside _finish,
+    // which runs after responseContent is fully populated (may be deferred
+    // by an in-flight drain). This is why storeStateKey is not here.
     finalizeSession(session, sessionStatus);
   }
 }
@@ -1049,6 +1229,72 @@ async function handleSessions(req, res) {
   writeJSON(res, 200, getSessionsSnapshot());
 }
 
+// Graceful shutdown trigger from the dashboard. Responds first, then shuts
+// down on next tick so the HTTP response flushes before the server closes.
+function handleShutdown(req, res) {
+  if (req.method !== 'POST') return openAIError(res, 405, 'method not allowed', 'invalid_request_error');
+  writeJSON(res, 200, { ok: true, message: 'shutting down' });
+  setImmediate(shutdown);
+}
+
+// Restart: spawn a detached successor that survives this process's exit,
+// then shut down. stdio:'ignore' + detached + unref() detaches the child on
+// both Windows and POSIX so it isn't killed when we exit.
+function handleRestart(req, res) {
+  if (req.method !== 'POST') return openAIError(res, 405, 'method not allowed', 'invalid_request_error');
+  let child;
+  try {
+    child = spawn(process.execPath, [__filename], {
+      cwd: __dirname, detached: true, stdio: 'ignore', shell: false,
+    });
+    child.unref();
+  } catch (err) {
+    return openAIError(res, 500, `failed to spawn successor: ${err.message}`);
+  }
+  // Give the successor a moment to bind before we release the port. On
+  // EADDRINUSE it will exit; the user sees it in the log. There's no
+  // reliable cross-platform signal back, so we just shut down after a beat.
+  writeJSON(res, 200, { ok: true, message: 'restarting' });
+  setTimeout(shutdown, 300);
+}
+
+// Clear state: reset live session tracking and caches without restarting.
+function handleClearState(req, res) {
+  if (req.method !== 'POST') return openAIError(res, 405, 'method not allowed', 'invalid_request_error');
+  sessions.clear();
+  sessionSeq = 0;
+  tpsBuckets.length = 0;
+  tpsBucketsByModel.clear();
+  modelCharRatio.clear();
+  messageHashCache.clear();
+  stateMap.clear();
+  seenModels.clear();
+  usageCache = { data: null, time: 0 };
+  concurrencyCache = { concurrent: null, limit: null, softLimit: null, user_id: null, time: 0 };
+  modelInfoCache = { data: null, time: 0 };
+  if (sessionsBroadcastTimer) { clearInterval(sessionsBroadcastTimer); sessionsBroadcastTimer = null; }
+  broadcastThrottled = false;
+  // Broadcast the empty state directly — don't call scheduleSessionsBroadcast,
+  // which would defer via setTimeout and could race with a prior pending call.
+  broadcastEvent('sessions', getSessionsSnapshot());
+  writeJSON(res, 200, { ok: true });
+}
+
+// System info for the admin panel.
+function handleSystemInfo(req, res) {
+  if (req.method !== 'GET') return openAIError(res, 405, 'method not allowed', 'invalid_request_error');
+  writeJSON(res, 200, {
+    pid: process.pid,
+    startedAt: new Date(startedAt).toISOString(),
+    uptimeMs: Date.now() - startedAt,
+    listenAddr: config.listenAddr,
+    upstream: config.upstreamBaseURL,
+    nodeVersion: process.version,
+    activeRequests,
+    queuedRequests,
+    sessionsTracked: sessions.size,
+  });
+}
 function handleEvents(req, res) {
   if (req.method !== 'GET') return openAIError(res, 405, 'method not allowed', 'invalid_request_error');
   res.writeHead(200, {
@@ -1080,6 +1326,10 @@ async function handleRequest(req, res) {
   if (url.pathname.startsWith('/v1/models/')) return handleModels(req, res, decodeURIComponent(url.pathname.slice('/v1/models/'.length)));
   if (url.pathname === '/v1/chat/completions') return handleChat(req, res);
   if (url.pathname.startsWith('/v1/')) return openAIError(res, 404, `unsupported endpoint: ${url.pathname}`, 'invalid_request_error');
+  if (url.pathname === '/api/shutdown') return handleShutdown(req, res);
+  if (url.pathname === '/api/restart') return handleRestart(req, res);
+  if (url.pathname === '/api/clear-state') return handleClearState(req, res);
+  if (url.pathname === '/api/system/info') return handleSystemInfo(req, res);
   writeText(res, 404, 'Not Found');
 }
 
@@ -1099,6 +1349,18 @@ const server = http.createServer((req, res) => {
 });
 
 server.on('error', (err) => {
+  // EADDRINUSE during a restart: the predecessor is still releasing the
+  // port. Retry with backoff instead of dying. Other errors are fatal.
+  if (err.code === 'EADDRINUSE') {
+    server.listenRetries = (server.listenRetries || 0) + 1;
+    if (server.listenRetries > 40) { console.error('Giving up: port still in use after 20s'); process.exit(1); }
+    console.error(`Port ${port} in use; successor retrying (attempt ${server.listenRetries})…`);
+    setTimeout(() => {
+      server.close(() => {});
+      server.listen({ port, host, exclusive: true });
+    }, 500);
+    return;
+  }
   console.error(`Server error: ${err.message}`);
   process.exit(1);
 });
@@ -1114,7 +1376,7 @@ process.once('SIGINT', shutdown);
 process.once('SIGTERM', shutdown);
 
 try {
-  server.listen(port, host, () => {
+  server.listen({ port, host, exclusive: true }, () => {
     console.log(`UMANS Proxy listening on http://${host}:${port}`);
     console.log(`Upstream: ${config.upstreamBaseURL}`);
     console.log(`API key: ${config.apiKey ? 'configured' : 'missing'}`);

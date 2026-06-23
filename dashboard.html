@@ -155,6 +155,8 @@
     button.btn:hover:not(:disabled) { background: var(--accent-2); }
     button.btn.tonal { background: var(--surface-3); color: var(--text); }
     button.btn.tonal:hover:not(:disabled) { background: var(--line-2); }
+    button.btn.danger { background: var(--bad); color: #fff; }
+    button.btn.danger:hover:not(:disabled) { background: var(--bad); filter: brightness(1.08); }
     button.btn + button.btn, button.btn.tonal + button.btn { margin-left: 8px; }
     button.btn:disabled { opacity: .5; cursor: progress; }
     .btn-row { margin-top: 16px; display: flex; gap: 8px; flex-wrap: wrap; }
@@ -324,6 +326,7 @@
       <button class="tab" role="tab" id="tab-test" aria-selected="false" aria-controls="panel-test">Test</button>
       <button class="tab" role="tab" id="tab-config" aria-selected="false" aria-controls="panel-config">Config</button>
       <button class="tab" role="tab" id="tab-api" aria-selected="false" aria-controls="panel-api">API</button>
+      <button class="tab" role="tab" id="tab-admin" aria-selected="false" aria-controls="panel-admin">Admin</button>
     </div>
 
     <!-- Overview: readable info only -->
@@ -373,6 +376,11 @@
           </div>
         </div>
         <p class="sub" style="margin:4px 0 0;color:var(--muted);font-size:13px;">Per-session tok/s and details for in-flight and recently completed requests.</p>
+        <label class="switch" style="margin-top:12px;" id="groupToggle">
+          <input type="checkbox" id="groupSessions">
+          <span class="track"></span>
+          <span>Group by conversation</span>
+        </label>
         <div class="sessiongrid" id="sessionGrid"></div>
         <div class="empty-state" id="sessionEmpty">No active sessions. Send a chat request to see live tok/s.</div>
       </section>
@@ -426,8 +434,41 @@
           <li><code>GET /v1/models</code></li>
           <li><code>POST /v1/chat/completions</code></li>
           <li><code>GET /api/events</code> <span class="muted" style="font-size:11px">SSE stream</span></li>
+          <li><code>GET /api/system/info</code> <span class="muted" style="font-size:11px">pid, uptime</span></li>
+          <li><code>POST /api/restart</code> · <code>POST /api/clear-state</code> · <code>POST /api/shutdown</code></li>
         </ul>
         <pre id="modelsOut"></pre>
+      </section>
+    </div>
+
+    <!-- Admin -->
+    <div id="panel-admin" class="tabpanel" role="tabpanel" aria-labelledby="tab-admin">
+      <section class="full">
+        <h2>System</h2>
+        <div class="details" id="adminInfo">
+          <div class="detail-block"><h3>Process</h3><table class="kv"><tbody>
+            <tr><th>PID</th><td id="adminPid" class="v">—</td></tr>
+            <tr><th>uptime</th><td id="adminUptime" class="v">—</td></tr>
+            <tr><th>started</th><td id="adminStarted" class="v">—</td></tr>
+            <tr><th>node</th><td id="adminNode" class="v">—</td></tr>
+          </tbody></table></div>
+          <div class="detail-block"><h3>Network</h3><table class="kv"><tbody>
+            <tr><th>listen</th><td id="adminListen" class="v">—</td></tr>
+            <tr><th>upstream</th><td id="adminUpstream" class="v">—</td></tr>
+          </tbody></table></div>
+          <div class="detail-block"><h3>Live</h3><table class="kv"><tbody>
+            <tr><th>active</th><td id="adminActive" class="v">—</td></tr>
+            <tr><th>queued</th><td id="adminQueued" class="v">—</td></tr>
+            <tr><th>tracked sessions</th><td id="adminSessions" class="v">—</td></tr>
+          </tbody></table></div>
+        </div>
+        <div class="btn-row">
+          <button class="btn tonal" id="adminRefreshBtn">Refresh info</button>
+          <button class="btn" id="clearStateBtn">Clear state</button>
+          <button class="btn tonal" id="restartBtn">Restart proxy</button>
+          <button class="btn danger" id="shutdownBtn">Shut down</button>
+        </div>
+        <pre id="adminOut"></pre>
       </section>
     </div>
     <p class="footer-note">UMANS Proxy · live updates via SSE; polls every 15s as fallback.</p>
@@ -454,7 +495,7 @@
     $('themeDark').onclick = () => setTheme('dark');
 
     // ---- tabs --------------------------------------------------------------
-    const TABS = ['overview', 'sessions', 'test', 'config', 'api'];
+    const TABS = ['overview', 'sessions', 'test', 'config', 'api', 'admin'];
     function selectTab(name) {
       TABS.forEach((t) => {
         const tab = $('tab-' + t), panel = $('panel-' + t);
@@ -463,6 +504,7 @@
         tab.tabIndex = on ? 0 : -1;
         panel.classList.toggle('active', on);
       });
+      if (name === 'admin' && typeof refreshAdmin === 'function') refreshAdmin();
       try { localStorage.setItem('umans-tab', name); } catch {}
     }
     TABS.forEach((t) => { $('tab-' + t).onclick = () => selectTab(t); });
@@ -497,6 +539,15 @@
 
     function number(value) { const n = Number(value || 0); return Number.isFinite(n) ? n : 0; }
     function fmt(n) { n = Number(n || 0); return n >= 1000 ? n.toLocaleString() : String(n); }
+    function fmtTokens(n) {
+      n = Number(n || 0);
+      if (n < 1e6) return n >= 1000 ? n.toLocaleString() : String(n);
+      const units = [['Q', 1e15], ['T', 1e12], ['B', 1e9], ['M', 1e6]];
+      for (const [s, v] of units) {
+        if (n >= v) return (n / v).toFixed(2) + s;
+      }
+      return String(n);
+    }
     function clampPct(p) { return Math.max(0, Math.min(100, Math.round(p))); }
     function positive(value) { const n = Number(value); return Number.isFinite(n) && n > 0 ? n : null; }
 
@@ -542,14 +593,14 @@
       const tokensCached = number(usage.tokens_cached_read ?? usage.tokens_cached ?? usage.cached_tokens);
 
       $('usageRequests').textContent = fmt(usage.requests_in_window ?? usage.requests ?? usage.request_count);
-      $('usageTokens').textContent = fmt(tokensIn + tokensOut);
+      $('usageTokens').textContent = fmtTokens(tokensIn + tokensOut);
       const uncachedIn = Math.max(0, tokensIn - tokensCached);
       const total = tokensIn + tokensOut || 1;
       const cachePct = Math.round((tokensCached / total) * 100);
       const inPct = Math.round((uncachedIn / total) * 100);
       const outPct = Math.round((tokensOut / total) * 100);
       $('usageTokensSub').className = 'sub multiline';
-      $('usageTokensSub').innerHTML = `<div><span>${fmt(tokensCached)} cache</span><span class="v good">${cachePct}%</span></div><div><span>${fmt(uncachedIn)} input</span><span class="v muted-2">${inPct}%</span></div><div><span>${fmt(tokensOut)} output</span><span class="v accent">${outPct}%</span></div>`;
+      $('usageTokensSub').innerHTML = `<div><span>${fmtTokens(tokensCached)} cache</span><span class="v good">${cachePct}%</span></div><div><span>${fmtTokens(uncachedIn)} input</span><span class="v muted-2">${inPct}%</span></div><div><span>${fmtTokens(tokensOut)} output</span><span class="v accent">${outPct}%</span></div>`;
       $('usageConcurrent').textContent = fmt(upstreamConc);
       $('usageConcSub').textContent = `${localActive} active · ${localQueued} queued`;
       $('usageLimit').textContent = concLimit != null ? fmt(concLimit) : '--';
@@ -776,6 +827,47 @@
       renderModelTps(agg.models || []);
     }
 
+    let groupSessions = false;
+    try { groupSessions = localStorage.getItem('umans-group-sessions') === '1'; } catch {}
+    function groupedCardHtml(group) {
+      const sessions = group.sessions;
+      const last = sessions[0]; // sessions are sorted: active/newest first
+      const active = sessions.some((s) => s.active);
+      const statusCls = active ? 'active' : last.status || 'done';
+      const totalTokens = sessions.reduce((a, s) => a + number(s.completionTokens), 0);
+      const totalCached = sessions.reduce((a, s) => a + number(s.cachedTokens), 0);
+      const totalUncached = sessions.reduce((a, s) => a + number(s.uncachedTokens), 0);
+      const totalBytes = sessions.reduce((a, s) => a + number(s.bytes), 0);
+      const earliestStart = sessions.reduce((m, s) => Math.min(m, new Date(s.startedAt).getTime()), Date.now());
+      const latestEnd = sessions.reduce((m, s) => Math.max(m, s.endedAt ? new Date(s.endedAt).getTime() : Date.now()), 0);
+      const elapsed = Math.max(0, (latestEnd || Date.now()) - earliestStart);
+      const allExact = sessions.every((s) => s.exactTokens);
+      const tpsLabel = allExact ? 'tok/s (exact)' : 'tok/s (mixed)';
+      const cacheRate = (totalCached + totalUncached) > 0 ? Math.round((totalCached / (totalCached + totalUncached)) * 1000) / 10 : null;
+      const cacheCls = cacheRate == null ? '' : cacheRate >= 50 ? 'good' : cacheRate > 0 ? 'warn' : '';
+      const cacheStr = cacheRate != null ? cacheRate + '%' : '—';
+      // Sum the rolling TPS from active sessions — consistent with the flat
+      // view's per-session metric. Completed sessions contribute 0.
+      const tps = Math.round(sessions.reduce((a, s) => a + number(s.tps), 0) * 10) / 10;
+      return `<div class="sessioncard ${active ? 'active' : ''}">
+        <div class="sessioncard-head">
+          <span class="sessioncard-model" title="${esc(last.model)}">${esc(last.model)}</span>
+          <span class="sessioncard-status ${statusCls}">${sessions.length} turn${sessions.length === 1 ? '' : 's'}</span>
+        </div>
+        <div class="sessioncard-tps">${fmtTps(tps)}<span class="unit">tok/s</span></div>
+        <div class="sessioncard-tpslabel">${tpsLabel}</div>
+        <div class="sessioncard-meta">
+          <span class="k">input cached</span><span class="v">${fmt(totalCached)}</span>
+          <span class="k">input new</span><span class="v">${fmt(totalUncached)}</span>
+          <span class="k">output</span><span class="v">${fmt(totalTokens)}</span>
+          <span class="k">cache hit</span><span class="v ${cacheCls}">${cacheStr}</span>
+          <span class="k">elapsed</span><span class="v">${fmtElapsed(elapsed)}</span>
+          <span class="k">requests</span><span class="v">${sessions.length}</span>
+          <span class="k">bytes</span><span class="v">${fmtBytes(totalBytes)}</span>
+        </div>
+        <div class="sessioncard-id">${esc(group.groupKey)}</div>
+      </div>`;
+    }
     function renderSessions(data) {
       lastSessionsData = data;
       const grid = $('sessionGrid');
@@ -789,7 +881,18 @@
         if (empty) empty.style.display = '';
       } else {
         if (empty) empty.style.display = 'none';
-        grid.innerHTML = list.map(sessionCardHtml).join('');
+        if (groupSessions) {
+          // Group by groupKey, preserve active/newest-first sort.
+          const groups = new Map();
+          for (const s of list) {
+            const g = groups.get(s.groupKey) || { groupKey: s.groupKey, sessions: [] };
+            g.sessions.push(s);
+            groups.set(s.groupKey, g);
+          }
+          grid.innerHTML = [...groups.values()].map(groupedCardHtml).join('');
+        } else {
+          grid.innerHTML = list.map(sessionCardHtml).join('');
+        }
       }
       scheduleSessionsTimer();
     }
@@ -844,7 +947,17 @@
       renderAggregate(agg);
       if (!list.length) { if ($('sessionEmpty')) $('sessionEmpty').style.display = ''; return; }
       if ($('sessionEmpty')) $('sessionEmpty').style.display = 'none';
-      grid.innerHTML = list.map(sessionCardHtml).join('');
+      if (groupSessions) {
+        const groups = new Map();
+        for (const s of list) {
+          const g = groups.get(s.groupKey) || { groupKey: s.groupKey, sessions: [] };
+          g.sessions.push(s);
+          groups.set(s.groupKey, g);
+        }
+        grid.innerHTML = [...groups.values()].map(groupedCardHtml).join('');
+      } else {
+        grid.innerHTML = list.map(sessionCardHtml).join('');
+      }
     }
 
     async function refreshUsage(force = false) {
@@ -926,6 +1039,87 @@
     // ---- wiring ------------------------------------------------------------
     $('saveBtn').onclick = save;
     $('reloadBtn').onclick = refresh;
+    $('groupSessions').checked = groupSessions;
+    $('groupSessions').onchange = () => {
+      groupSessions = $('groupSessions').checked;
+      try { localStorage.setItem('umans-group-sessions', groupSessions ? '1' : '0'); } catch {}
+      if (lastSessionsData) renderSessions(lastSessionsData);
+    };
+    // ---- admin -------------------------------------------------------------
+    function fmtUptime(ms) {
+      ms = Math.max(0, Number(ms || 0));
+      const s = Math.floor(ms / 1000);
+      if (s < 60) return s + 's';
+      const m = Math.floor(s / 60);
+      if (m < 60) return m + 'm ' + (s % 60) + 's';
+      const h = Math.floor(m / 60);
+      return h + 'h ' + (m % 60) + 'm';
+    }
+    async function refreshAdmin() {
+      try {
+        const info = await json('/api/system/info');
+        $('adminPid').textContent = info.pid;
+        $('adminUptime').textContent = fmtUptime(info.uptimeMs);
+        $('adminStarted').textContent = info.startedAt ? new Date(info.startedAt).toLocaleString() : '—';
+        $('adminNode').textContent = info.nodeVersion;
+        $('adminListen').textContent = info.listenAddr;
+        $('adminUpstream').textContent = info.upstream;
+        $('adminActive').textContent = fmt(info.activeRequests);
+        $('adminQueued').textContent = fmt(info.queuedRequests);
+        $('adminSessions').textContent = fmt(info.sessionsTracked);
+        $('adminOut').textContent = '';
+      } catch (err) {
+        $('adminOut').textContent = err.message;
+      }
+    }
+    function adminBusy(id, label) {
+      const btn = $(id); const old = btn.innerHTML; btn.disabled = true; btn.innerHTML = '<span class="spin"></span>' + label;
+      return () => { btn.disabled = false; btn.innerHTML = old; };
+    }
+    function adminDie(msg) {
+      setStatus('bad', msg);
+      if (sse) { try { sse.close(); } catch {} sse = null; }
+      ['restartBtn', 'shutdownBtn', 'clearStateBtn', 'adminRefreshBtn'].forEach((id) => { $(id).disabled = true; });
+    }
+    $('adminRefreshBtn').onclick = refreshAdmin;
+    $('clearStateBtn').onclick = async () => {
+      if (!confirm('Clear all live session tracking and in-memory caches? Config is unaffected.')) return;
+      const done = adminBusy('clearStateBtn', 'Clearing');
+      try {
+        await json('/api/clear-state', { method: 'POST' });
+        $('adminOut').textContent = 'State cleared.';
+        await refreshAdmin();
+      } catch (err) { $('adminOut').textContent = err.message; }
+      finally { done(); }
+    };
+    $('restartBtn').onclick = async () => {
+      if (!confirm('Restart the proxy? A new process spawns and replaces this one; the dashboard may briefly drop.')) return;
+      const done = adminBusy('restartBtn', 'Restarting');
+      try {
+        await json('/api/restart', { method: 'POST' });
+        // The proxy is shutting down; expect the fetch to resolve then the
+        // connection to drop. Poll /health until the successor is back.
+        await new Promise((r) => setTimeout(r, 1500));
+        let up = false;
+        for (let i = 0; i < 20; i++) {
+          try { await json('/health'); up = true; break; } catch { await new Promise((r) => setTimeout(r, 1000)); }
+        }
+        if (up) { setStatus('ok', 'Restarted'); $('adminOut').textContent = 'Proxy restarted.'; await refreshAdmin(); }
+        else adminDie('Restarted — not yet reachable');
+      } catch { adminDie('Restarting — connection lost'); }
+      finally { done(); }
+    };
+    $('shutdownBtn').onclick = async () => {
+      if (!confirm('Shut down the proxy? The dashboard will stop responding until you restart it manually.')) return;
+      const done = adminBusy('shutdownBtn', 'Stopping');
+      try {
+        await json('/api/shutdown', { method: 'POST' });
+        adminDie('Stopped');
+      } catch {
+        // Fetch failure is expected: the proxy died mid-response.
+        adminDie('Stopped');
+      } finally { done(); }
+    };
     $('modelsBtn').onclick = checkModels;
     $('usageBtn').onclick = () => refreshUsage(true);
     $('testBtn').onclick = testChat;

@@ -178,9 +178,11 @@
 
     /* ---- usage stats ---- */
     .stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
-    .stat { background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 14px 16px; }
-    .stat strong { display: block; font-size: 22px; font-weight: 650; font-variant-numeric: tabular-nums; letter-spacing: -0.02em; margin-bottom: 3px; color: var(--accent); }
-    .stat span { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; font-weight: 600; }
+    /* Shared card base for .stat (usage) and .live (livegrid/model stats) */
+    .stat, .live { background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 14px 14px; }
+    .stat strong, .live strong { display: block; font-size: 22px; font-weight: 650; font-variant-numeric: tabular-nums; letter-spacing: -0.02em; margin-bottom: 3px; }
+    .stat span, .live span { color: var(--muted); font-size: 10.5px; text-transform: uppercase; letter-spacing: .04em; font-weight: 600; }
+    .stat strong { color: var(--accent); }
     .stat .sub { color: var(--muted-2); font-size: 11px; margin-top: 3px; text-transform: none; letter-spacing: 0; font-weight: 400; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .stat .sub.multiline { white-space: normal; overflow: visible; line-height: 1.7; }
     .stat .sub.multiline > div { display: flex; justify-content: space-between; gap: 8px; }
@@ -191,9 +193,8 @@
     .meter-labels { display: flex; justify-content: space-between; margin-top: 6px; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
     .meter-labels strong { color: var(--text); font-weight: 650; }
     .livegrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 12px; margin-top: 16px; }
-    .live { background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 14px 14px; text-align: center; }
-    .live strong { display: block; font-size: 22px; font-weight: 650; font-variant-numeric: tabular-nums; color: var(--text); margin-bottom: 3px; }
-    .live span { color: var(--muted); font-size: 10.5px; text-transform: uppercase; letter-spacing: .04em; font-weight: 600; }
+    .live { text-align: center; }
+    .live strong { color: var(--text); }
     .live.accent strong { color: var(--accent); }
     .live.model { text-align: left; }
     .live.model .model-name { font-size: 10.5px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .04em; margin-bottom: 6px; }

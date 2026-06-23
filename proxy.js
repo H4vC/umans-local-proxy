@@ -355,8 +355,18 @@ function getSessionsSnapshot() {
   // Per-session TPS distribution stats from completed sessions only.
   // Uses finalTps (true generation rate, TTFT excluded) — never the live
   // rolling tps of active sessions. Null when no completed sessions yet.
-  const tpsValues = list.filter((s) => !s.active && s.finalTps != null && s.finalTps > 0)
-    .map((s) => s.finalTps).sort((a, b) => a - b);
+  const tpsByModel = new Map(); // model -> [finalTps, ...] sorted
+  const tpsValues = [];
+  for (const s of list) {
+    if (!s.active && s.finalTps != null && s.finalTps > 0) {
+      tpsValues.push(s.finalTps);
+      let arr = tpsByModel.get(s.model);
+      if (!arr) { arr = []; tpsByModel.set(s.model, arr); }
+      arr.push(s.finalTps);
+    }
+  }
+  tpsValues.sort((a, b) => a - b);
+  for (const arr of tpsByModel.values()) arr.sort((a, b) => a - b);
   const percentile = (arr, p) => {
     if (!arr.length) return null;
     const idx = Math.min(arr.length - 1, Math.max(0, Math.floor((arr.length - 1) * p)));
@@ -364,24 +374,26 @@ function getSessionsSnapshot() {
   };
   const medianTps = percentile(tpsValues, 0.5);
   const p10Tps = percentile(tpsValues, 0.1);
-  // Group summaries: persistent stats per conversation, surviving past
-  // individual session expiry. The dashboard merges these with live sessions
-  // for the grouped view so turn counts stay accurate when older sessions
-  // have been cleaned up.
+  // Per-model breakdown: live rolling TPS + median/p10 from completed sessions.
+  const liveModelTps = modelTpsBreakdown();
+  const models = liveModelTps.map((m) => {
+    const vals = tpsByModel.get(m.model);
+    return {
+      model: m.model,
+      tps: Math.round(m.tps * 10) / 10,
+      medianTps: vals ? percentile(vals, 0.5) : null,
+      p10Tps: vals ? percentile(vals, 0.1) : null,
+    };
+  });
   const groups = [...groupSummaries.values()].map((g) => {
     const avgFinal = g.finalTpsCount
       ? Math.round(g.finalTpsSum / g.finalTpsCount * 10) / 10
       : null;
     return {
-      groupKey: g.groupKey,
-      model: g.model,
-      turnCount: g.turnCount,
-      totalTokens: g.totalTokens,
-      totalCached: g.totalCached,
-      totalUncached: g.totalUncached,
-      totalBytes: g.totalBytes,
-      avgFinalTps: avgFinal,
-      lastSeenAt: g.lastSeenAt,
+      groupKey: g.groupKey, model: g.model, turnCount: g.turnCount,
+      totalTokens: g.totalTokens, totalCached: g.totalCached,
+      totalUncached: g.totalUncached, totalBytes: g.totalBytes,
+      avgFinalTps: avgFinal, lastSeenAt: g.lastSeenAt,
     };
   });
   return {
@@ -392,14 +404,11 @@ function getSessionsSnapshot() {
       activeSessions: (() => { let n = 0; for (const s of sessions.values()) if (s.status === 'active') n++; return n; })(),
       medianTps,
       p10Tps,
-      // Per-model TPS for models actually used, sorted desc by tps.
-      models: modelTpsBreakdown().map((m) => ({ model: m.model, tps: Math.round(m.tps * 10) / 10 })),
+      // Per-model: live rolling TPS + median/p10 from completed sessions.
+      models,
     },
   };
 }
-
-// Broadcast sessions snapshot on a throttle (at most once per second) while
-// sessions are active. Stops the timer when no active sessions remain.
 function scheduleSessionsBroadcast() {
   if (broadcastThrottled) return;
   let hasActive = false;

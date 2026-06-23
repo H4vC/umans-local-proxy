@@ -353,9 +353,9 @@
           <div class="live" id="delayedCard"><strong id="liveQueued">0</strong><span>delayed</span></div>
           <div class="live"><strong id="liveRemaining">--</strong><span>remaining</span></div>
           <div class="live accent"><strong id="liveTps">0.0</strong><span>tokens/sec</span><div class="sub" id="liveTpsSub" style="text-transform:none;letter-spacing:0;font-weight:400;color:var(--muted-2);font-size:11px;margin-top:3px;">all sessions</div></div>
-          <div class="live"><strong id="liveMedianTps">--</strong><span>median tok/s</span></div>
-          <div class="live"><strong id="liveP10Tps">--</strong><span>p10 low tok/s</span></div>
         </div>
+
+        <div id="modelStats" style="margin-top:16px;"></div>
 
         <div id="delayBanner" class="banner" role="status" aria-live="polite" hidden><span class="spin"></span><span id="delayBannerText">0 requests delayed — waiting for a concurrency slot</span></div>
 
@@ -827,12 +827,10 @@
 
     function renderAggregate(agg) {
       if ($('liveTps')) $('liveTps').textContent = fmtTps(agg.tps);
-      if ($('liveMedianTps')) $('liveMedianTps').textContent = agg.medianTps != null ? fmtTps(agg.medianTps) : '--';
-      if ($('liveP10Tps')) $('liveP10Tps').textContent = agg.p10Tps != null ? fmtTps(agg.p10Tps) : '--';
       if ($('aggTps')) $('aggTps').textContent = fmtTps(agg.tps);
       if ($('aggActive')) $('aggActive').textContent = fmt(agg.activeSessions ?? 0);
       if ($('aggTotal')) $('aggTotal').textContent = fmt(agg.totalSessions ?? 0);
-      renderModelTps(agg.models || []);
+      renderModelStats(agg.models || [], agg.medianTps, agg.p10Tps);
     }
 
     let groupSessions = false;
@@ -942,23 +940,20 @@
       scheduleSessionsTimer();
     }
 
-    // Overview: per-model TPS breakdown. Only surfaces models we have actually
-    // used (server-side seenModels). Rendered as chips beneath the livegrid.
-    function renderModelTps(models) {
-      let el = $('modelTpsRow');
-      if (!el) {
-        // Lazily create the container if not present yet.
-        const livegrid = document.querySelector('#panel-overview .livegrid');
-        if (!livegrid) return;
-        el = document.createElement('div');
-        el.id = 'modelTpsRow';
-        el.className = 'chips';
-        el.style.marginTop = '16px';
-        livegrid.parentNode.insertBefore(el, livegrid.nextSibling);
-      }
+    // Overview: per-model TPS breakdown with median/p10 from completed sessions.
+    // Renders as a grid of stat cards — one per model that has been used.
+    function renderModelStats(models, globalMedian, globalP10) {
+      const el = $('modelStats');
+      if (!el) return;
       const used = models.filter((m) => m.tps > 0 || lastSessionsData?.sessions?.some((s) => s.model === m.model && s.active));
       if (!used.length) { el.innerHTML = ''; return; }
-      el.innerHTML = used.map((m) => `<span class="chip ${m.tps > 0 ? 'ok' : ''}">${esc(m.model)} · ${fmtTps(m.tps)} tok/s</span>`).join('');
+      const cards = used.map((m) => {
+        const live = m.tps > 0 ? `<span style="color:var(--accent)">${fmtTps(m.tps)}</span>` : '—';
+        const med = m.medianTps != null ? fmtTps(m.medianTps) : '--';
+        const p10 = m.p10Tps != null ? fmtTps(m.p10Tps) : '--';
+        return `<div class="live"><strong>${live}</strong><span>${esc(m.model)}</span><div class="sub multiline" style="margin-top:4px;"><div><span style="color:var(--muted-2);">med</span><span>${med} tok/s</span></div><div><span style="color:var(--muted-2);">p10</span><span>${p10} tok/s</span></div></div></div>`;
+      }).join('');
+      el.innerHTML = `<div class="livegrid">${cards}</div>`;
     }
 
     // Local timer: between SSE updates, re-render with a smooth TPS decay.

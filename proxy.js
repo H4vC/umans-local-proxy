@@ -168,8 +168,10 @@ function finalizeSession(session, status) {
   if (!session) return;
   session.status = status;
   session.endedAt = Date.now();
-  // Keep the entry briefly so the UI can render final state; drop after 5s.
-  setTimeout(() => { sessions.delete(session.id); scheduleSessionsBroadcast(); }, 5000);
+  // Keep the entry so the dashboard can show completed sessions and group
+  // multi-turn conversations. 120s covers typical inter-turn gaps; the
+  // stateMap (5 min TTL) handles prefix→groupKey coalescing independently.
+  setTimeout(() => { sessions.delete(session.id); scheduleSessionsBroadcast(); }, 120000);
   scheduleSessionsBroadcast();
 }
 

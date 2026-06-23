@@ -930,9 +930,9 @@
             if (!groups.has(key)) groups.set(key, { groupKey: key, sessions: [], summary });
           }
           const sorted = [...groups.values()].sort((a, b) => {
-            const at = a.sessions[0]?.startedAt || a.summary?.lastSeenAt || 0;
-            const bt = b.sessions[0]?.startedAt || b.summary?.lastSeenAt || 0;
-            return bt.localeCompare ? bt.localeCompare(at) : (bt - at || 0);
+            const at = a.sessions[0]?.startedAt ? new Date(a.sessions[0].startedAt).getTime() : (a.summary?.lastSeenAt || 0);
+            const bt = b.sessions[0]?.startedAt ? new Date(b.sessions[0].startedAt).getTime() : (b.summary?.lastSeenAt || 0);
+            return bt - at;
           });
           grid.innerHTML = sorted.map(groupedCardHtml).join('');
         } else {
@@ -1009,9 +1009,9 @@
           if (!groups.has(key)) groups.set(key, { groupKey: key, sessions: [], summary });
         }
         const sorted = [...groups.values()].sort((a, b) => {
-          const at = a.sessions[0]?.startedAt || a.summary?.lastSeenAt || 0;
-          const bt = b.sessions[0]?.startedAt || b.summary?.lastSeenAt || 0;
-          return bt.localeCompare ? bt.localeCompare(at) : (bt - at || 0);
+          const at = a.sessions[0]?.startedAt ? new Date(a.sessions[0].startedAt).getTime() : (a.summary?.lastSeenAt || 0);
+          const bt = b.sessions[0]?.startedAt ? new Date(b.sessions[0].startedAt).getTime() : (b.summary?.lastSeenAt || 0);
+          return bt - at;
         });
         grid.innerHTML = sorted.map(groupedCardHtml).join('');
       } else {

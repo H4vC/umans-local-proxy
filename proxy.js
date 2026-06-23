@@ -37,7 +37,7 @@ const tpsBuckets = []; // { time, tokens }
 const tpsBucketsByModel = new Map(); // model -> [{ time, tokens }]
 const seenModels = new Set();
 // Debug ring buffer: captures coalescing trace data for live inspection.
-// Accessed via GET /api/debug/coalesce (no auth, localhost only).
+// Accessed via GET /api/debug/coalesce (requires proxy auth).
 const coalesceDebug = [];
 const COALESCE_DEBUG_MAX = 50;
 function logCoalesce(entry) {
@@ -589,7 +589,6 @@ class ChatTap {
             }
           }
           if (chars > 0) {
-            if (!this.session.firstTokenAt) this.session.firstTokenAt = Date.now();
             this.session.chars += chars;
             const est = estimateTokensFromChars(this.session.model, this.session.chars);
             const prev = this.session.outputTokens;

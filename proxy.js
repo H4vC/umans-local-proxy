@@ -834,7 +834,7 @@ function canStart(effective) {
   return true;
 }
 
-async function acquireThrottleSlot(res, signal) {
+async function acquireThrottleSlot(res, signal, { keepalive } = {}) {
   if (signal?.aborted) throw new Error('aborted');
   let effective = getEffectiveConcurrency();
   // Cold cache: if the concurrency limit is unknown, we need it before
@@ -846,19 +846,16 @@ async function acquireThrottleSlot(res, signal) {
     if (activeRequests === 0) refreshUsageSoon();
     else { await fetchUmansUsage(); effective = getEffectiveConcurrency(); }
   }
-  // Keep the downstream client alive across long queue waits (>30s idle timeouts).
-  // 102 Processing is an interim response: it does not commit the final status
-  // and is ignored by HTTP clients, but resets their read/idle timers.
-  let keepalive = null;
+  // While queued, emit SSE comment frames to keep omp's idle watchdog alive.
+  // omp's iterateWithIdleTimeout counts SSE events; comment frames reset it.
+  // This only applies to streaming requests where we've already sent 200 + SSE
+  // headers. Non-streaming requests just wait (omp's timeout:false covers them).
+  let keepaliveTimer = null;
   try {
     while (!canStart(effective)) {
       if (signal?.aborted) throw new Error('aborted');
-      if (!keepalive && res && !res.headersSent && res.socket && !res.socket.destroyed) {
-        res.socket.write('HTTP/1.1 102 Processing\r\n\r\n');
-        keepalive = setInterval(() => {
-          if (!res.headersSent && res.socket && !res.socket.destroyed) res.socket.write('HTTP/1.1 102 Processing\r\n\r\n');
-        }, 5000);
-      }
+      // Start keepalive on first queue iteration if the caller provided one.
+      if (!keepaliveTimer && keepalive) keepaliveTimer = setInterval(keepalive, 3000);
       queuedRequests++;
       try {
         await new Promise((resolve, reject) => {
@@ -880,7 +877,7 @@ async function acquireThrottleSlot(res, signal) {
       effective = getEffectiveConcurrency();
     }
   } finally {
-    if (keepalive) clearInterval(keepalive);
+    if (keepaliveTimer) clearInterval(keepaliveTimer);
   }
   if (signal?.aborted) throw new Error('aborted');
   activeRequests++;
@@ -1081,10 +1078,41 @@ async function handleChat(req, res) {
   if (closed) { sessionStatus = 'aborted'; controller.abort(); }
   else res.on('close', onClose);
 
-  try { await acquireThrottleSlot(res, controller.signal); }
-  catch (err) {
+  // For streaming requests, send 200 + SSE headers BEFORE acquiring the
+  // throttle slot. This lets omp's fetch resolve, starts its SSE idle
+  // watchdog, and lets us emit comment-frame keepalives while queued.
+  // omp's iterateWithIdleTimeout counts SSE events; comment frames reset it.
+  // Non-streaming requests wait normally (omp's timeout:false covers them).
+  const isStream = !!payload.stream;
+  let headersSentEarly = false;
+  if (isStream && !closed) {
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+      'X-Accel-Buffering': 'no',
+    });
+    headersSentEarly = true;
+  }
+
+  try {
+    await acquireThrottleSlot(res, controller.signal, {
+      keepalive: headersSentEarly ? () => {
+        if (!closed && !res.destroyed) {
+          try { res.write(': queued\n\n'); } catch {}
+        }
+      } : undefined,
+    });
+  } catch (err) {
     if (closed) return;
-    return openAIError(res, 503, err.message, 'rate_limit_error');
+    if (headersSentEarly) {
+      // Already sent 200; emit an SSE error event and end the stream.
+      try { res.write(`data: ${JSON.stringify({ error: { message: err.message, type: 'rate_limit_error' } })}\n\n`); } catch {}
+      res.end();
+    } else {
+      return openAIError(res, 503, err.message, 'rate_limit_error');
+    }
+    return;
   }
   let timedOut = false;
   const timeout = setTimeout(() => { timedOut = true; sessionStatus = 'aborted'; controller.abort(); }, config.requestTimeout);
@@ -1124,7 +1152,20 @@ async function handleChat(req, res) {
       signal: controller.signal,
     });
     refreshUsageSoon();
-    res.writeHead(upstream.status, safeHeaders(upstream.headers));
+
+    if (headersSentEarly) {
+      // We already sent 200 + SSE headers. If upstream returned an error,
+      // emit it as an SSE error event (can't change the HTTP status now).
+      if (!upstream.ok) {
+        const errText = await upstream.text().catch(() => upstream.statusText);
+        try { res.write(`data: ${JSON.stringify({ error: { message: `upstream ${upstream.status}: ${errText.slice(0, 500)}`, type: 'upstream_error' } })}\n\n`); } catch {}
+        res.end();
+        sessionStatus = 'error';
+        return;
+      }
+    } else {
+      res.writeHead(upstream.status, safeHeaders(upstream.headers));
+    }
     if (!upstream.body) return res.end();
 
     const reader = upstream.body.getReader();
@@ -1147,8 +1188,13 @@ async function handleChat(req, res) {
     if (!closed) res.end();
   } catch (err) {
     if (!closed) logError('Chat proxy failed', err);
-    if (!res.headersSent && !closed) openAIError(res, timedOut ? 504 : 502, timedOut ? 'upstream request timed out' : err.message);
-    else if (!closed) res.end();
+    if (!res.headersSent && !headersSentEarly && !closed) openAIError(res, timedOut ? 504 : 502, timedOut ? 'upstream request timed out' : err.message);
+    else if (!closed) {
+      if (headersSentEarly) {
+        try { res.write(`data: ${JSON.stringify({ error: { message: timedOut ? 'upstream request timed out' : err.message, type: 'server_error' } })}\n\n`); } catch {}
+      }
+      res.end();
+    }
     sessionStatus = closed || timedOut ? 'aborted' : 'error';
   }
   finally {

@@ -191,6 +191,12 @@
     .stat.model .model-sub { font-size: 12px; color: var(--muted-2); font-variant-numeric: tabular-nums; margin-top: 6px; }
     .stat.model .model-sub .val { color: var(--text-2); font-weight: 500; }
 
+    .meter { margin: 20px 0 4px; }
+    .meter-track { height: 10px; border-radius: var(--radius-sm); background: var(--surface-3); overflow: hidden; }
+    .meter-fill { height: 100%; border-radius: var(--radius-sm); transition: width .4s cubic-bezier(.2,.7,.3,1), background .3s ease; background: var(--good); }
+    .meter-labels { display: flex; justify-content: space-between; margin-top: 6px; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+    .meter-labels strong { color: var(--text); font-weight: 650; }
+
     /* ---- sessions ---- */
     .sessions-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 4px; flex-wrap: wrap; }
     .sessions-head .agg { display: flex; gap: 18px; align-items: baseline; font-variant-numeric: tabular-nums; }

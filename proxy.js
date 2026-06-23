@@ -36,6 +36,14 @@ const tpsBuckets = []; // { time, tokens }
 // The dashboard Overview breaks down TPS by model, surfacing only seen models.
 const tpsBucketsByModel = new Map(); // model -> [{ time, tokens }]
 const seenModels = new Set();
+// Debug ring buffer: captures coalescing trace data for live inspection.
+// Accessed via GET /api/debug/coalesce (no auth, localhost only).
+const coalesceDebug = [];
+const COALESCE_DEBUG_MAX = 50;
+function logCoalesce(entry) {
+  coalesceDebug.push(entry);
+  if (coalesceDebug.length > COALESCE_DEBUG_MAX) coalesceDebug.shift();
+}
 let sessionsBroadcastTimer = null;
 let broadcastThrottled = false;
 const SESSION_BROADCAST_MIN_MS = 1000;
@@ -89,8 +97,20 @@ function fnv1a(str) {
 // a system prompt reused across 50 turns is stringified+hashed exactly once.
 // True LRU: on a hit, delete + re-insert to move to end (most-recently-used).
 // Map iteration order is insertion order, so keys().next() returns the LRU.
+// Normalize a message to its cache-relevant identity: role + content text.
+// Extra fields (refusal, reasoning_content, tool_calls, provider_specific_fields,
+// …) vary between what the proxy captures and what the client replays, so
+// they MUST NOT participate in the prefix hash. content null → "" so that a
+// reasoning-only turn (proxy saw "" , client sends null) still coalesces.
+function canonicalMessage(message) {
+  const content = message?.content;
+  return {
+    role: message?.role || '',
+    content: typeof content === 'string' ? content : (content == null ? '' : JSON.stringify(content)),
+  };
+}
 function messageHash(message) {
-  const json = JSON.stringify(message);
+  const json = JSON.stringify(canonicalMessage(message));
   let h = messageHashCache.get(json);
   if (h !== undefined) {
     // Promote to most-recently-used by re-inserting.
@@ -125,7 +145,9 @@ function chainHash(model, messages, fromChain) {
 function resolveGroupKey(model, messages) {
   const prefix = messages.slice(0, -1);
   const prefixChain = chainHash(model, prefix);
-  const groupKey = stateMap.get(prefixChain) || newSessionId();
+  const hit = stateMap.get(prefixChain);
+  const groupKey = hit || newSessionId();
+  logCoalesce({ t: Date.now(), type: 'resolve', model, msgCount: messages.length, prefixMsgCount: prefix.length, prefixChain, stateMapHit: !!hit, groupKey, stateMapSize: stateMap.size });
   return { groupKey, prefixChain };
 }
 
@@ -134,10 +156,13 @@ function resolveGroupKey(model, messages) {
 // session completion — never in the streaming hot path. Accepts the saved
 // prefixChain from resolveGroupKey to avoid re-walking the prefix.
 function storeStateKey(model, messages, responseContent, groupKey, prefixChain) {
+  const lastUser = messages[messages.length - 1];
   const responseMsg = { role: 'assistant', content: responseContent || '' };
   // Extend the saved prefix chain with the final user turn + the response.
-  const stateChain = chainHash(model, [messages[messages.length - 1], responseMsg], prefixChain);
+  const stateChain = chainHash(model, [lastUser, responseMsg], prefixChain);
   stateMap.set(stateChain, groupKey);
+  // Debug: capture what we stored vs what the client sent as the last user msg.
+  logCoalesce({ t: Date.now(), type: 'store', model, msgCount: messages.length, stateChain, prefixChain, groupKey, responseContentLen: (responseContent || '').length, responseContentPreview: (responseContent || '').slice(0, 100), lastUserMsg: JSON.stringify(lastUser).slice(0, 200), lastUserHash: messageHash(lastUser), responseMsgHash: messageHash(responseMsg) });
   setTimeout(() => { stateMap.delete(stateChain); }, COALESCE_TTL_MS).unref();
 }
 
@@ -158,7 +183,7 @@ function createSession({ model, stream, groupKey }) {
     cachedTokens: 0,         // input tokens served from cache
     completionTokens: 0,     // output (completion) tokens
     responseContent: '',    // accumulated assistant reply (for coalescing stateKey)
-    endedAt: null,
+    finalTps: null,         // set at finalize: outputTokens / real elapsed (no 5s cap)
   };
   sessions.set(id, session);
   return session;
@@ -168,6 +193,9 @@ function finalizeSession(session, status) {
   if (!session) return;
   session.status = status;
   session.endedAt = Date.now();
+  // Record the true end-to-end TPS (no 5s cap) for stats.
+  const elapsed = Math.max(1, session.endedAt - session.startedAt);
+  session.finalTps = session.outputTokens > 0 ? Math.round((session.outputTokens / elapsed) * 1000 * 10) / 10 : 0;
   // Keep the entry so the dashboard can show completed sessions and group
   // multi-turn conversations. 120s covers typical inter-turn gaps; the
   // stateMap (5 min TTL) handles prefix→groupKey coalescing independently.
@@ -262,6 +290,7 @@ function sessionPublicView(session) {
     cacheHitRate: session.promptTokens > 0 ? Math.round((session.cachedTokens / session.promptTokens) * 1000) / 10 : null,
     bytes: session.bytes,
     tps: Math.round(sessionTps(session) * 10) / 10,
+    finalTps: session.finalTps,
   };
 }
 
@@ -1377,6 +1406,7 @@ async function handleRequest(req, res) {
   if (url.pathname === '/api/shutdown') return handleShutdown(req, res);
   if (url.pathname === '/api/restart') return handleRestart(req, res);
   if (url.pathname === '/api/clear-state') return handleClearState(req, res);
+  if (url.pathname === '/api/debug/coalesce') return writeJSON(res, 200, coalesceDebug);
   if (url.pathname === '/api/system/info') return handleSystemInfo(req, res);
   writeText(res, 404, 'Not Found');
 }

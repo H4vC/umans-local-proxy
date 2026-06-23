@@ -376,11 +376,18 @@
           </div>
         </div>
         <p class="sub" style="margin:4px 0 0;color:var(--muted);font-size:13px;">Per-session tok/s and details for in-flight and recently completed requests.</p>
-        <label class="switch" style="margin-top:12px;" id="groupToggle">
-          <input type="checkbox" id="groupSessions">
-          <span class="track"></span>
-          <span>Group by conversation</span>
-        </label>
+        <div style="display:flex;gap:16px;align-items:center;flex-wrap:wrap;margin-top:12px;">
+          <label class="switch" id="groupToggle">
+            <input type="checkbox" id="groupSessions">
+            <span class="track"></span>
+            <span>Group by conversation</span>
+          </label>
+          <label class="switch" id="activeOnlyToggle">
+            <input type="checkbox" id="activeOnly">
+            <span class="track"></span>
+            <span>Active only</span>
+          </label>
+        </div>
         <div class="sessiongrid" id="sessionGrid"></div>
         <div class="empty-state" id="sessionEmpty">No active sessions. Send a chat request to see live tok/s.</div>
       </section>
@@ -828,7 +835,9 @@
     }
 
     let groupSessions = false;
+    let activeOnly = false;
     try { groupSessions = localStorage.getItem('umans-group-sessions') === '1'; } catch {}
+    try { activeOnly = localStorage.getItem('umans-active-only') === '1'; } catch {}
     function groupedCardHtml(group) {
       const sessions = group.sessions;
       const last = sessions[0]; // sessions are sorted: active/newest first
@@ -873,7 +882,8 @@
       const grid = $('sessionGrid');
       const empty = $('sessionEmpty');
       if (!grid) return;
-      const list = data?.sessions || [];
+      const allList = data?.sessions || [];
+      const list = activeOnly ? allList.filter((s) => s.active) : allList;
       const agg = data?.aggregate || {};
       renderAggregate(agg);
       if (!list.length) {
@@ -942,7 +952,8 @@
     function renderSessionsInner(data) {
       const grid = $('sessionGrid');
       if (!grid) return;
-      const list = data?.sessions || [];
+      const allList = data?.sessions || [];
+      const list = activeOnly ? allList.filter((s) => s.active) : allList;
       const agg = data?.aggregate || {};
       renderAggregate(agg);
       if (!list.length) { if ($('sessionEmpty')) $('sessionEmpty').style.display = ''; return; }
@@ -1043,6 +1054,12 @@
     $('groupSessions').onchange = () => {
       groupSessions = $('groupSessions').checked;
       try { localStorage.setItem('umans-group-sessions', groupSessions ? '1' : '0'); } catch {}
+      if (lastSessionsData) renderSessions(lastSessionsData);
+    };
+    $('activeOnly').checked = activeOnly;
+    $('activeOnly').onchange = () => {
+      activeOnly = $('activeOnly').checked;
+      try { localStorage.setItem('umans-active-only', activeOnly ? '1' : '0'); } catch {}
       if (lastSessionsData) renderSessions(lastSessionsData);
     };
     // ---- admin -------------------------------------------------------------

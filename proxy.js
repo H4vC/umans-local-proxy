@@ -183,7 +183,8 @@ function createSession({ model, stream, groupKey }) {
     cachedTokens: 0,         // input tokens served from cache
     completionTokens: 0,     // output (completion) tokens
     responseContent: '',    // accumulated assistant reply (for coalescing stateKey)
-    finalTps: null,         // set at finalize: outputTokens / real elapsed (no 5s cap)
+    finalTps: null,         // set at finalize: outputTokens / generation time (TTFT excluded)
+    firstTokenAt: null,      // set on first content delta; finalTps excludes TTFT
   };
   sessions.set(id, session);
   return session;
@@ -193,9 +194,18 @@ function finalizeSession(session, status) {
   if (!session) return;
   session.status = status;
   session.endedAt = Date.now();
-  // Record the true end-to-end TPS (no 5s cap) for stats.
-  const elapsed = Math.max(1, session.endedAt - session.startedAt);
-  session.finalTps = session.outputTokens > 0 ? Math.round((session.outputTokens / elapsed) * 1000 * 10) / 10 : 0;
+  // Record the true generation TPS for stats. Exclude TTFT (time from
+  // request start to first token) so queue time + prefill doesn't dilute
+  // the rate. If we never saw a token, finalTps stays null.
+  if (session.outputTokens > 0 && session.firstTokenAt) {
+    const genMs = Math.max(1, session.endedAt - session.firstTokenAt);
+    session.finalTps = Math.round((session.outputTokens / genMs) * 1000 * 10) / 10;
+  } else if (session.outputTokens > 0) {
+    // No firstTokenAt (e.g. non-streaming with immediate body): fall back
+    // to full elapsed so we still have a number, but it includes TTFT.
+    const elapsed = Math.max(1, session.endedAt - session.startedAt);
+    session.finalTps = Math.round((session.outputTokens / elapsed) * 1000 * 10) / 10;
+  }
   // Keep the entry so the dashboard can show completed sessions and group
   // multi-turn conversations. 120s covers typical inter-turn gaps; the
   // stateMap (5 min TTL) handles prefix→groupKey coalescing independently.
@@ -298,9 +308,11 @@ function getSessionsSnapshot() {
   const list = [...sessions.values()].map(sessionPublicView);
   // Active first, then most recent.
   list.sort((a, b) => (a.active === b.active ? b.startedAt.localeCompare(a.startedAt) : a.active ? -1 : 1));
-  // Per-session TPS distribution stats: median and p10 (low). Computed across
-  // all tracked sessions that produced tokens; null when no data yet.
-  const tpsValues = list.map((s) => s.tps).filter((t) => t > 0).sort((a, b) => a - b);
+  // Per-session TPS distribution stats from completed sessions only.
+  // Uses finalTps (true generation rate, TTFT excluded) — never the live
+  // rolling tps of active sessions. Null when no completed sessions yet.
+  const tpsValues = list.filter((s) => !s.active && s.finalTps != null && s.finalTps > 0)
+    .map((s) => s.finalTps).sort((a, b) => a - b);
   const percentile = (arr, p) => {
     if (!arr.length) return null;
     const idx = Math.min(arr.length - 1, Math.max(0, Math.floor((arr.length - 1) * p)));
@@ -447,6 +459,7 @@ class ChatTap {
       }
     }
     if (chars > 0) {
+      if (!this.session.firstTokenAt) this.session.firstTokenAt = Date.now();
       this.session.chars += chars;
       this.session.outputTokens = estimateTokensFromChars(this.session.model, this.session.chars);
     }
@@ -515,6 +528,7 @@ class ChatTap {
             }
           }
           if (chars > 0) {
+            if (!this.session.firstTokenAt) this.session.firstTokenAt = Date.now();
             this.session.chars += chars;
             const est = estimateTokensFromChars(this.session.model, this.session.chars);
             const prev = this.session.outputTokens;

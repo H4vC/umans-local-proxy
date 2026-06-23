@@ -784,6 +784,8 @@
     // ---- sessions + TPS ----------------------------------------------------
     let lastSessionsData = null;
     let sessionsTimer = null;
+    const sessionCards = new Map(); // key -> HTMLElement, reused across updates
+    let currentSkeleton = null;    // tracks skeleton type; cleared on view toggle
 
     function fmtTps(n) { n = Number(n || 0); return (n >= 100 ? Math.round(n) : n.toFixed(1)); }
     function fmtElapsed(ms) {
@@ -800,32 +802,52 @@
       return (n / 1048576).toFixed(1) + ' MB';
     }
 
-    function sessionCardHtml(s) {
+    // Flat session card descriptor — computed every tick; patches an existing
+    // element's textContent instead of rebuilding DOM. See diffCards().
+    function flatCardDesc(s) {
       const statusCls = s.status || 'active';
-      const cardCls = s.active ? 'active' : statusCls;
-      const tpsLabel = s.exactTokens ? 'tok/s (exact)' : 'tok/s (est.)';
-      const rateLabel = s.active ? '' : ' · gen';
       const cacheRate = s.cacheHitRate != null ? s.cacheHitRate + '%' : '—';
       const cacheCls = s.cacheHitRate == null ? '' : s.cacheHitRate >= 50 ? 'good' : s.cacheHitRate > 0 ? 'warn' : '';
-      return `<div class="sessioncard ${cardCls}">
-        <div class="sessioncard-head">
-          <span class="sessioncard-model" title="${esc(s.model)}">${esc(s.model)}</span>
-          <span class="sessioncard-status ${statusCls}">${esc(statusCls)}</span>
-        </div>
-        <div class="sessioncard-tps">${fmtTps(s.tps)}<span class="unit">tok/s</span></div>
-        <div class="sessioncard-tpslabel">${tpsLabel} <span style="color:var(--muted-2)">${rateLabel}</span></div>
-        <div class="sessioncard-meta">
-          <span class="k">input cached</span><span class="v">${fmt(s.cachedTokens)}</span>
-          <span class="k">input new</span><span class="v">${fmt(s.uncachedTokens)}</span>
-          <span class="k">output</span><span class="v">${fmt(s.completionTokens)}</span>
-          <span class="k">cache hit</span><span class="v ${cacheCls}">${cacheRate}</span>
-          <span class="k">elapsed</span><span class="v">${fmtElapsed(s.elapsedMs)}</span>
-          <span class="k">mode</span><span class="v">${s.stream ? 'stream' : 'sync'}</span>
-          <span class="k">bytes</span><span class="v">${fmtBytes(s.bytes)}</span>
-        </div>
-        <div class="sessioncard-id">${esc(s.id)}</div>
-      </div>`;
+      return {
+        key: s.id,
+        cardCls: s.active ? 'active' : statusCls,
+        cardDim: false,
+        statusCls,
+        statusText: s.status || 'active',
+        model: s.model || '',
+        cacheRate, cacheCls,
+        fields: {
+          tps: fmtTps(s.tps),
+          tpsLabel: s.exactTokens ? 'tok/s (exact)' : 'tok/s (est.)',
+          rateLabel: s.active ? '' : ' · gen',
+          cached: fmt(s.cachedTokens),
+          uncached: fmt(s.uncachedTokens),
+          output: fmt(s.completionTokens),
+          elapsed: fmtElapsed(s.elapsedMs),
+          mode: s.stream ? 'stream' : 'sync',
+          bytes: fmtBytes(s.bytes),
+          id: s.id || '',
+        },
+      };
     }
+    const FLAT_SKELETON = `<div class="sessioncard">
+      <div class="sessioncard-head">
+        <span class="sessioncard-model" data-f="model"></span>
+        <span class="sessioncard-status" data-f="status"></span>
+      </div>
+      <div class="sessioncard-tps"><span data-f="tps"></span><span class="unit">tok/s</span></div>
+      <div class="sessioncard-tpslabel"><span data-f="tpsLabel"></span> <span data-f="rateLabel" style="color:var(--muted-2)"></span></div>
+      <div class="sessioncard-meta">
+        <span class="k">input cached</span><span class="v" data-f="cached"></span>
+        <span class="k">input new</span><span class="v" data-f="uncached"></span>
+        <span class="k">output</span><span class="v" data-f="output"></span>
+        <span class="k">cache hit</span><span class="v" data-f="cacheHit"></span>
+        <span class="k">elapsed</span><span class="v" data-f="elapsed"></span>
+        <span class="k">mode</span><span class="v" data-f="mode"></span>
+        <span class="k">bytes</span><span class="v" data-f="bytes"></span>
+      </div>
+      <div class="sessioncard-id" data-f="id"></div>
+    </div>`;
 
     function renderAggregate(agg) {
       if ($('liveTps')) $('liveTps').textContent = fmtTps(agg.tps);
@@ -839,20 +861,87 @@
     let activeOnly = false;
     try { groupSessions = localStorage.getItem('umans-group-sessions') === '1'; } catch {}
     try { activeOnly = localStorage.getItem('umans-active-only') === '1'; } catch {}
-    function groupedCardHtml(group) {
+    // Patch an existing card's mutable fields in place — no DOM rebuild.
+    // Element references are cached on first call via el._refs.
+    function patchCard(el, desc) {
+      el.className = 'sessioncard ' + desc.cardCls;
+      el.style.opacity = desc.cardDim ? '.7' : '';
+      let r = el._refs;
+      if (!r) {
+        r = {};
+        for (const e of el.querySelectorAll('[data-f]')) r[e.getAttribute('data-f')] = e;
+        el._refs = r;
+      }
+      if (r.status) { r.status.className = 'sessioncard-status ' + desc.statusCls; r.status.textContent = desc.statusText; }
+      if (r.model) { r.model.textContent = desc.model; r.model.title = desc.model; }
+      if (r.cacheHit) { r.cacheHit.className = 'v ' + desc.cacheCls; r.cacheHit.textContent = desc.cacheRate; }
+      for (const name in desc.fields) {
+        const e = r[name];
+        if (e && e !== r.cacheHit) e.textContent = desc.fields[name];
+      }
+    }
+    // Keyed reconciliation: reuse/patch existing cards, create new ones,
+    // remove stale ones, reorder to match new order. No full innerHTML wipe.
+    function diffCards(grid, descs, skeleton) {
+      if (currentSkeleton !== skeleton) {
+        for (const [, el] of sessionCards) el.remove();
+        sessionCards.clear();
+        currentSkeleton = skeleton;
+      }
+      const seen = new Set();
+      let prev = null;
+      for (const desc of descs) {
+        seen.add(desc.key);
+        let el = sessionCards.get(desc.key);
+        if (!el) {
+          const tmp = document.createElement('div');
+          tmp.innerHTML = skeleton;
+          el = tmp.firstElementChild;
+          sessionCards.set(desc.key, el);
+        }
+        patchCard(el, desc);
+        const wantNext = prev ? prev.nextSibling : grid.firstChild;
+        if (el !== wantNext) grid.insertBefore(el, wantNext);
+        prev = el;
+      }
+      for (const [key, el] of sessionCards) {
+        if (!seen.has(key)) { el.remove(); sessionCards.delete(key); }
+      }
+    }
+    // Shared grouping logic (extracted from renderSessions/renderSessionsInner).
+    function buildGroups(list, summariesData) {
+      const groups = new Map();
+      for (const s of list) {
+        const g = groups.get(s.groupKey) || { groupKey: s.groupKey, sessions: [] };
+        g.sessions.push(s);
+        groups.set(s.groupKey, g);
+      }
+      const summaries = new Map((summariesData || []).map((g) => [g.groupKey, g]));
+      for (const [key, group] of groups) {
+        const summary = summaries.get(key);
+        if (summary) group.summary = summary;
+      }
+      for (const [key, summary] of summaries) {
+        if (!groups.has(key)) groups.set(key, { groupKey: key, sessions: [], summary });
+      }
+      return [...groups.values()];
+    }
+    function sortGroups(groups) {
+      return groups.sort((a, b) => {
+        const at = a.sessions[0]?.startedAt ? new Date(a.sessions[0].startedAt).getTime() : (a.summary?.lastSeenAt || 0);
+        const bt = b.sessions[0]?.startedAt ? new Date(b.sessions[0].startedAt).getTime() : (b.summary?.lastSeenAt || 0);
+        return bt - at;
+      });
+    }
+    // Grouped session card descriptor.
+    function groupedCardDesc(group) {
       const sessions = group.sessions || [];
       const summary = group.summary;
-      const last = sessions[0]; // sessions are sorted: active/newest first
+      const last = sessions[0];
       const active = sessions.some((s) => s.active);
       const statusCls = active ? 'active' : (last?.status || 'done');
       const modelName = last?.model || summary?.model || '—';
-      // Use summary turn count if available (includes expired sessions);
-      // otherwise fall back to the live session count.
       const turnCount = summary?.turnCount || sessions.length;
-      // Aggregate stats: merge live sessions with the summary's persistent totals.
-      // The summary already includes the live sessions' contributions (updated at
-      // finalize), so when a summary exists we use it directly. When no summary
-      // (e.g. first turn still in-flight), compute from live sessions only.
       const totalTokens = summary ? summary.totalTokens : sessions.reduce((a, s) => a + number(s.completionTokens), 0);
       const totalCached = summary ? summary.totalCached : sessions.reduce((a, s) => a + number(s.cachedTokens), 0);
       const totalUncached = summary ? summary.totalUncached : sessions.reduce((a, s) => a + number(s.uncachedTokens), 0);
@@ -861,82 +950,75 @@
       const latestEnd = sessions.length ? sessions.reduce((m, s) => Math.max(m, s.endedAt ? new Date(s.endedAt).getTime() : Date.now()), 0) : (summary?.lastSeenAt || 0);
       const elapsed = Math.max(0, (latestEnd || Date.now()) - earliestStart);
       const allExact = sessions.length ? sessions.every((s) => s.exactTokens) : true;
-      const tpsLabel = allExact ? 'tok/s (exact)' : 'tok/s (mixed)';
       const cacheRate = (totalCached + totalUncached) > 0 ? Math.round((totalCached / (totalCached + totalUncached)) * 1000) / 10 : null;
       const cacheCls = cacheRate == null ? '' : cacheRate >= 50 ? 'good' : cacheRate > 0 ? 'warn' : '';
       const cacheStr = cacheRate != null ? cacheRate + '%' : '—';
-      // Sum the rolling TPS from active sessions — consistent with the flat
-      // view's per-session metric. Completed sessions contribute 0.
       const tps = Math.round(sessions.reduce((a, s) => a + number(s.tps), 0) * 10) / 10;
-      // Average finalTps: prefer summary's accumulated values, fall back to live.
       const finalVals = sessions.filter((s) => !s.active && s.finalTps != null && s.finalTps > 0).map((s) => s.finalTps);
       const avgFinal = summary?.avgFinalTps != null
         ? summary.avgFinalTps
         : finalVals.length ? Math.round(finalVals.reduce((a, b) => a + b, 0) / finalVals.length * 10) / 10 : null;
-      const finalLabel = avgFinal != null ? `· avg final ${fmtTps(avgFinal)}` : '';
-      const cardDim = !sessions.length ? ' style="opacity:.7"' : '';
-      return `<div class="sessioncard ${active ? 'active' : ''}"${cardDim}>
-        <div class="sessioncard-head">
-          <span class="sessioncard-model" title="${esc(modelName)}">${esc(modelName)}</span>
-          <span class="sessioncard-status ${statusCls}">${turnCount} turn${turnCount === 1 ? '' : 's'}${!sessions.length ? ' · expired' : ''}</span>
-        </div>
-        <div class="sessioncard-tps">${fmtTps(tps)}<span class="unit">tok/s</span></div>
-        <div class="sessioncard-tpslabel">${tpsLabel} <span style="color:var(--muted-2)">${finalLabel}</span></div>
-        <div class="sessioncard-meta">
-          <span class="k">input cached</span><span class="v">${fmt(totalCached)}</span>
-          <span class="k">input new</span><span class="v">${fmt(totalUncached)}</span>
-          <span class="k">output</span><span class="v">${fmt(totalTokens)}</span>
-          <span class="k">cache hit</span><span class="v ${cacheCls}">${cacheStr}</span>
-          <span class="k">elapsed</span><span class="v">${fmtElapsed(elapsed)}</span>
-          <span class="k">requests</span><span class="v">${turnCount}</span>
-          <span class="k">bytes</span><span class="v">${fmtBytes(totalBytes)}</span>
-        </div>
-        <div class="sessioncard-id">${esc(group.groupKey)}</div>
-      </div>`;
+      return {
+        key: group.groupKey,
+        cardCls: active ? 'active' : '',
+        cardDim: !sessions.length,
+        statusCls,
+        statusText: `${turnCount} turn${turnCount === 1 ? '' : 's'}${!sessions.length ? ' · expired' : ''}`,
+        model: modelName,
+        cacheRate: cacheStr,
+        cacheCls,
+        fields: {
+          tps: fmtTps(tps),
+          tpsLabel: allExact ? 'tok/s (exact)' : 'tok/s (mixed)',
+          finalLabel: avgFinal != null ? `· avg final ${fmtTps(avgFinal)}` : '',
+          cached: fmt(totalCached),
+          uncached: fmt(totalUncached),
+          output: fmt(totalTokens),
+          elapsed: fmtElapsed(elapsed),
+          requests: String(turnCount),
+          bytes: fmtBytes(totalBytes),
+          id: group.groupKey || '',
+        },
+      };
     }
+    const GROUPED_SKELETON = `<div class="sessioncard">
+      <div class="sessioncard-head">
+        <span class="sessioncard-model" data-f="model"></span>
+        <span class="sessioncard-status" data-f="status"></span>
+      </div>
+      <div class="sessioncard-tps"><span data-f="tps"></span><span class="unit">tok/s</span></div>
+      <div class="sessioncard-tpslabel"><span data-f="tpsLabel"></span> <span data-f="finalLabel" style="color:var(--muted-2)"></span></div>
+      <div class="sessioncard-meta">
+        <span class="k">input cached</span><span class="v" data-f="cached"></span>
+        <span class="k">input new</span><span class="v" data-f="uncached"></span>
+        <span class="k">output</span><span class="v" data-f="output"></span>
+        <span class="k">cache hit</span><span class="v" data-f="cacheHit"></span>
+        <span class="k">elapsed</span><span class="v" data-f="elapsed"></span>
+        <span class="k">requests</span><span class="v" data-f="requests"></span>
+        <span class="k">bytes</span><span class="v" data-f="bytes"></span>
+      </div>
+      <div class="sessioncard-id" data-f="id"></div>
+    </div>`;
     function renderSessions(data) {
       lastSessionsData = data;
       const grid = $('sessionGrid');
       const empty = $('sessionEmpty');
       if (!grid) return;
+      renderAggregate(data?.aggregate || {});
       const allList = data?.sessions || [];
       const list = activeOnly ? allList.filter((s) => s.active) : allList;
-      const agg = data?.aggregate || {};
-      renderAggregate(agg);
       if (!list.length) {
-        grid.innerHTML = '';
+        for (const [, el] of sessionCards) el.remove();
+        sessionCards.clear();
+        currentSkeleton = null;
         if (empty) empty.style.display = '';
       } else {
         if (empty) empty.style.display = 'none';
         if (groupSessions) {
-          // Group by groupKey, preserve active/newest-first sort.
-          const groups = new Map();
-          for (const s of list) {
-            const g = groups.get(s.groupKey) || { groupKey: s.groupKey, sessions: [] };
-            g.sessions.push(s);
-            groups.set(s.groupKey, g);
-          }
-          // Merge persistent group summaries: for groups where older sessions
-          // have expired, the summary provides the authoritative turn count and
-          // aggregate stats. Live sessions override with real-time TPS.
-          const summaries = new Map((data?.groupSummaries || []).map((g) => [g.groupKey, g]));
-          for (const [key, group] of groups) {
-            const summary = summaries.get(key);
-            if (summary) group.summary = summary;
-          }
-          // Also show summary-only groups (all sessions expired but conversation
-          // is still within the 1h TTL). Sort by lastSeenAt desc.
-          for (const [key, summary] of summaries) {
-            if (!groups.has(key)) groups.set(key, { groupKey: key, sessions: [], summary });
-          }
-          const sorted = [...groups.values()].sort((a, b) => {
-            const at = a.sessions[0]?.startedAt ? new Date(a.sessions[0].startedAt).getTime() : (a.summary?.lastSeenAt || 0);
-            const bt = b.sessions[0]?.startedAt ? new Date(b.sessions[0].startedAt).getTime() : (b.summary?.lastSeenAt || 0);
-            return bt - at;
-          });
-          grid.innerHTML = sorted.map(groupedCardHtml).join('');
+          const groups = sortGroups(buildGroups(list, data?.groupSummaries));
+          diffCards(grid, groups.map(groupedCardDesc), GROUPED_SKELETON);
         } else {
-          grid.innerHTML = list.map(sessionCardHtml).join('');
+          diffCards(grid, list.map(flatCardDesc), FLAT_SKELETON);
         }
       }
       scheduleSessionsTimer();
@@ -990,35 +1072,22 @@
     function renderSessionsInner(data) {
       const grid = $('sessionGrid');
       if (!grid) return;
+      renderAggregate(data?.aggregate || {});
       const allList = data?.sessions || [];
       const list = activeOnly ? allList.filter((s) => s.active) : allList;
-      const agg = data?.aggregate || {};
-      renderAggregate(agg);
-      if (!list.length) { if ($('sessionEmpty')) $('sessionEmpty').style.display = ''; return; }
+      if (!list.length) {
+        for (const [, el] of sessionCards) el.remove();
+        sessionCards.clear();
+        currentSkeleton = null;
+        if ($('sessionEmpty')) $('sessionEmpty').style.display = '';
+        return;
+      }
       if ($('sessionEmpty')) $('sessionEmpty').style.display = 'none';
       if (groupSessions) {
-        const groups = new Map();
-        for (const s of list) {
-          const g = groups.get(s.groupKey) || { groupKey: s.groupKey, sessions: [] };
-          g.sessions.push(s);
-          groups.set(s.groupKey, g);
-        }
-        const summaries = new Map((data?.groupSummaries || []).map((g) => [g.groupKey, g]));
-        for (const [key, group] of groups) {
-          const summary = summaries.get(key);
-          if (summary) group.summary = summary;
-        }
-        for (const [key, summary] of summaries) {
-          if (!groups.has(key)) groups.set(key, { groupKey: key, sessions: [], summary });
-        }
-        const sorted = [...groups.values()].sort((a, b) => {
-          const at = a.sessions[0]?.startedAt ? new Date(a.sessions[0].startedAt).getTime() : (a.summary?.lastSeenAt || 0);
-          const bt = b.sessions[0]?.startedAt ? new Date(b.sessions[0].startedAt).getTime() : (b.summary?.lastSeenAt || 0);
-          return bt - at;
-        });
-        grid.innerHTML = sorted.map(groupedCardHtml).join('');
+        const groups = sortGroups(buildGroups(list, data?.groupSummaries));
+        diffCards(grid, groups.map(groupedCardDesc), GROUPED_SKELETON);
       } else {
-        grid.innerHTML = list.map(sessionCardHtml).join('');
+        diffCards(grid, list.map(flatCardDesc), FLAT_SKELETON);
       }
     }
 

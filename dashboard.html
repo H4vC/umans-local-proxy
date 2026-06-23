@@ -195,6 +195,13 @@
     .live strong { display: block; font-size: 22px; font-weight: 650; font-variant-numeric: tabular-nums; color: var(--text); margin-bottom: 3px; }
     .live span { color: var(--muted); font-size: 10.5px; text-transform: uppercase; letter-spacing: .04em; font-weight: 600; }
     .live.accent strong { color: var(--accent); }
+    .live.model { text-align: left; padding: 14px 16px; }
+    .live.model strong { font-size: 20px; margin-bottom: 2px; }
+    .live.model .model-name { font-size: 11px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .04em; margin-bottom: 8px; }
+    .live.model .model-sub { display: flex; gap: 16px; font-variant-numeric: tabular-nums; }
+    .live.model .model-sub .stat { display: flex; flex-direction: column; gap: 2px; }
+    .live.model .model-sub .stat .label { font-size: 10px; color: var(--muted-2); text-transform: uppercase; letter-spacing: .04em; font-weight: 600; }
+    .live.model .model-sub .stat .val { font-size: 14px; font-weight: 600; color: var(--text); }
 
     /* ---- sessions ---- */
     .sessions-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 4px; flex-wrap: wrap; }
@@ -951,12 +958,19 @@
       const used = models.filter((m) => m.tps > 0 || m.medianTps != null || m.p10Tps != null);
       if (!used.length) { el.innerHTML = ''; return; }
       const cards = used.map((m) => {
-        const live = m.tps > 0 ? `<span style="color:var(--accent)">${fmtTps(m.tps)}</span>` : '—';
+        const live = m.tps > 0 ? `<span style="color:var(--accent)">${fmtTps(m.tps)}</span>` : '<span style="color:var(--muted-2)">—</span>';
         const med = m.medianTps != null ? fmtTps(m.medianTps) : '--';
         const p10 = m.p10Tps != null ? fmtTps(m.p10Tps) : '--';
-        return `<div class="live"><strong>${live}</strong><span>${esc(m.model)}</span><div class="sub multiline" style="margin-top:4px;"><div><span style="color:var(--muted-2);margin-right:8px;">med</span><span>${med} tok/s</span></div><div><span style="color:var(--muted-2);margin-right:10px;">p10</span><span>${p10} tok/s</span></div></div></div>`;
+        return `<div class="live model">
+          <strong>${live} <span style="font-size:11px;color:var(--muted);font-weight:500;">tok/s</span></strong>
+          <div class="model-name">${esc(m.model)}</div>
+          <div class="model-sub">
+            <div class="stat"><span class="label">median</span><span class="val">${med}</span></div>
+            <div class="stat"><span class="label">p10</span><span class="val">${p10}</span></div>
+          </div>
+        </div>`;
       }).join('');
-      el.innerHTML = `<div class="livegrid">${cards}</div>`;
+      el.innerHTML = `<div class="livegrid" style="grid-template-columns:repeat(auto-fill,minmax(180px,1fr));">${cards}</div>`;
     }
 
     // Local timer: between SSE updates, re-render with a smooth TPS decay.

@@ -153,7 +153,7 @@ function resolveGroupKey(model, messages) {
   const prefixChain = chainHash(model, prefix);
   const hit = stateMap.get(prefixChain);
   const groupKey = hit || newSessionId();
-  logCoalesce({ t: Date.now(), type: 'resolve', model, msgCount: messages.length, prefixMsgCount: prefix.length, prefixChain, stateMapHit: !!hit, groupKey, stateMapSize: stateMap.size });
+  if (coalesceDebug.length < COALESCE_DEBUG_MAX) logCoalesce({ t: Date.now(), type: 'resolve', model, msgCount: messages.length, prefixMsgCount: prefix.length, prefixChain, stateMapHit: !!hit, groupKey, stateMapSize: stateMap.size });
   return { groupKey, prefixChain };
 }
 
@@ -167,8 +167,7 @@ function storeStateKey(model, messages, responseContent, groupKey, prefixChain) 
   // Extend the saved prefix chain with the final user turn + the response.
   const stateChain = chainHash(model, [lastUser, responseMsg], prefixChain);
   stateMap.set(stateChain, groupKey);
-  // Debug: capture what we stored vs what the client sent as the last user msg.
-  logCoalesce({ t: Date.now(), type: 'store', model, msgCount: messages.length, stateChain, prefixChain, groupKey, responseContentLen: (responseContent || '').length, responseContentPreview: (responseContent || '').slice(0, 100), lastUserMsg: JSON.stringify(lastUser).slice(0, 200), lastUserHash: messageHash(lastUser), responseMsgHash: messageHash(responseMsg) });
+  if (coalesceDebug.length < COALESCE_DEBUG_MAX) logCoalesce({ t: Date.now(), type: 'store', model, msgCount: messages.length, stateChain, prefixChain, groupKey, responseContentLen: (responseContent || '').length, responseContentPreview: (responseContent || '').slice(0, 100), lastUserMsg: JSON.stringify(lastUser).slice(0, 200), lastUserHash: messageHash(lastUser), responseMsgHash: messageHash(responseMsg) });
   setTimeout(() => { stateMap.delete(stateChain); }, COALESCE_TTL_MS).unref();
 }
 
@@ -206,7 +205,8 @@ function updateGroupSummary(session) {
     totalCached: 0,
     totalUncached: 0,
     totalBytes: 0,
-    finalTpsValues: [],
+    finalTpsSum: 0,
+    finalTpsCount: 0,
     lastSeenAt: 0,
   };
   g.turnCount++;
@@ -214,7 +214,11 @@ function updateGroupSummary(session) {
   g.totalCached += session.cachedTokens || 0;
   g.totalUncached += Math.max(0, (session.promptTokens || 0) - (session.cachedTokens || 0));
   g.totalBytes += session.bytes || 0;
-  if (session.finalTps != null && session.finalTps > 0) g.finalTpsValues.push(session.finalTps);
+  if (session.finalTps != null && session.finalTps > 0) {
+    // Running average: avoid storing every value. Keep sum + count.
+    g.finalTpsSum = (g.finalTpsSum || 0) + session.finalTps;
+    g.finalTpsCount = (g.finalTpsCount || 0) + 1;
+  }
   g.lastSeenAt = Date.now();
   groupSummaries.set(session.groupKey, g);
   setTimeout(() => {
@@ -365,8 +369,8 @@ function getSessionsSnapshot() {
   // for the grouped view so turn counts stay accurate when older sessions
   // have been cleaned up.
   const groups = [...groupSummaries.values()].map((g) => {
-    const avgFinal = g.finalTpsValues.length
-      ? Math.round(g.finalTpsValues.reduce((a, b) => a + b, 0) / g.finalTpsValues.length * 10) / 10
+    const avgFinal = g.finalTpsCount
+      ? Math.round(g.finalTpsSum / g.finalTpsCount * 10) / 10
       : null;
     return {
       groupKey: g.groupKey,
@@ -385,8 +389,7 @@ function getSessionsSnapshot() {
     groupSummaries: groups,
     aggregate: {
       tps: Math.round(aggregateTps() * 10) / 10,
-      activeSessions: [...sessions.values()].filter((s) => s.status === 'active').length,
-      totalSessions: sessions.size,
+      activeSessions: (() => { let n = 0; for (const s of sessions.values()) if (s.status === 'active') n++; return n; })(),
       medianTps,
       p10Tps,
       // Per-model TPS for models actually used, sorted desc by tps.
@@ -399,21 +402,22 @@ function getSessionsSnapshot() {
 // sessions are active. Stops the timer when no active sessions remain.
 function scheduleSessionsBroadcast() {
   if (broadcastThrottled) return;
-  const hasActive = [...sessions.values()].some((s) => s.status === 'active');
+  let hasActive = false;
+  for (const s of sessions.values()) { if (s.status === 'active') { hasActive = true; break; } }
   if (!hasActive) {
     if (sessionsBroadcastTimer) { clearInterval(sessionsBroadcastTimer); sessionsBroadcastTimer = null; }
     // One final broadcast so the UI sees the terminal state.
     broadcastEvent('sessions', getSessionsSnapshot());
     return;
   }
-  broadcastThrottled = true;
   setTimeout(() => {
     broadcastThrottled = false;
     broadcastEvent('sessions', getSessionsSnapshot());
     // Re-evaluate; if still active, keep polling via interval.
     if (!sessionsBroadcastTimer) {
       sessionsBroadcastTimer = setInterval(() => {
-        const stillActive = [...sessions.values()].some((s) => s.status === 'active');
+        let stillActive = false;
+        for (const s of sessions.values()) { if (s.status === 'active') { stillActive = true; break; } }
         broadcastEvent('sessions', getSessionsSnapshot());
         if (!stillActive && sessionsBroadcastTimer) {
           clearInterval(sessionsBroadcastTimer);

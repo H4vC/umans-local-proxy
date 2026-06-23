@@ -802,6 +802,7 @@
       const statusCls = s.status || 'active';
       const cardCls = s.active ? 'active' : statusCls;
       const tpsLabel = s.exactTokens ? 'tok/s (exact)' : 'tok/s (est.)';
+      const rateLabel = s.active ? '' : ' · gen';
       const cacheRate = s.cacheHitRate != null ? s.cacheHitRate + '%' : '—';
       const cacheCls = s.cacheHitRate == null ? '' : s.cacheHitRate >= 50 ? 'good' : s.cacheHitRate > 0 ? 'warn' : '';
       return `<div class="sessioncard ${cardCls}">
@@ -810,7 +811,7 @@
           <span class="sessioncard-status ${statusCls}">${esc(statusCls)}</span>
         </div>
         <div class="sessioncard-tps">${fmtTps(s.tps)}<span class="unit">tok/s</span></div>
-        <div class="sessioncard-tpslabel">${tpsLabel}</div>
+        <div class="sessioncard-tpslabel">${tpsLabel} <span style="color:var(--muted-2)">${rateLabel}</span></div>
         <div class="sessioncard-meta">
           <span class="k">input cached</span><span class="v">${fmt(s.cachedTokens)}</span>
           <span class="k">input new</span><span class="v">${fmt(s.uncachedTokens)}</span>
@@ -839,18 +840,27 @@
     try { groupSessions = localStorage.getItem('umans-group-sessions') === '1'; } catch {}
     try { activeOnly = localStorage.getItem('umans-active-only') === '1'; } catch {}
     function groupedCardHtml(group) {
-      const sessions = group.sessions;
+      const sessions = group.sessions || [];
+      const summary = group.summary;
       const last = sessions[0]; // sessions are sorted: active/newest first
       const active = sessions.some((s) => s.active);
-      const statusCls = active ? 'active' : last.status || 'done';
-      const totalTokens = sessions.reduce((a, s) => a + number(s.completionTokens), 0);
-      const totalCached = sessions.reduce((a, s) => a + number(s.cachedTokens), 0);
-      const totalUncached = sessions.reduce((a, s) => a + number(s.uncachedTokens), 0);
-      const totalBytes = sessions.reduce((a, s) => a + number(s.bytes), 0);
-      const earliestStart = sessions.reduce((m, s) => Math.min(m, new Date(s.startedAt).getTime()), Date.now());
-      const latestEnd = sessions.reduce((m, s) => Math.max(m, s.endedAt ? new Date(s.endedAt).getTime() : Date.now()), 0);
+      const statusCls = active ? 'active' : (last?.status || 'done');
+      const modelName = last?.model || summary?.model || '—';
+      // Use summary turn count if available (includes expired sessions);
+      // otherwise fall back to the live session count.
+      const turnCount = summary?.turnCount || sessions.length;
+      // Aggregate stats: merge live sessions with the summary's persistent totals.
+      // The summary already includes the live sessions' contributions (updated at
+      // finalize), so when a summary exists we use it directly. When no summary
+      // (e.g. first turn still in-flight), compute from live sessions only.
+      const totalTokens = summary ? summary.totalTokens : sessions.reduce((a, s) => a + number(s.completionTokens), 0);
+      const totalCached = summary ? summary.totalCached : sessions.reduce((a, s) => a + number(s.cachedTokens), 0);
+      const totalUncached = summary ? summary.totalUncached : sessions.reduce((a, s) => a + number(s.uncachedTokens), 0);
+      const totalBytes = summary ? summary.totalBytes : sessions.reduce((a, s) => a + number(s.bytes), 0);
+      const earliestStart = sessions.length ? sessions.reduce((m, s) => Math.min(m, new Date(s.startedAt).getTime()), Date.now()) : Date.now();
+      const latestEnd = sessions.length ? sessions.reduce((m, s) => Math.max(m, s.endedAt ? new Date(s.endedAt).getTime() : Date.now()), 0) : (summary?.lastSeenAt || 0);
       const elapsed = Math.max(0, (latestEnd || Date.now()) - earliestStart);
-      const allExact = sessions.every((s) => s.exactTokens);
+      const allExact = sessions.length ? sessions.every((s) => s.exactTokens) : true;
       const tpsLabel = allExact ? 'tok/s (exact)' : 'tok/s (mixed)';
       const cacheRate = (totalCached + totalUncached) > 0 ? Math.round((totalCached / (totalCached + totalUncached)) * 1000) / 10 : null;
       const cacheCls = cacheRate == null ? '' : cacheRate >= 50 ? 'good' : cacheRate > 0 ? 'warn' : '';
@@ -858,20 +868,27 @@
       // Sum the rolling TPS from active sessions — consistent with the flat
       // view's per-session metric. Completed sessions contribute 0.
       const tps = Math.round(sessions.reduce((a, s) => a + number(s.tps), 0) * 10) / 10;
-      return `<div class="sessioncard ${active ? 'active' : ''}">
+      // Average finalTps: prefer summary's accumulated values, fall back to live.
+      const finalVals = sessions.filter((s) => !s.active && s.finalTps != null && s.finalTps > 0).map((s) => s.finalTps);
+      const avgFinal = summary?.avgFinalTps != null
+        ? summary.avgFinalTps
+        : finalVals.length ? Math.round(finalVals.reduce((a, b) => a + b, 0) / finalVals.length * 10) / 10 : null;
+      const finalLabel = avgFinal != null ? `· avg final ${fmtTps(avgFinal)}` : '';
+      const cardDim = !sessions.length ? ' style="opacity:.7"' : '';
+      return `<div class="sessioncard ${active ? 'active' : ''}"${cardDim}>
         <div class="sessioncard-head">
-          <span class="sessioncard-model" title="${esc(last.model)}">${esc(last.model)}</span>
-          <span class="sessioncard-status ${statusCls}">${sessions.length} turn${sessions.length === 1 ? '' : 's'}</span>
+          <span class="sessioncard-model" title="${esc(modelName)}">${esc(modelName)}</span>
+          <span class="sessioncard-status ${statusCls}">${turnCount} turn${turnCount === 1 ? '' : 's'}${!sessions.length ? ' · expired' : ''}</span>
         </div>
         <div class="sessioncard-tps">${fmtTps(tps)}<span class="unit">tok/s</span></div>
-        <div class="sessioncard-tpslabel">${tpsLabel}</div>
+        <div class="sessioncard-tpslabel">${tpsLabel} <span style="color:var(--muted-2)">${finalLabel}</span></div>
         <div class="sessioncard-meta">
           <span class="k">input cached</span><span class="v">${fmt(totalCached)}</span>
           <span class="k">input new</span><span class="v">${fmt(totalUncached)}</span>
           <span class="k">output</span><span class="v">${fmt(totalTokens)}</span>
           <span class="k">cache hit</span><span class="v ${cacheCls}">${cacheStr}</span>
           <span class="k">elapsed</span><span class="v">${fmtElapsed(elapsed)}</span>
-          <span class="k">requests</span><span class="v">${sessions.length}</span>
+          <span class="k">requests</span><span class="v">${turnCount}</span>
           <span class="k">bytes</span><span class="v">${fmtBytes(totalBytes)}</span>
         </div>
         <div class="sessioncard-id">${esc(group.groupKey)}</div>
@@ -899,7 +916,25 @@
             g.sessions.push(s);
             groups.set(s.groupKey, g);
           }
-          grid.innerHTML = [...groups.values()].map(groupedCardHtml).join('');
+          // Merge persistent group summaries: for groups where older sessions
+          // have expired, the summary provides the authoritative turn count and
+          // aggregate stats. Live sessions override with real-time TPS.
+          const summaries = new Map((data?.groupSummaries || []).map((g) => [g.groupKey, g]));
+          for (const [key, group] of groups) {
+            const summary = summaries.get(key);
+            if (summary) group.summary = summary;
+          }
+          // Also show summary-only groups (all sessions expired but conversation
+          // is still within the 5-min TTL). Sort by lastSeenAt desc.
+          for (const [key, summary] of summaries) {
+            if (!groups.has(key)) groups.set(key, { groupKey: key, sessions: [], summary });
+          }
+          const sorted = [...groups.values()].sort((a, b) => {
+            const at = a.sessions[0]?.startedAt || a.summary?.lastSeenAt || 0;
+            const bt = b.sessions[0]?.startedAt || b.summary?.lastSeenAt || 0;
+            return bt.localeCompare ? bt.localeCompare(at) : (bt - at || 0);
+          });
+          grid.innerHTML = sorted.map(groupedCardHtml).join('');
         } else {
           grid.innerHTML = list.map(sessionCardHtml).join('');
         }
@@ -965,7 +1000,20 @@
           g.sessions.push(s);
           groups.set(s.groupKey, g);
         }
-        grid.innerHTML = [...groups.values()].map(groupedCardHtml).join('');
+        const summaries = new Map((data?.groupSummaries || []).map((g) => [g.groupKey, g]));
+        for (const [key, group] of groups) {
+          const summary = summaries.get(key);
+          if (summary) group.summary = summary;
+        }
+        for (const [key, summary] of summaries) {
+          if (!groups.has(key)) groups.set(key, { groupKey: key, sessions: [], summary });
+        }
+        const sorted = [...groups.values()].sort((a, b) => {
+          const at = a.sessions[0]?.startedAt || a.summary?.lastSeenAt || 0;
+          const bt = b.sessions[0]?.startedAt || b.summary?.lastSeenAt || 0;
+          return bt.localeCompare ? bt.localeCompare(at) : (bt - at || 0);
+        });
+        grid.innerHTML = sorted.map(groupedCardHtml).join('');
       } else {
         grid.innerHTML = list.map(sessionCardHtml).join('');
       }

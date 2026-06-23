@@ -44,6 +44,12 @@ function logCoalesce(entry) {
   coalesceDebug.push(entry);
   if (coalesceDebug.length > COALESCE_DEBUG_MAX) coalesceDebug.shift();
 }
+// Persistent conversation group summaries. Survive past individual session
+// expiry (120s) so the dashboard's grouped view shows correct turn counts and
+// aggregate stats even when older sessions have been cleaned up. Keyed by
+// groupKey; entries expire after GROUP_SUMMARY_TTL_MS of inactivity.
+const groupSummaries = new Map();
+const GROUP_SUMMARY_TTL_MS = 5 * 60 * 1000; // match COALESCE_TTL_MS
 let sessionsBroadcastTimer = null;
 let broadcastThrottled = false;
 const SESSION_BROADCAST_MIN_MS = 1000;
@@ -189,6 +195,36 @@ function createSession({ model, stream, groupKey }) {
   sessions.set(id, session);
   return session;
 }
+// Accumulate per-group stats that survive past individual session expiry.
+function updateGroupSummary(session) {
+  if (!session.groupKey) return;
+  const g = groupSummaries.get(session.groupKey) || {
+    groupKey: session.groupKey,
+    model: session.model,
+    turnCount: 0,
+    totalTokens: 0,
+    totalCached: 0,
+    totalUncached: 0,
+    totalBytes: 0,
+    finalTpsValues: [],
+    lastSeenAt: 0,
+  };
+  g.turnCount++;
+  g.totalTokens += session.completionTokens || 0;
+  g.totalCached += session.cachedTokens || 0;
+  g.totalUncached += Math.max(0, (session.promptTokens || 0) - (session.cachedTokens || 0));
+  g.totalBytes += session.bytes || 0;
+  if (session.finalTps != null && session.finalTps > 0) g.finalTpsValues.push(session.finalTps);
+  g.lastSeenAt = Date.now();
+  groupSummaries.set(session.groupKey, g);
+  setTimeout(() => {
+    // Expire stale summaries. Only delete if no new turns arrived.
+    const entry = groupSummaries.get(session.groupKey);
+    if (entry && Date.now() - entry.lastSeenAt >= GROUP_SUMMARY_TTL_MS) {
+      groupSummaries.delete(session.groupKey);
+    }
+  }, GROUP_SUMMARY_TTL_MS).unref();
+}
 
 function finalizeSession(session, status) {
   if (!session) return;
@@ -206,6 +242,7 @@ function finalizeSession(session, status) {
     const elapsed = Math.max(1, session.endedAt - session.startedAt);
     session.finalTps = Math.round((session.outputTokens / elapsed) * 1000 * 10) / 10;
   }
+  updateGroupSummary(session);
   // Keep the entry so the dashboard can show completed sessions and group
   // multi-turn conversations. 120s covers typical inter-turn gaps; the
   // stateMap (5 min TTL) handles prefix→groupKey coalescing independently.
@@ -299,7 +336,10 @@ function sessionPublicView(session) {
     // Cache hit rate: cached / total prompt tokens. Null when no prompt tokens.
     cacheHitRate: session.promptTokens > 0 ? Math.round((session.cachedTokens / session.promptTokens) * 1000) / 10 : null,
     bytes: session.bytes,
-    tps: Math.round(sessionTps(session) * 10) / 10,
+    // Active sessions show the live rolling rate; completed sessions show
+    // finalTps (true generation rate, TTFT excluded) — never the 5s-capped
+    // rolling rate which inflates short generations.
+    tps: Math.round((!active && session.finalTps != null ? session.finalTps : sessionTps(session)) * 10) / 10,
     finalTps: session.finalTps,
   };
 }
@@ -320,8 +360,29 @@ function getSessionsSnapshot() {
   };
   const medianTps = percentile(tpsValues, 0.5);
   const p10Tps = percentile(tpsValues, 0.1);
+  // Group summaries: persistent stats per conversation, surviving past
+  // individual session expiry. The dashboard merges these with live sessions
+  // for the grouped view so turn counts stay accurate when older sessions
+  // have been cleaned up.
+  const groups = [...groupSummaries.values()].map((g) => {
+    const avgFinal = g.finalTpsValues.length
+      ? Math.round(g.finalTpsValues.reduce((a, b) => a + b, 0) / g.finalTpsValues.length * 10) / 10
+      : null;
+    return {
+      groupKey: g.groupKey,
+      model: g.model,
+      turnCount: g.turnCount,
+      totalTokens: g.totalTokens,
+      totalCached: g.totalCached,
+      totalUncached: g.totalUncached,
+      totalBytes: g.totalBytes,
+      avgFinalTps: avgFinal,
+      lastSeenAt: g.lastSeenAt,
+    };
+  });
   return {
     sessions: list,
+    groupSummaries: groups,
     aggregate: {
       tps: Math.round(aggregateTps() * 10) / 10,
       activeSessions: [...sessions.values()].filter((s) => s.status === 'active').length,
@@ -706,7 +767,7 @@ function authorized(req, url) {
 }
 
 function requiresProxyAuth(pathname) {
-  return pathname === '/api/config' || pathname === '/api/events' || pathname === '/api/shutdown' || pathname === '/api/restart' || pathname === '/api/clear-state' || pathname === '/api/system/info' || pathname.startsWith('/api/umans/') || pathname.startsWith('/v1/');
+  return pathname === '/api/config' || pathname === '/api/events' || pathname === '/api/shutdown' || pathname === '/api/restart' || pathname === '/api/clear-state' || pathname === '/api/system/info' || pathname === '/api/debug/coalesce' || pathname.startsWith('/api/umans/') || pathname.startsWith('/v1/');
 }
 
 function filterModels(models) {
@@ -1359,6 +1420,7 @@ function handleClearState(req, res) {
   modelCharRatio.clear();
   messageHashCache.clear();
   stateMap.clear();
+  groupSummaries.clear();
   seenModels.clear();
   usageCache = { data: null, time: 0 };
   concurrencyCache = { concurrent: null, limit: null, softLimit: null, user_id: null, time: 0 };

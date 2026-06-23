@@ -945,13 +945,15 @@
     function renderModelStats(models, globalMedian, globalP10) {
       const el = $('modelStats');
       if (!el) return;
-      const used = models.filter((m) => m.tps > 0 || lastSessionsData?.sessions?.some((s) => s.model === m.model && s.active));
+      // Keep all models that have ever been used (seenModels persists server-side).
+      // Only filter out models with no stats at all (no live TPS, no median, no p10).
+      const used = models.filter((m) => m.tps > 0 || m.medianTps != null || m.p10Tps != null);
       if (!used.length) { el.innerHTML = ''; return; }
       const cards = used.map((m) => {
         const live = m.tps > 0 ? `<span style="color:var(--accent)">${fmtTps(m.tps)}</span>` : '—';
         const med = m.medianTps != null ? fmtTps(m.medianTps) : '--';
         const p10 = m.p10Tps != null ? fmtTps(m.p10Tps) : '--';
-        return `<div class="live"><strong>${live}</strong><span>${esc(m.model)}</span><div class="sub multiline" style="margin-top:4px;"><div><span style="color:var(--muted-2);">med</span><span>${med} tok/s</span></div><div><span style="color:var(--muted-2);">p10</span><span>${p10} tok/s</span></div></div></div>`;
+        return `<div class="live"><strong>${live}</strong><span>${esc(m.model)}</span><div class="sub multiline" style="margin-top:4px;"><div><span style="color:var(--muted-2);margin-right:8px;">med</span><span>${med} tok/s</span></div><div><span style="color:var(--muted-2);margin-right:10px;">p10</span><span>${p10} tok/s</span></div></div></div>`;
       }).join('');
       el.innerHTML = `<div class="livegrid">${cards}</div>`;
     }

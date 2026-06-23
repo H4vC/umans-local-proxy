@@ -328,6 +328,7 @@
       <button class="tab" role="tab" id="tab-test" aria-selected="false" aria-controls="panel-test">Test</button>
       <button class="tab" role="tab" id="tab-config" aria-selected="false" aria-controls="panel-config">Config</button>
       <button class="tab" role="tab" id="tab-api" aria-selected="false" aria-controls="panel-api">API</button>
+      <button class="tab" role="tab" id="tab-models" aria-selected="false" aria-controls="panel-models">Models</button>
       <button class="tab" role="tab" id="tab-admin" aria-selected="false" aria-controls="panel-admin">Admin</button>
     </div>
 
@@ -435,7 +436,7 @@
     <!-- API -->
     <div id="panel-api" class="tabpanel" role="tabpanel" aria-labelledby="tab-api">
       <section class="full">
-        <h2>Endpoints <button class="btn tonal btn-sm" id="modelsBtn">Check models</button></h2>
+        <h2>Endpoints</h2>
         <ul>
           <li><code>GET /health</code></li>
           <li><code>GET /api/umans/usage</code></li>
@@ -448,10 +449,19 @@
           <li><code>GET /api/system/info</code> <span class="muted" style="font-size:11px">pid, uptime</span></li>
           <li><code>POST /api/restart</code> · <code>POST /api/clear-state</code> · <code>POST /api/shutdown</code></li>
         </ul>
-        <pre id="modelsOut"></pre>
       </section>
     </div>
 
+
+    <!-- Models -->
+    <div id="panel-models" class="tabpanel" role="tabpanel" aria-labelledby="tab-models">
+      <section class="full">
+        <h2>Models <button class="btn tonal btn-sm" id="modelsBtn">Refresh</button></h2>
+        <p class="sub" style="margin:0 0 12px;color:var(--muted);font-size:13px;">Models exposed at <code>/v1/models</code>. Filter by id, and dimmed cards are hidden by your enabled-models list in Config.</p>
+        <input id="modelsFilter" class="grow" placeholder="Filter models…" style="margin-bottom:14px;">
+        <div id="modelsOut"></div>
+      </section>
+    </div>
     <!-- Admin -->
     <div id="panel-admin" class="tabpanel" role="tabpanel" aria-labelledby="tab-admin">
       <section class="full">
@@ -506,7 +516,7 @@
     $('themeDark').onclick = () => setTheme('dark');
 
     // ---- tabs --------------------------------------------------------------
-    const TABS = ['overview', 'sessions', 'test', 'config', 'api', 'admin'];
+    const TABS = ['overview', 'sessions', 'test', 'config', 'api', 'models', 'admin'];
     function selectTab(name) {
       TABS.forEach((t) => {
         const tab = $('tab-' + t), panel = $('panel-' + t);
@@ -516,6 +526,7 @@
         panel.classList.toggle('active', on);
       });
       if (name === 'admin' && typeof refreshAdmin === 'function') refreshAdmin();
+      if (name === 'models' && typeof checkModels === 'function') checkModels();
       try { localStorage.setItem('umans-tab', name); } catch {}
     }
     TABS.forEach((t) => { $('tab-' + t).onclick = () => selectTab(t); });
@@ -725,13 +736,18 @@
         </div>`;
     }
 
+    let lastModelsData = null;
     function renderModels(data) {
       const el = $('modelsOut');
       if (!el) return;
       const models = Array.isArray(data?.data) ? data.data : [];
       if (!models.length) { el.innerHTML = '<div class="empty">No models returned.</div>'; return; }
+      const q = ($('modelsFilter')?.value || '').trim().toLowerCase();
+      const filtered = q ? models.filter((m) => String(m.id ?? '').toLowerCase().includes(q) || String(m.owned_by ?? '').toLowerCase().includes(q)) : models;
       const enabled = new Set(($('models').value || '').split(/\r?\n/).map((s) => s.trim()).filter(Boolean));
-      el.innerHTML = `<div class="modelgrid">${models.map((m) => {
+      const head = q ? `<div class="sub" style="margin-bottom:10px;">${filtered.length} of ${models.length} matching “${esc(q)}”</div>` : `<div class="sub" style="margin-bottom:10px;">${models.length} model${models.length === 1 ? '' : 's'} available</div>`;
+      if (!filtered.length) { el.innerHTML = `${head}<div class="empty">No models match “${esc(q)}”.</div>`; return; }
+      el.innerHTML = `${head}<div class="modelgrid">${filtered.map((m) => {
         const ctx = m.context_length ? (m.context_length >= 1024 ? `${Math.round(m.context_length / 1024)}K` : m.context_length) : '—';
         const p = m.pricing || {};
         const in$ = p.input != null ? `$${Number(p.input).toFixed(2)}` : null;
@@ -1123,6 +1139,7 @@
     async function refresh() {
       try {
         const [health, config, sessionsData] = await Promise.all([json('/health'), json('/api/config').catch(() => null), json('/api/umans/sessions').catch(() => null)]);
+        setStatus('ok', 'Online');
         if (config) {
           $('apiKey').placeholder = config.hasApiKey ? 'Configured; leave blank to keep' : 'sk-...';
           $('timeout').value = config.requestTimeout || '15m';
@@ -1158,7 +1175,10 @@
 
     async function checkModels() {
       $('modelsBtn').disabled = true;
-      try { renderModels(await json('/v1/models')); }
+      try {
+        lastModelsData = await json('/v1/models');
+        renderModels(lastModelsData);
+      }
       catch (err) { show('modelsOut', err.message); }
       finally { $('modelsBtn').disabled = false; }
     }
@@ -1265,6 +1285,7 @@
       } finally { done(); }
     };
     $('modelsBtn').onclick = checkModels;
+    $('modelsFilter').addEventListener('input', () => { if (lastModelsData) renderModels(lastModelsData); });
     $('usageBtn').onclick = () => refreshUsage(true);
     $('testBtn').onclick = testChat;
 

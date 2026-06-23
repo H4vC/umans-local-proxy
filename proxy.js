@@ -858,9 +858,9 @@ function safeHeaders(headers) {
   const out = {};
   for (const [key, value] of headers) {
     const lower = key.toLowerCase();
-    // Strip hop-by-hop headers; keep content-length since we forward the
-    // upstream body byte-for-byte (both streaming and non-streaming).
-    if (['connection', 'content-encoding', 'keep-alive', 'transfer-encoding'].includes(lower)) continue;
+    // Strip hop-by-hop headers and content-length: writeJSON/writeText
+    // recompute Content-Length from the (possibly re-serialized) body.
+    if (['connection', 'content-encoding', 'keep-alive', 'transfer-encoding', 'content-length'].includes(lower)) continue;
     out[key] = value;
   }
   return out;

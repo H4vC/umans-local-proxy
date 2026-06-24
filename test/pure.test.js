@@ -335,9 +335,10 @@ test('percentValue skips negative, returns null', () => {
 });
 
 test('percentValue returns null for no valid input', () => {
-  // null coerces to 0 which IS finite and >= 0, so it returns 0 — not null.
-  // Only NaN/undefined are truly invalid.
-  assert.strictEqual(percentValue(NaN, undefined), null);
+  assert.strictEqual(percentValue(NaN, undefined, null), null);
+});
+test('percentValue skips null and returns next valid', () => {
+  assert.strictEqual(percentValue(null, 50), 0.5);
 });
 
 // ---- concurrency: burstQuota ----

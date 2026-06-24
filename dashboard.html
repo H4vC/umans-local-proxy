@@ -155,6 +155,8 @@
     button.btn:hover:not(:disabled) { background: var(--accent-2); }
     button.btn.tonal { background: var(--surface-3); color: var(--text); }
     button.btn.tonal:hover:not(:disabled) { background: var(--line-2); }
+    button.btn.outline { background: transparent; border: 1px solid var(--line-2); color: var(--text-2); }
+    button.btn.outline:hover:not(:disabled) { background: var(--surface-2); border-color: var(--muted-2); color: var(--text); }
     button.btn.danger { background: var(--bad); color: #fff; }
     button.btn.danger:hover:not(:disabled) { background: var(--bad); filter: brightness(1.08); }
     button.btn + button.btn, button.btn.tonal + button.btn { margin-left: 8px; }
@@ -393,10 +395,9 @@
     </header>
 
     <div class="toolbar full">
-      <div id="usagePill" class="badge"><span class="dot"></span><span>usage—</span></div>
-      <span class="countdown" id="refreshCountdown"></span>
+      <div id="usagePill" class="badge ok"><span class="dot"></span><span>Live usage updates</span></div>
       <span class="spacer"></span>
-      <button class="btn tonal" id="usageBtn">Refresh now</button>
+      <button class="btn outline" id="usageBtn" hidden>Refresh now</button>
     </div>
 
     <div class="tabs" role="tablist" aria-label="Sections">
@@ -492,7 +493,7 @@
       <section class="full">
         <h2>Smoke test</h2>
         <div class="row">
-          <input id="testModel" class="grow" placeholder="model id (blank = first enabled)">
+          <input id="testModel" class="grow" placeholder="model id" />
           <button class="btn" id="testBtn">Send test</button>
         </div>
         <label for="prompt">Prompt</label>
@@ -684,9 +685,11 @@
       if (!iso) return '';
       const ms = new Date(iso).getTime() - Date.now();
       if (!Number.isFinite(ms) || ms <= 0) return '';
-      const mins = Math.round(ms / 60000);
+      if (ms < 60000) return `${Math.ceil(ms / 1000)}s`;
+      const mins = Math.floor(ms / 60000);
       if (mins >= 60) return `${Math.floor(mins / 60)}h ${mins % 60}m`;
-      return `${mins}m`;
+      const secs = Math.floor((ms % 60000) / 1000);
+      return secs ? `${mins}m ${secs}s` : `${mins}m`;
     }
 
     function setStatus(cls, text) {
@@ -703,13 +706,14 @@
       if (!banner.hidden) $('delayBannerText').textContent = `${fmt(n)} request${n === 1 ? '' : 's'} delayed — waiting for a concurrency slot`;
     }
 
+    let lastUsageData = null;
     function renderUsage(data) {
+      lastUsageData = data;
       const usage = data?.usage || {};
-      const limits = data?.limits || {};
       const throttle = data?.throttle || {};
+      const limits = data?.limits || {};
       const plan = data?.plan || null;
       const win = data?.window || {};
-      const conc = limits?.concurrency || {};
       const concSoft = positive(throttle.soft) ?? throttle.softLimit ?? null;
       const concHard = positive(throttle.hard);
       const quotaLimit = positive(throttle.quotaLimit) ?? concSoft;
@@ -768,7 +772,7 @@
       updateDelayBanner(localQueued);
 
       $('windowLine').textContent = win.resets_at ? `resets in ${timeUntil(win.resets_at)}` : '';
-      $('usageWindowSub').textContent = win.remaining_minutes != null ? `window ${win.remaining_minutes}m left` : '';
+      $('usageWindowSub').textContent = win.resets_at ? `${timeUntil(win.resets_at)} left` : (win.remaining_minutes != null ? `${win.remaining_minutes}m left` : '');
       $('planLine').textContent = plan?.display_name ? `${plan.display_name} · UMANS Proxy` : 'UMANS usage-informed concurrency proxy';
 
       const chips = $('chips'); chips.innerHTML = '';
@@ -786,10 +790,11 @@
       if (throttle.overridden) { const c = document.createElement('span'); c.className = 'chip ok'; c.textContent = `override ${fmt(concLimit)}`; chips.appendChild(c); }
       if (data?.stale) { const c = document.createElement('span'); c.className = 'chip warn'; c.textContent = 'stale cache'; chips.appendChild(c); }
 
+      // Pill reflects usage fetch result. On error: red "Usage error".
+      // On success: restore to live/connecting state based on WS.
       const up = $('usagePill');
-      if (data?.ok === false) { up.className = 'badge bad'; up.lastElementChild.textContent = 'usage error'; }
-      else if (data?.stale) { up.className = 'badge warn'; up.lastElementChild.textContent = 'usage stale'; }
-      else { up.className = 'badge ok'; up.lastElementChild.textContent = 'usage live'; }
+      if (data?.ok === false) { up.className = 'badge bad'; up.lastElementChild.textContent = 'Usage error'; }
+      else { tickCountdown(); }
 
       renderUsageDetails(data);
     }
@@ -1275,20 +1280,34 @@
       if (inFlightUsage) return;
       inFlightUsage = true;
       const btn = $('usageBtn');
+      const wasHidden = btn.hidden;
+      btn.hidden = false; // ensure visible during refresh
       const old = btn.innerHTML; btn.disabled = true; btn.innerHTML = '<span class="spin"></span>Refreshing';
       try {
         const data = await json('/api/umans/usage' + (force ? '?force=1' : ''));
         renderUsage(data);
       } catch (err) {
         show('usageOut', err.message);
-        const up = $('usagePill'); up.className = 'badge bad'; up.lastElementChild.textContent = 'usage error';
+        tickCountdown(); // restore pill to live/connecting state
       } finally {
-        btn.disabled = false; btn.innerHTML = old; inFlightUsage = false;
+        btn.disabled = false; btn.innerHTML = old; btn.hidden = wasHidden; inFlightUsage = false;
       }
     }
 
     function tickCountdown() {
-      $('refreshCountdown').textContent = sseConnected ? 'live' : 'connecting…';
+      // WS connected: green dot + "Live usage updates", hide refresh button.
+      // WS disconnected: amber dot + "Connecting…", show refresh button.
+      const pill = $('usagePill');
+      const btn = $('usageBtn');
+      if (wsConnected) {
+        pill.className = 'badge ok';
+        pill.lastElementChild.textContent = 'Live usage updates';
+        btn.hidden = true;
+      } else {
+        pill.className = 'badge warn';
+        pill.lastElementChild.textContent = 'Connecting…';
+        btn.hidden = false;
+      }
     }
 
     // ---- config / models / smoke -------------------------------------------
@@ -1352,8 +1371,8 @@
       $('testBtn').disabled = true;
       await refreshUsage(true);
       try {
-        const model = $('testModel').value.trim() || $('models').value.split(/\r?\n/).map(x => x.trim()).filter(Boolean)[0];
-        if (!model) throw new Error('Enter a model id first.');
+        const model = $('testModel').value.trim();
+        if (!model) throw new Error('Enter a model id.');
         const body = { model, stream: false, messages: [{ role: 'user', content: $('prompt').value }] };
         renderTestResult(await json('/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }));
       } catch (err) { show('testOut', err.message); }
@@ -1572,38 +1591,60 @@
     $('testBtn').onclick = testChat;
     $('statusBtn').onclick = () => checkStatus(true);
 
-    // ---- SSE: live updates from the proxy ---------------------------------
-    let sse = null;
-    let sseConnected = false;
-    function connectSSE() {
-      const key = $('proxyKey')?.value.trim() || sessionStorage.getItem('proxyKey') || '';
-      const qs = key ? `?key=${encodeURIComponent(key)}` : '';
-      sse = new EventSource('/api/events' + qs);
-      sse.addEventListener('open', () => { sseConnected = true; tickCountdown(); });
-      sse.addEventListener('connected', () => { sseConnected = true; tickCountdown(); });
-      sse.addEventListener('usage', (e) => {
-        try { renderUsage(JSON.parse(e.data)); } catch {}
-      });
-      sse.addEventListener('session', (e) => {
-        try {
-          const d = JSON.parse(e.data);
-          $('liveActive').textContent = fmt(d.active ?? 0);
-          $('liveQueued').textContent = fmt(d.queued ?? 0);
-          updateDelayBanner(d.queued ?? 0);
-        } catch {}
-      });
-      sse.addEventListener('sessions', (e) => {
-        try { renderSessions(JSON.parse(e.data)); } catch {}
-      });
-      sse.addEventListener('error', () => {
-        sseConnected = false;
+    // ---- WebSocket: live updates from the proxy ----------------------------
+    let ws = null;
+    let wsConnected = false;
+    let wsReconnectDelay = 1000;
+    function connectWS() {
+      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      ws = new WebSocket(`${proto}//${location.host}/ws`);
+      ws.onopen = () => {
+        wsConnected = true;
+        wsReconnectDelay = 1000; // reset backoff on success
         tickCountdown();
-        try { sse.close(); } catch {}
-        sse = null;
-        setTimeout(connectSSE, 5000);
-      });
+      };
+      ws.onmessage = (e) => {
+        try {
+          const msg = JSON.parse(e.data);
+          switch (msg.type) {
+            case 'usage':
+              renderUsage(msg.data);
+              break;
+            case 'session':
+              $('liveActive').textContent = fmt(msg.data.active ?? 0);
+              $('liveQueued').textContent = fmt(msg.data.queued ?? 0);
+              updateDelayBanner(msg.data.queued ?? 0);
+              break;
+            case 'sessions':
+              renderSessions(msg.data);
+              break;
+          }
+        } catch {}
+      };
+      ws.onclose = () => {
+        wsConnected = false;
+        tickCountdown();
+        ws = null;
+        // Exponential backoff capped at 10s.
+        setTimeout(connectWS, wsReconnectDelay);
+        wsReconnectDelay = Math.min(wsReconnectDelay * 2, 10000);
+      };
+      ws.onerror = () => {
+        // onclose will fire after this — reconnect handled there.
+        try { ws.close(); } catch {}
+      };
     }
-    connectSSE();
+    connectWS();
+
+    // Tick time labels every second so seconds-precision feels live.
+    setInterval(() => {
+      if (!lastUsageData) return;
+      const win = lastUsageData?.window || {};
+      if (win.resets_at) {
+        $('windowLine').textContent = `resets in ${timeUntil(win.resets_at)}`;
+        $('usageWindowSub').textContent = `${timeUntil(win.resets_at)} left`;
+      }
+    }, 1000);
 
     refresh();
     tickCountdown();

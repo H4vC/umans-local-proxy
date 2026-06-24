@@ -45,7 +45,7 @@ Use the launcher, dashboard, or create `.config/config.json`:
 }
 ```
 
-`.config/` is gitignored and never committed — it holds your live API key. `UMANS_API_KEY` overrides `API_KEY`. `API_KEYS` or comma-separated env `API_KEYS` protects `/api/config`, `/api/events`, `/api/umans/*`, and `/v1/*`. Proxy auth is **disabled by default** (empty `API_KEYS`): intended for a localhost single-user tool. Set `API_KEYS` before binding to a non-loopback address. `REQUEST_TIMEOUT` accepts `ms`, `s`, `m`, or `h` units. `OVERRIDE_CONCURRENCY=0` uses UMANS `/usage` limits; positive values cap the UMANS burst/soft limit.
+`.config/` is gitignored and never committed — it holds your live API key. `UMANS_API_KEY` overrides `API_KEY`. `API_KEYS` or comma-separated env `API_KEYS` protects `/api/config`, `/api/events`, `/api/umans/*`, and `/v1/*`. Proxy auth is **disabled by default** (empty `API_KEYS`): intended for a localhost single-user tool. Set `API_KEYS` before binding to a non-loopback address. When auth is disabled, `GET /api/debug/coalesce` exposes conversation-prefix hashes and short response-content previews — safe on loopback, but set `API_KEYS` before exposing the proxy on a network. `REQUEST_TIMEOUT` accepts `ms`, `s`, `m`, or `h` units. `OVERRIDE_CONCURRENCY=0` uses UMANS `/usage` limits; positive values cap the UMANS burst/soft limit.
 
 Launcher flags:
 
@@ -70,7 +70,7 @@ Both API shapes are always live as passthrough routes — point your client at w
 Throttling, session tracking, and live tok/s telemetry apply to both shapes. Claude Code (`ANTHROPIC_BASE_URL=http://127.0.0.1:8084`) and OpenAI-compatible clients (omp, Cursor, OpenCode) can both use the same proxy simultaneously.
 ## Throttling and usage
 
-Before chat requests, the proxy reads the concurrency limit from UMANS `/usage` (`limits.concurrency.limit`) and queues requests when **local** in-flight requests reach that limit. Queued requests re-read the effective limit each iteration, so config changes or usage refreshes are honored without restarting. `OVERRIDE_CONCURRENCY` caps below the upstream limit. The upstream-reported `concurrent_sessions` count is shown for insight but does not gate the proxy — only locally-tracked requests do, so other clients on the same key don't throttle you.
+Before chat requests, the proxy reads the concurrency limit from UMANS `/usage` (`limits.concurrency.limit`) and queues requests when in-flight requests reach that limit. The effective in-flight count is the maximum of locally-tracked requests and the upstream-reported `concurrent_sessions` count, so other clients on the same key are counted toward the limit. Queued requests re-read the effective limit each iteration, so config changes or usage refreshes are honored without restarting. `OVERRIDE_CONCURRENCY` caps below the upstream limit.
 
 `/usage` is cached for 10 seconds. If `/usage` is unavailable or no limit is known, the proxy proceeds without gating rather than blocking chat. The proxy refreshes its cache when any proxied chat request starts and ends.
 
@@ -94,12 +94,17 @@ The dashboard **Sessions** tab shows per-session cards with:
 
 Sessions are pushed via the `/api/events` SSE stream (event: `sessions`) at most once per second while sessions are active. Completed sessions remain visible for 5 seconds before being dropped. A local timer in the dashboard updates elapsed times at 2fps between SSE pushes.
 
+## Service health
+
+`GET /api/umans/status` proxies the upstream UMANS `/v1/status` endpoint and projects a public-safe subset: the overall status band, 24h uptime %, time-to-first-token p50 (ms), and decode tokens-per-second p50 — both overall and per served model. The response is cached for 15 seconds; `?force=1` bypasses the cache. If the upstream fetch fails but a cached copy exists, the cached copy is served with `stale: true`. The dashboard **Service Health** tab renders this as an overall status panel plus per-model cards.
+
 ## API
 
 - `GET /health`
 - `GET /api/umans/usage`
 - `GET /api/umans/concurrency`
 - `GET /api/umans/sessions` (live TPS + per-session tracking)
+- `GET /api/umans/status` (UMANS service health: status band, uptime, TTFT/decode p50)
 - `GET /v1/models/info` (upstream per-model capabilities)
 - `GET /v1/models/:id`
 - `POST /v1/chat/completions` (OpenAI shape; snaps `reasoning_effort` to supported levels)

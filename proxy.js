@@ -9,6 +9,7 @@ const DEFAULT_UPSTREAM = 'https://api.code.umans.ai/v1';
 const MAX_BODY_SIZE = 25 * 1024 * 1024;
 const USAGE_TTL_MS = 10 * 1000;
 const MODEL_INFO_TTL_MS = 60 * 1000;
+const STATUS_TTL_MS = 15 * 1000;
 
 // Canonical reasoning-effort ordering, weakest to strongest.
 // Covers OpenAI (minimal/low/medium/high), UMANS (none/low/medium/high/max),
@@ -19,10 +20,11 @@ const REASONING_RANK = { none: 0, off: 0, disabled: 0, minimal: 1, low: 2, mediu
 let config = loadConfig();
 const startedAt = Date.now();
 let usageCache = { data: null, time: 0 };
-let concurrencyCache = { concurrent: null, limit: null, softLimit: null, user_id: null, time: 0 };
+let concurrencyCache = { concurrent: null, limit: null, softLimit: null, time: 0 };
 let activeRequests = 0;
 let queuedRequests = 0;
 const sseClients = new Set();
+let statusCache = { data: null, time: 0 };
 let modelInfoCache = { data: null, time: 0 };
 // Per-session tracking for live TPS + session listing. Sessions are created
 // when a chat request begins streaming/receiving and removed on completion.
@@ -265,9 +267,11 @@ function addSessionTokens(session, tokens, { exact = false } = {}) {
   if (tokens <= 0) return;
   const now = Date.now();
   const cutoff = now - TPS_WINDOW_MS;
-  // Aggregate bucket.
+  // Aggregate bucket. Single splice of expired prefix instead of repeated O(n) shifts.
   tpsBuckets.push({ time: now, tokens });
-  while (tpsBuckets.length && tpsBuckets[0].time < cutoff) tpsBuckets.shift();
+  let i = 0;
+  while (i < tpsBuckets.length && tpsBuckets[i].time < cutoff) i++;
+  if (i > 0) tpsBuckets.splice(0, i);
   // Per-model bucket.
   const model = session.model;
   if (model) {
@@ -275,7 +279,9 @@ function addSessionTokens(session, tokens, { exact = false } = {}) {
     let buckets = tpsBucketsByModel.get(model);
     if (!buckets) { buckets = []; tpsBucketsByModel.set(model, buckets); }
     buckets.push({ time: now, tokens });
-    while (buckets.length && buckets[0].time < cutoff) buckets.shift();
+    let j = 0;
+    while (j < buckets.length && buckets[j].time < cutoff) j++;
+    if (j > 0) buckets.splice(0, j);
   }
 }
 function aggregateTps() {
@@ -403,6 +409,7 @@ function getSessionsSnapshot() {
     aggregate: {
       tps: Math.round(aggregateTps() * 10) / 10,
       activeSessions: (() => { let n = 0; for (const s of sessions.values()) if (s.status === 'active') n++; return n; })(),
+      totalSessions: list.length,
       medianTps,
       p10Tps,
       // Per-model: live rolling TPS + median/p10 from completed sessions.
@@ -420,6 +427,10 @@ function scheduleSessionsBroadcast() {
     broadcastEvent('sessions', getSessionsSnapshot());
     return;
   }
+  // Coalesce: mark throttled so rapid calls (e.g. multiple sessions ending
+  // in the same tick) collapse into a single broadcast. The setTimeout(0)
+  // defers to the next tick; the interval takes over for ongoing updates.
+  broadcastThrottled = true;
   setTimeout(() => {
     broadcastThrottled = false;
     broadcastEvent('sessions', getSessionsSnapshot());
@@ -1006,7 +1017,6 @@ async function fetchUmansUsage({ force = false } = {}) {
       concurrent: Number(raw?.usage?.concurrent_sessions ?? 0) || 0,
       limit: concurrencyQuotaLimit(raw?.limits?.concurrency || {}),
       softLimit: firstNumber(raw?.limits?.concurrency?.limit),
-      user_id: raw?.user_id ?? null,
       time: Date.now(),
     };
     broadcastEvent('usage', result);
@@ -1046,7 +1056,7 @@ function getEffectiveConcurrency() {
     concurrencyCache.softLimit,
     config.overrideConcurrency || 0,
   );
-  return { concurrent: concurrencyCache.concurrent || 0, limit, softLimit, overridden, user_id: concurrencyCache.user_id || null };
+  return { concurrent: concurrencyCache.concurrent || 0, limit, softLimit, overridden };
 }
 function canStart(effective) {
   const limit = effective.limit;
@@ -1135,6 +1145,60 @@ async function fetchModelInfo({ force = false } = {}) {
   } catch (err) {
     logError('UMANS /models/info fetch failed', err);
     return modelInfoCache.data; // serve stale if available, else null
+  }
+}
+
+// Project the upstream /status response to the public-safe subset exposed
+// by GET /api/umans/status: status band, 24h uptime %, TTFT p50, decode tps
+// p50 — overall plus per served model. Strips generated_at/latency detail we
+// don't surface.
+function projectStatus(raw) {
+  const pick = (entry) => {
+    if (!entry || typeof entry !== 'object') return null;
+    const ttftP50 = firstNumber(entry?.latency?.ttft_ms?.p50);
+    const tpsP50 = firstNumber(entry?.output_tokens_per_second?.p50);
+    return {
+      status: String(entry?.status || 'unknown'),
+      uptimePct: firstNumber(entry?.uptime_pct_24h),
+      ttftMsP50: ttftP50 ?? null,
+      decodeTpsP50: tpsP50 ?? null,
+    };
+  };
+  const models = {};
+  const rawModels = raw?.models || {};
+  for (const id of Object.keys(rawModels)) {
+    const p = pick(rawModels[id]);
+    if (p) models[id] = p;
+  }
+  return {
+    ok: true,
+    overall: pick(raw?.overall),
+    models,
+    stale: false,
+    fetchedAt: new Date().toISOString(),
+  };
+}
+
+async function fetchUmansStatus({ force = false } = {}) {
+  if (!config.apiKey) return { ok: false, error: 'UMANS API key is not configured', overall: null, models: {} };
+  if (!force && statusCache.data && Date.now() - statusCache.time < STATUS_TTL_MS) {
+    return { ...statusCache.data, stale: Date.now() - statusCache.time > STATUS_TTL_MS };
+  }
+  try {
+    const resp = await fetch(upstreamURL('/status'), {
+      headers: authHeaders({ Accept: 'application/json' }),
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!resp.ok) throw new Error(`UMANS /status returned ${resp.status}`);
+    const raw = await resp.json();
+    const result = projectStatus(raw);
+    statusCache = { data: result, time: Date.now() };
+    return result;
+  } catch (err) {
+    logError('UMANS /status fetch failed', err);
+    // Serve stale with a stale:true flag if we have it; otherwise surface the error.
+    if (statusCache.data) return { ...statusCache.data, stale: true };
+    return { ok: false, error: err.message, overall: null, models: {}, stale: false };
   }
 }
 
@@ -1344,13 +1408,15 @@ async function handleChat(req, res) {
   }
   let timedOut = false;
   const timeout = setTimeout(() => { timedOut = true; sessionStatus = 'aborted'; controller.abort(); }, config.requestTimeout);
+  let session, tap;
+  try {
   // asynchronously (setImmediate drain) and NEVER mutates what the client
   // receives. Created here so it covers the upstream fetch + streaming.
   // Coalesce: resolve the logical session from the message prefix before
   // creating the per-request session. Runs at arrival — never in the stream.
   const { groupKey, prefixChain } = resolveGroupKey(payload.model, payload.messages || []);
-  const session = createSession({ model: payload.model, stream: payload.stream, groupKey });
-  const tap = new ChatTap(session, { stream: payload.stream, onFinalize: (s) => {
+  session = createSession({ model: payload.model, stream: payload.stream, groupKey });
+  tap = new ChatTap(session, { stream: payload.stream, onFinalize: (s) => {
     if (sessionStatus === 'done') {
       try { storeStateKey(payload.model, payload.messages || [], s.responseContent, s.groupKey, prefixChain); } catch {}
     }
@@ -1362,7 +1428,6 @@ async function handleChat(req, res) {
   broadcastEvent('session', { type: 'start', id: session.id, active: activeRequests, queued: queuedRequests });
   scheduleSessionsBroadcast();
 
-  try {
     // Inject stream_options.include_usage to get exact token counts on the
     // final stream chunk. Only re-serialize if this actually changes the
     // payload — if the client already set it, forward raw bytes.
@@ -1431,7 +1496,7 @@ async function handleChat(req, res) {
     releaseThrottleSlot();
     // Finalize telemetry. onEnd() is async-safe: if a drain is in flight,
     // _finish runs when caught up; otherwise it runs now. Never throws.
-    try { tap.onEnd(); } catch {}
+    try { if (tap) tap.onEnd(); } catch {}
     // Coalescing is handled by the onFinalize callback inside _finish,
     // which runs after responseContent is fully populated (may be deferred
     // by an in-flight drain). This is why storeStateKey is not here.
@@ -1504,9 +1569,11 @@ async function handleMessages(req, res) {
   }
   let timedOut = false;
   const timeout = setTimeout(() => { timedOut = true; sessionStatus = 'aborted'; controller.abort(); }, config.requestTimeout);
+  let session, tap;
+  try {
   const { groupKey, prefixChain } = resolveGroupKey(payload.model, payload.messages || []);
-  const session = createSession({ model: payload.model, stream: payload.stream, groupKey });
-  const tap = new ChatTap(session, { stream: payload.stream, shape: 'anthropic', onFinalize: (s) => {
+  session = createSession({ model: payload.model, stream: payload.stream, groupKey });
+  tap = new ChatTap(session, { stream: payload.stream, shape: 'anthropic', onFinalize: (s) => {
     if (sessionStatus === 'done') {
       try { storeStateKey(payload.model, payload.messages || [], s.responseContent, s.groupKey, prefixChain); } catch {}
     }
@@ -1515,7 +1582,6 @@ async function handleMessages(req, res) {
   broadcastEvent('session', { type: 'start', id: session.id, active: activeRequests, queued: queuedRequests });
   scheduleSessionsBroadcast();
 
-  try {
     const upstream = await fetch(upstreamURL('/messages'), {
       method: 'POST',
       headers: authHeaders({ 'Content-Type': 'application/json', Accept: payload.stream ? 'text/event-stream' : 'application/json' }, { anthropic: true }),
@@ -1563,8 +1629,7 @@ async function handleMessages(req, res) {
   finally {
     clearTimeout(timeout);
     res.off('close', onClose);
-    releaseThrottleSlot();
-    try { tap.onEnd(); } catch {}
+    try { if (tap) tap.onEnd(); } catch {}
     finalizeSession(session, sessionStatus);
   }
 }
@@ -1611,7 +1676,8 @@ async function handleConfig(req, res) {
   saveConfig(nextConfig);
   config = nextConfig;
   usageCache = { data: null, time: 0 };
-  concurrencyCache = { concurrent: null, limit: null, softLimit: null, user_id: null, time: 0 };
+  concurrencyCache = { concurrent: null, limit: null, softLimit: null, time: 0 };
+  statusCache = { data: null, time: 0 };
   writeJSON(res, 200, { ok: true });
 }
 
@@ -1631,6 +1697,12 @@ async function handleConcurrency(req, res) {
 async function handleSessions(req, res) {
   if (req.method !== 'GET') return openAIError(res, 405, 'method not allowed', 'invalid_request_error');
   writeJSON(res, 200, getSessionsSnapshot());
+}
+
+async function handleStatus(req, res) {
+  if (req.method !== 'GET') return openAIError(res, 405, 'method not allowed', 'invalid_request_error');
+  const force = new URL(req.url, 'http://localhost').searchParams.get('force') === '1';
+  writeJSON(res, 200, await fetchUmansStatus({ force }));
 }
 
 // Graceful shutdown trigger from the dashboard. Responds first, then shuts
@@ -1675,7 +1747,8 @@ function handleClearState(req, res) {
   groupSummaries.clear();
   seenModels.clear();
   usageCache = { data: null, time: 0 };
-  concurrencyCache = { concurrent: null, limit: null, softLimit: null, user_id: null, time: 0 };
+  concurrencyCache = { concurrent: null, limit: null, softLimit: null, time: 0 };
+  coalesceDebug.length = 0;
   modelInfoCache = { data: null, time: 0 };
   if (sessionsBroadcastTimer) { clearInterval(sessionsBroadcastTimer); sessionsBroadcastTimer = null; }
   broadcastThrottled = false;
@@ -1727,6 +1800,7 @@ async function handleRequest(req, res) {
   if (url.pathname === '/api/umans/sessions') return handleSessions(req, res);
   if (url.pathname === '/api/umans/usage') return handleUsage(req, res);
   if (url.pathname === '/api/umans/concurrency') return handleConcurrency(req, res);
+  if (url.pathname === '/api/umans/status') return handleStatus(req, res);
   if (url.pathname === '/v1/models/info') return handleModelsInfo(req, res);
   if (url.pathname === '/v1/models') return handleModels(req, res);
   if (url.pathname.startsWith('/v1/models/')) return handleModels(req, res, decodeURIComponent(url.pathname.slice('/v1/models/'.length)));

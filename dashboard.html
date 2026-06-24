@@ -269,6 +269,41 @@
     .modelname { font-weight: 650; font-size: 13px; word-break: break-all; }
     .modelcard-meta { display: flex; gap: 10px; flex-wrap: wrap; font-size: 11.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
 
+    /* ---- service health ---- */
+    .health-hero { display: grid; grid-template-columns: minmax(180px, auto) repeat(3, minmax(0, 1fr)); gap: 12px; align-items: stretch; }
+    .health-band {
+      display: flex; flex-direction: column; justify-content: center; gap: 6px;
+      background: var(--surface-2); border: 1px solid var(--line); border-left: 3px solid var(--muted-2);
+      border-radius: var(--radius-sm); padding: 16px 18px;
+    }
+    .health-band.operational { border-left-color: var(--good); }
+    .health-band.degraded { border-left-color: var(--warn); }
+    .health-band.down, .health-band.outage { border-left-color: var(--bad); }
+    .health-band .band-label { font-size: 10.5px; text-transform: uppercase; letter-spacing: .04em; font-weight: 600; color: var(--muted); }
+    .health-band .band-value { font-size: 17px; font-weight: 650; letter-spacing: -0.01em; }
+    .health-band.operational .band-value { color: var(--good); }
+    .health-band.degraded .band-value { color: var(--warn); }
+    .health-band.down .band-value, .health-band.outage .band-value { color: var(--bad); }
+    .health-band .band-sub { font-size: 11px; color: var(--muted-2); font-variant-numeric: tabular-nums; }
+    .health-section-title { margin: 22px 0 10px; font-size: 11px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
+    .healthgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 12px; }
+    .healthcard { background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 14px 16px; border-left: 3px solid var(--muted-2); }
+    .healthcard.operational { border-left-color: var(--good); }
+    .healthcard.degraded { border-left-color: var(--warn); }
+    .healthcard.down, .healthcard.outage { border-left-color: var(--bad); }
+    .healthcard-name { font-weight: 650; font-size: 13px; word-break: break-all; margin-bottom: 4px; }
+    .healthcard-band { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+    .healthcard-band.operational { color: var(--good); }
+    .healthcard-band.degraded { color: var(--warn); }
+    .healthcard-band.down, .healthcard-band.outage { color: var(--bad); }
+    .healthcard-meta { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 12px; margin-top: 12px; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+    .healthcard-meta .k { color: var(--muted-2); }
+    .healthcard-meta .v { color: var(--text); font-weight: 500; }
+    .health-footer { margin-top: 16px; font-size: 12px; color: var(--muted-2); font-variant-numeric: tabular-nums; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+    .health-footer .chip { font-size: 11px; padding: 3px 10px; }
+    @media (max-width: 820px) { .health-hero { grid-template-columns: 1fr 1fr; } }
+    @media (max-width: 480px) { .health-hero { grid-template-columns: 1fr; } }
+
     .result-msg { background: var(--surface-2); border: 1px solid var(--line); border-left: 3px solid var(--accent); border-radius: var(--radius-sm); padding: 14px 16px; white-space: pre-wrap; word-break: break-word; font-size: 14px; line-height: 1.6; color: var(--text); }
     .result-reasoning { margin-top: 12px; }
     .result-reasoning summary { cursor: pointer; color: var(--muted); font-size: 12px; font-weight: 600; padding: 6px 0; }
@@ -325,6 +360,7 @@
     <div class="tabs" role="tablist" aria-label="Sections">
       <button class="tab" role="tab" id="tab-overview" aria-selected="true" aria-controls="panel-overview">Overview</button>
       <button class="tab" role="tab" id="tab-sessions" aria-selected="false" aria-controls="panel-sessions">Sessions</button>
+      <button class="tab" role="tab" id="tab-health" aria-selected="false" aria-controls="panel-health">Service Health</button>
       <button class="tab" role="tab" id="tab-test" aria-selected="false" aria-controls="panel-test">Test</button>
       <button class="tab" role="tab" id="tab-config" aria-selected="false" aria-controls="panel-config">Config</button>
       <button class="tab" role="tab" id="tab-api" aria-selected="false" aria-controls="panel-api">API</button>
@@ -395,6 +431,19 @@
         <div class="empty-state" id="sessionEmpty">No active sessions. Send a chat request to see live tok/s.</div>
       </section>
     </div>
+    <!-- Service Health -->
+    <div id="panel-health" class="tabpanel" role="tabpanel" aria-labelledby="tab-health">
+      <section class="full">
+        <h2>Service Health <button class="btn tonal btn-sm" id="statusBtn">Refresh</button></h2>
+        <p class="sub" style="margin:0 0 14px;color:var(--muted);font-size:13px;">UMANS upstream service status — overall and per served model. Public-safe subset from <code>GET /api/umans/status</code>.</p>
+        <div id="healthError" class="result-error" style="display:none;"></div>
+        <div id="healthOverall" class="health-hero"></div>
+        <h3 class="health-section-title">Per model</h3>
+        <div id="healthModels" class="healthgrid"></div>
+        <div class="health-footer" id="healthFooter"></div>
+      </section>
+    </div>
+
 
     <!-- Test -->
     <div id="panel-test" class="tabpanel" role="tabpanel" aria-labelledby="tab-test">
@@ -442,6 +491,7 @@
           <li><code>GET /api/umans/usage</code></li>
           <li><code>GET /api/umans/concurrency</code></li>
           <li><code>GET /api/umans/sessions</code> <span class="muted" style="font-size:11px">live TPS + per-session</span></li>
+          <li><code>GET /api/umans/status</code> <span class="muted" style="font-size:11px">UMANS service health</span></li>
           <li><code>GET /v1/models</code></li>
           <li><code>POST /v1/chat/completions</code> <span class="muted" style="font-size:11px">OpenAI shape</span></li>
           <li><code>POST /v1/messages</code> <span class="muted" style="font-size:11px">Anthropic shape</span></li>
@@ -492,7 +542,7 @@
         <pre id="adminOut"></pre>
       </section>
     </div>
-    <p class="footer-note">UMANS Proxy · live updates via SSE; polls every 15s as fallback.</p>
+    <p class="footer-note">UMANS Proxy · live updates via SSE; reconnects after 5s on drop.</p>
   </main>
 
   <script>
@@ -516,7 +566,7 @@
     $('themeDark').onclick = () => setTheme('dark');
 
     // ---- tabs --------------------------------------------------------------
-    const TABS = ['overview', 'sessions', 'test', 'config', 'api', 'models', 'admin'];
+    const TABS = ['overview', 'sessions', 'health', 'test', 'config', 'api', 'models', 'admin'];
     function selectTab(name) {
       TABS.forEach((t) => {
         const tab = $('tab-' + t), panel = $('panel-' + t);
@@ -527,6 +577,7 @@
       });
       if (name === 'admin' && typeof refreshAdmin === 'function') refreshAdmin();
       if (name === 'models' && typeof checkModels === 'function') checkModels();
+      if (name === 'health' && typeof checkStatus === 'function') checkStatus();
       try { localStorage.setItem('umans-tab', name); } catch {}
     }
     TABS.forEach((t) => { $('tab-' + t).onclick = () => selectTab(t); });
@@ -640,6 +691,7 @@
       const pct = concLimit ? (used / concLimit) * 100 : 0;
       const fill = $('concMeter');
       fill.style.width = clampPct(pct) + '%';
+      $('concPct').textContent = clampPct(pct) + '%';
       // Interpolate between theme --good → --warn → --bad as pct rises.
       const mix = (c1, c2, t) => c1.map((v, i) => Math.round(v + (c2[i] - v) * t));
       const hexToRgb = (h) => [1, 3, 5].map((i) => parseInt(h.slice(i, i + 2), 16));
@@ -933,7 +985,10 @@
       }
     }
     // Shared grouping logic (extracted from renderSessions/renderSessionsInner).
-    function buildGroups(list, summariesData) {
+    // `activeOnly` suppresses summary-only groups (conversations whose
+    // sessions have all expired) — otherwise the filter is bypassed and
+    // expired cards reappear via groupSummaries.
+    function buildGroups(list, summariesData, activeOnly) {
       const groups = new Map();
       for (const s of list) {
         const g = groups.get(s.groupKey) || { groupKey: s.groupKey, sessions: [] };
@@ -945,8 +1000,12 @@
         const summary = summaries.get(key);
         if (summary) group.summary = summary;
       }
-      for (const [key, summary] of summaries) {
-        if (!groups.has(key)) groups.set(key, { groupKey: key, sessions: [], summary });
+      // Only inject summary-only groups (no live sessions) when not filtering
+      // to active — these represent expired conversations.
+      if (!activeOnly) {
+        for (const [key, summary] of summaries) {
+          if (!groups.has(key)) groups.set(key, { groupKey: key, sessions: [], summary });
+        }
       }
       return [...groups.values()];
     }
@@ -1039,7 +1098,7 @@
       } else {
         if (empty) empty.style.display = 'none';
         if (groupSessions) {
-          const groups = sortGroups(buildGroups(list, data?.groupSummaries));
+          const groups = sortGroups(buildGroups(list, data?.groupSummaries, activeOnly));
           diffCards(grid, groups.map(groupedCardDesc), GROUPED_SKELETON);
         } else {
           diffCards(grid, list.map(flatCardDesc), FLAT_SKELETON);
@@ -1108,7 +1167,7 @@
       }
       if ($('sessionEmpty')) $('sessionEmpty').style.display = 'none';
       if (groupSessions) {
-        const groups = sortGroups(buildGroups(list, data?.groupSummaries));
+        const groups = sortGroups(buildGroups(list, data?.groupSummaries, activeOnly));
         diffCards(grid, groups.map(groupedCardDesc), GROUPED_SKELETON);
       } else {
         diffCards(grid, list.map(flatCardDesc), FLAT_SKELETON);
@@ -1192,6 +1251,85 @@
         renderTestResult(await json('/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }));
       } catch (err) { show('testOut', err.message); }
       finally { $('testBtn').disabled = false; await refreshUsage(true); }
+    }
+
+    // ---- service health ---------------------------------------------------
+    let lastStatusData = null;
+    function bandClass(band) {
+      const b = String(band || '').toLowerCase();
+      if (b === 'operational') return 'operational';
+      if (b === 'degraded') return 'degraded';
+      if (b === 'down' || b === 'outage') return 'down';
+      return '';
+    }
+    function fmtMs(ms) {
+      if (ms == null) return '—';
+      const n = Number(ms);
+      if (!Number.isFinite(n)) return '—';
+      if (n >= 1000) return (n / 1000).toFixed(n >= 10000 ? 1 : 2) + 's';
+      return Math.round(n) + 'ms';
+    }
+    function fmtUptimePct(pct) {
+      const n = Number(pct);
+      if (!Number.isFinite(n)) return '—';
+      return n.toFixed(n >= 99.9 ? 2 : 1) + '%';
+    }
+    function fmtTpsP50(n) { n = Number(n || 0); return Number.isFinite(n) ? (n >= 100 ? Math.round(n) : n.toFixed(1)) + ' tok/s' : '—'; }
+    function renderStatus(data) {
+      const err = $('healthError'); if (err) err.style.display = 'none';
+      const overall = data?.overall || {};
+      const cls = bandClass(overall.status);
+      const hero = $('healthOverall');
+      if (hero) hero.innerHTML = `
+        <div class="health-band ${cls}">
+          <span class="band-label">overall status</span>
+          <span class="band-value">${esc(overall.status || 'unknown')}</span>
+          <span class="band-sub">${fmtUptimePct(overall.uptimePct)} uptime · 24h</span>
+        </div>
+        <div class="stat"><strong>${fmtMs(overall.ttftMsP50)}</strong><span>TTFT p50</span></div>
+        <div class="stat accent"><strong>${fmtTpsP50(overall.decodeTpsP50).replace(' tok/s','')}</strong><span>decode tok/s p50</span></div>
+        <div class="stat"><strong>${fmtUptimePct(overall.uptimePct)}</strong><span>uptime 24h</span></div>`;
+      const models = data?.models || {};
+      const ids = Object.keys(models).sort();
+      const mg = $('healthModels');
+      if (mg) {
+        if (!ids.length) { mg.innerHTML = '<div class="empty-state">No per-model status reported.</div>'; }
+        else {
+          mg.innerHTML = ids.map((id) => {
+            const m = models[id] || {};
+            const mc = bandClass(m.status);
+            return `<div class="healthcard ${mc}">
+              <div class="healthcard-name">${esc(id)}</div>
+              <div class="healthcard-band ${mc}">${esc(m.status || 'unknown')}</div>
+              <div class="healthcard-meta">
+                <span class="k">TTFT p50</span><span class="v">${fmtMs(m.ttftMsP50)}</span>
+                <span class="k">decode p50</span><span class="v">${fmtTpsP50(m.decodeTpsP50).replace(' tok/s','')} tok/s</span>
+                <span class="k">uptime</span><span class="v">${fmtUptimePct(m.uptimePct)}</span>
+              </div>
+            </div>`;
+          }).join('');
+        }
+      }
+      const foot = $('healthFooter');
+      if (foot) {
+        const chips = [];
+        if (data?.stale) chips.push('<span class="chip warn">stale cache</span>');
+        if (data?.fetchedAt) chips.push(`<span>updated ${new Date(data.fetchedAt).toLocaleString()}</span>`);
+        foot.innerHTML = chips.join('');
+      }
+    }
+    async function checkStatus(force = false) {
+      const btn = $('statusBtn'); const old = btn ? btn.innerHTML : ''; if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spin"></span>Refreshing'; }
+      try {
+        lastStatusData = await json('/api/umans/status' + (force ? '?force=1' : ''));
+        if (!lastStatusData.ok) throw new Error(lastStatusData.error || 'status unavailable');
+        renderStatus(lastStatusData);
+      } catch (err) {
+        const e = $('healthError'); if (e) { e.style.display = ''; e.textContent = err.message; }
+        const hero = $('healthOverall'); if (hero) hero.innerHTML = '';
+        const mg = $('healthModels'); if (mg) mg.innerHTML = '';
+        const foot = $('healthFooter'); if (foot) foot.innerHTML = '';
+      } finally { if (btn) { btn.disabled = false; btn.innerHTML = old; } }
     }
 
     // ---- wiring ------------------------------------------------------------
@@ -1288,6 +1426,7 @@
     $('modelsFilter').addEventListener('input', () => { if (lastModelsData) renderModels(lastModelsData); });
     $('usageBtn').onclick = () => refreshUsage(true);
     $('testBtn').onclick = testChat;
+    $('statusBtn').onclick = () => checkStatus(true);
 
     // ---- SSE: live updates from the proxy ---------------------------------
     let sse = null;

@@ -538,7 +538,7 @@
           <li><code>GET /v1/models</code></li>
           <li><code>POST /v1/chat/completions</code> <span class="muted" style="font-size:11px">OpenAI shape</span></li>
           <li><code>POST /v1/messages</code> <span class="muted" style="font-size:11px">Anthropic shape</span></li>
-          <li><code>GET /api/events</code> <span class="muted" style="font-size:11px">SSE stream</span></li>
+          <li><code>GET /ws</code> <span class="muted" style="font-size:11px">WebSocket</span></li>
           <li><code>GET /api/system/info</code> <span class="muted" style="font-size:11px">pid, uptime</span></li>
           <li><code>POST /api/reload</code> · <code>POST /api/restart</code> · <code>POST /api/clear-state</code> · <code>POST /api/shutdown</code></li>
         </ul>
@@ -599,7 +599,7 @@
         <pre id="adminOut"></pre>
       </section>
     </div>
-    <p class="footer-note">UMANS Proxy · live updates via SSE; reconnects after 5s on drop.</p>
+    <p class="footer-note">UMANS Proxy · live updates via WebSocket; auto-reconnects on drop.</p>
   </main>
 
   <script>
@@ -1231,7 +1231,7 @@
       el.innerHTML = cards;
     }
 
-    // Local timer: between SSE updates, re-render with a smooth TPS decay.
+    // Local timer: between WS updates, re-render with a smooth TPS decay.
     // The server pushes ~1/sec; this keeps the numbers feeling live at 2fps.
     function scheduleSessionsTimer() {
       const hasActive = lastSessionsData?.sessions?.some((s) => s.active);
@@ -1522,7 +1522,7 @@
     }
     function adminDie(msg) {
       setStatus('bad', msg);
-      if (sse) { try { sse.close(); } catch {} sse = null; }
+      if (ws) { try { ws.close(); } catch {} ws = null; }
       ['restartBtn', 'adminReloadBtn', 'shutdownBtn', 'clearStateBtn', 'adminRefreshBtn'].forEach((id) => { $(id).disabled = true; });
       toast('bad', 'Proxy stopped', msg);
     }

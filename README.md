@@ -45,7 +45,7 @@ Use the launcher, dashboard, or create `.config/config.json`:
 }
 ```
 
-`.config/` is gitignored and never committed — it holds your live API key. `UMANS_API_KEY` overrides `API_KEY`. `API_KEYS` or comma-separated env `API_KEYS` protects `/api/config`, `/api/events`, `/api/umans/*`, and `/v1/*`. Proxy auth is **disabled by default** (empty `API_KEYS`): intended for a localhost single-user tool. Set `API_KEYS` before binding to a non-loopback address. When auth is disabled, `GET /api/debug/coalesce` exposes conversation-prefix hashes and short response-content previews — safe on loopback, but set `API_KEYS` before exposing the proxy on a network. `REQUEST_TIMEOUT` accepts `ms`, `s`, `m`, or `h` units. `OVERRIDE_CONCURRENCY=0` uses UMANS `/usage` limits; positive values cap the UMANS burst/soft limit.
+`.config/` is gitignored and never committed — it holds your live API key. `UMANS_API_KEY` overrides `API_KEY`. `API_KEYS` or comma-separated env `API_KEYS` protects `/api/config`, `/api/umans/*`, and `/v1/*`. Proxy auth is **disabled by default** (empty `API_KEYS`): intended for a localhost single-user tool. Set `API_KEYS` before binding to a non-loopback address. When auth is disabled, `GET /api/debug/coalesce` exposes conversation-prefix hashes and short response-content previews — protect it if you have untrusted local users.
 
 Launcher flags:
 
@@ -74,7 +74,7 @@ Before chat requests, the proxy reads the concurrency limit from UMANS `/usage` 
 
 `/usage` is cached for 10 seconds. If `/usage` is unavailable or no limit is known, the proxy proceeds without gating rather than blocking chat. The proxy refreshes its cache when any proxied chat request starts and ends.
 
-The dashboard connects to `/api/events` (Server-Sent Events) for live updates — the proxy pushes fresh usage data whenever it fetches `/usage` (on session start/end, manual refresh, config changes). If the SSE stream drops, the dashboard reconnects after 5s (no separate polling loop). The dashboard also force-refreshes before and after a smoke test, and exposes local `active`/`queued` counts. A manual **Refresh now** button force-bypasses the cache.
+The dashboard connects to `/ws` (WebSocket) for live updates — the proxy pushes fresh usage data whenever it fetches `/usage` (on session start/end, manual refresh, config changes). If the WebSocket drops, the dashboard auto-reconnects with exponential backoff (no separate polling loop). The dashboard also force-refreshes before and after a smoke test, and exposes local `active`/`queued` counts. A manual **Refresh now** button force-bypasses the cache.
 
 ## Sessions and live TPS
 
@@ -92,7 +92,7 @@ The dashboard **Sessions** tab shows per-session cards with:
 - Token breakdown: input cached, input uncached, output, cache hit rate
 - Elapsed time, bytes forwarded, session id
 
-Sessions are pushed via the `/api/events` SSE stream (event: `sessions`) at most once per second while sessions are active. Completed sessions remain visible for 5 seconds before being dropped. A local timer in the dashboard updates elapsed times at 2fps between SSE pushes.
+Sessions are pushed via the WebSocket (message type: `sessions`) at most once per second while sessions are active. Completed sessions remain visible for 5 seconds before being dropped. A local timer in the dashboard updates elapsed times at 2fps between WebSocket pushes.
 
 ## Service health
 
@@ -100,7 +100,7 @@ Sessions are pushed via the `/api/events` SSE stream (event: `sessions`) at most
 
 ## Hot reload
 
-`POST /api/reload` re-requires all `lib/*.js` modules from disk without restarting the process — including `lib/server.js` itself. `proxy.js` is a ~10-line immutable bootstrap that never changes. The listening socket, SSE connections, and in-flight requests survive — in-flight requests continue with the old code (closure capture), new requests get the fresh code. `lib/state.js` is never purged, so live sessions, caches, and telemetry persist across reloads. If the new code throws on require, the old handler is kept — the proxy stays functional. The dashboard **Admin** tab has a "Reload code" button; `GET /api/system/info` shows `reloadCount` and `lastReloadAt`.
+`POST /api/reload` re-requires all `lib/*.js` modules from disk without restarting the process — including `lib/server.js` itself. `proxy.js` is a ~10-line immutable bootstrap that never changes. The listening socket, WebSocket connections, and in-flight requests survive — in-flight requests continue with the old code (closure capture), new requests get the fresh code. `lib/state.js` is never purged, so live sessions, caches, and telemetry persist across reloads. If the new code throws on require, the old handler is kept — the proxy stays functional. The dashboard **Admin** tab has a "Reload code" button; `GET /api/system/info` shows `reloadCount` and `lastReloadAt`.
 
 ## API
 
@@ -109,7 +109,7 @@ Sessions are pushed via the `/api/events` SSE stream (event: `sessions`) at most
 - `GET /api/umans/concurrency`
 - `GET /api/umans/sessions` (live TPS + per-session tracking)
 - `GET /api/umans/status` (UMANS service health: status band, uptime, TTFT/decode p50)
-- `GET /v1/models/info` (upstream per-model capabilities)
+- `GET /ws` (WebSocket: live usage, sessions, and session events)
 - `GET /v1/models/:id`
 - `POST /v1/chat/completions` (OpenAI shape; snaps `reasoning_effort` to supported levels)
 - `POST /v1/messages` (Anthropic shape; `x-api-key` + `anthropic-version`)

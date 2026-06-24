@@ -3,10 +3,12 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 
-const { fnv1a } = require('../lib/hash');
+const { fnv1a, fnv1a32, fnv1aMixNum } = require('../lib/hash');
 const { parseDuration, parseListenAddr, cleanKeys, fileProxyApiKeys } = require('../lib/config');
 const { snapReasoningLevel, enrichModelsWithReasoning, REASONING_RANK } = require('../lib/reasoning');
 const { firstNumber, concurrencyHardLimit, percentValue, burstQuota, concurrencyQuotaLimit, applyOverride } = require('../lib/concurrency');
+const { canonicalMessage, messageHash, chainHash } = require('../lib/coalesce');
+const { authorized } = require('../lib/auth');
 
 // ---- hash ----
 
@@ -24,6 +26,114 @@ test('fnv1a differs on different input', () => {
 
 test('fnv1a empty string returns FNV offset basis', () => {
   assert.strictEqual(fnv1a(''), '811c9dc5');
+});
+
+test('fnv1a32 matches fnv1a output for same input', () => {
+  assert.strictEqual(fnv1a32('hello').toString(16).padStart(8, '0'), fnv1a('hello'));
+});
+
+test('fnv1a32 returns uint32', () => {
+  const h = fnv1a32('test');
+  assert.ok(Number.isInteger(h) && h >= 0 && h <= 0xffffffff);
+});
+
+test('fnv1aMixNum is deterministic', () => {
+  const seed = fnv1a32('model');
+  const msgHash = fnv1a32('hello');
+  assert.strictEqual(fnv1aMixNum(seed, msgHash), fnv1aMixNum(seed, msgHash));
+});
+
+test('fnv1aMixNum differs on changed seed', () => {
+  const h1 = fnv1a32('msg');
+  assert.notStrictEqual(fnv1aMixNum(fnv1a32('a'), h1), fnv1aMixNum(fnv1a32('b'), h1));
+});
+
+test('fnv1aMixNum differs on changed hash', () => {
+  const seed = fnv1a32('model');
+  assert.notStrictEqual(fnv1aMixNum(seed, fnv1a32('a')), fnv1aMixNum(seed, fnv1a32('b')));
+});
+
+test('fnv1aMixNum returns uint32', () => {
+  const h = fnv1aMixNum(0, 0);
+  assert.ok(Number.isInteger(h) && h >= 0 && h <= 0xffffffff);
+});
+
+// ---- coalesce: numeric chain hashing (L4) ----
+
+test('chainHash is deterministic', () => {
+  const msgs = [{ role: 'user', content: 'hello' }];
+  assert.strictEqual(chainHash('m', msgs), chainHash('m', msgs));
+});
+
+test('chainHash differs on changed model', () => {
+  const msgs = [{ role: 'user', content: 'hi' }];
+  assert.notStrictEqual(chainHash('m1', msgs), chainHash('m2', msgs));
+});
+
+test('chainHash differs on changed message', () => {
+  const m1 = [{ role: 'user', content: 'hello' }];
+  const m2 = [{ role: 'user', content: 'world' }];
+  assert.notStrictEqual(chainHash('m', m1), chainHash('m', m2));
+});
+
+test('chainHash extends via fromChain', () => {
+  const prefix = [{ role: 'user', content: 'q1' }];
+  const full = [...prefix, { role: 'assistant', content: 'a1' }, { role: 'user', content: 'q2' }];
+  const prefixChain = chainHash('m', prefix);
+  const fromChain = chainHash('m', full.slice(prefix.length), prefixChain);
+  const direct = chainHash('m', full);
+  assert.strictEqual(fromChain, direct);
+});
+
+test('chainHash prefix differs from full', () => {
+  const prefix = [{ role: 'user', content: 'q1' }];
+  const full = [...prefix, { role: 'assistant', content: 'a1' }];
+  assert.notStrictEqual(chainHash('m', prefix), chainHash('m', full));
+});
+
+test('messageHash returns uint32', () => {
+  const h = messageHash({ role: 'user', content: 'x' });
+  assert.ok(Number.isInteger(h) && h >= 0 && h <= 0xffffffff);
+});
+
+test('canonicalMessage normalizes null content to empty', () => {
+  assert.deepStrictEqual(canonicalMessage({ role: 'user', content: null }), { role: 'user', content: '' });
+});
+
+// ---- auth: constant-time comparison (L3) ----
+
+test('authorized returns true when no proxy keys configured', () => {
+  const orig = require('../lib/state').config;
+  require('../lib/state').config = { ...orig, proxyApiKeys: [] };
+  try { assert.strictEqual(authorized({}, new URL('http://localhost/')), true); }
+  finally { require('../lib/state').config = orig; }
+});
+
+test('authorized matches valid key', () => {
+  const orig = require('../lib/state').config;
+  require('../lib/state').config = { ...orig, proxyApiKeys: ['secret-key'] };
+  try {
+    const req = { headers: { 'x-api-key': 'secret-key' } };
+    assert.strictEqual(authorized(req, new URL('http://localhost/')), true);
+  } finally { require('../lib/state').config = orig; }
+});
+
+test('authorized rejects invalid key', () => {
+  const orig = require('../lib/state').config;
+  require('../lib/state').config = { ...orig, proxyApiKeys: ['secret-key'] };
+  try {
+    const req = { headers: { 'x-api-key': 'wrong' } };
+    assert.strictEqual(authorized(req, new URL('http://localhost/')), false);
+  } finally { require('../lib/state').config = orig; }
+});
+
+test('authorized accepts bearer token', () => {
+  const orig = require('../lib/state').config;
+  require('../lib/state').config = { ...orig, proxyApiKeys: ['secret-key'] };
+  try {
+    const req = { headers: { authorization: 'Bearer secret-key' } };
+    assert.strictEqual(authorized(req, new URL('http://localhost/')), true);
+  } finally { require('../lib/state').config = orig; }
 });
 
 // ---- config: parseDuration ----

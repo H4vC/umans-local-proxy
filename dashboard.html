@@ -261,13 +261,28 @@
     .v.muted-2 { color: var(--muted-2); font-weight: 400; }
 
 
-    .modelgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 10px; margin-top: 14px; }
+    .modelgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 10px; margin-top: 14px; }
     .modelcard { background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 12px 14px; transition: border-color .15s; }
     .modelcard:hover { border-color: var(--line-2); }
     .modelcard.dim { opacity: .55; }
     .modelcard-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 6px; }
     .modelname { font-weight: 650; font-size: 13px; word-break: break-all; }
-    .modelcard-meta { display: flex; gap: 10px; flex-wrap: wrap; font-size: 11.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
+    .modelcard-desc { font-size: 11.5px; color: var(--muted); margin-bottom: 8px; line-height: 1.45; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+    .modelcard-meta { display: flex; gap: 6px; flex-wrap: wrap; font-size: 11.5px; color: var(--muted); font-variant-numeric: tabular-nums; margin-bottom: 8px; }
+    .modelcard-badges { display: flex; gap: 4px; flex-wrap: wrap; }
+    .modelcard-badges .chip { font-size: 10px; padding: 1px 6px; border-radius: 3px; }
+    .modelcard-reasoning { font-size: 11px; color: var(--muted); margin-top: 6px; }
+    .modelcard-reasoning .lvl { display: inline-block; padding: 1px 5px; border-radius: 3px; font-size: 10px; margin-right: 2px; background: var(--surface-3); }
+    .modelcard-reasoning .lvl.active { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+    .modelcard-deprecated { border-color: var(--warn); }
+    .modelcard-deprecated .modelcard-head { opacity: .7; }
+
+    .model-legend { display: flex; flex-wrap: wrap; gap: 10px 16px; font-size: 11px; color: var(--muted); margin-bottom: 14px; align-items: center; }
+    .ml-item { display: inline-flex; align-items: center; gap: 5px; }
+    .ml-item .chip { font-size: 10px; padding: 1px 6px; border-radius: 3px; }
+    .ml-item .lvl { display: inline-block; padding: 1px 5px; border-radius: 3px; font-size: 10px; background: var(--surface-3); }
+    .ml-item .lvl.active { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+    .ml-swatch { display: inline-block; width: 14px; height: 14px; border-radius: var(--radius-sm); border: 1px solid var(--line); background: var(--surface-2); }
 
     /* ---- service health ---- */
     .health-hero { display: grid; grid-template-columns: minmax(180px, auto) repeat(3, minmax(0, 1fr)); gap: 12px; align-items: stretch; }
@@ -497,7 +512,7 @@
           <li><code>POST /v1/messages</code> <span class="muted" style="font-size:11px">Anthropic shape</span></li>
           <li><code>GET /api/events</code> <span class="muted" style="font-size:11px">SSE stream</span></li>
           <li><code>GET /api/system/info</code> <span class="muted" style="font-size:11px">pid, uptime</span></li>
-          <li><code>POST /api/restart</code> · <code>POST /api/clear-state</code> · <code>POST /api/shutdown</code></li>
+          <li><code>POST /api/reload</code> · <code>POST /api/restart</code> · <code>POST /api/clear-state</code> · <code>POST /api/shutdown</code></li>
         </ul>
       </section>
     </div>
@@ -507,8 +522,17 @@
     <div id="panel-models" class="tabpanel" role="tabpanel" aria-labelledby="tab-models">
       <section class="full">
         <h2>Models <button class="btn tonal btn-sm" id="modelsBtn">Refresh</button></h2>
-        <p class="sub" style="margin:0 0 12px;color:var(--muted);font-size:13px;">Models exposed at <code>/v1/models</code>. Filter by id, and dimmed cards are hidden by your enabled-models list in Config.</p>
-        <input id="modelsFilter" class="grow" placeholder="Filter models…" style="margin-bottom:14px;">
+        <p class="sub" style="margin:0 0 12px;color:var(--muted);font-size:13px;">Models from <code>/v1/models</code> enriched with <code>/v1/models/info</code>. Cards show capabilities, reasoning levels, pricing, and deprecation status. Dimmed cards are hidden by your enabled-models list.</p>
+        <input id="modelsFilter" class="grow" placeholder="Filter models…" style="margin-bottom:10px;">
+        <div class="model-legend">
+          <span class="ml-item"><span class="chip ok">capability</span> supported</span>
+          <span class="ml-item"><span class="chip">toggleable</span> can disable</span>
+          <span class="ml-item"><span class="chip warn">vision*</span> via handoff</span>
+          <span class="ml-item"><span class="chip warn">deprecated</span> sunset pending</span>
+          <span class="ml-item"><span class="lvl active">level</span> default reasoning</span>
+          <span class="ml-item"><span class="lvl">level</span> available level</span>
+          <span class="ml-item" style="border-color:var(--warn);"><span class="ml-swatch" style="border-color:var(--warn);"></span> deprecated card</span>
+        </div>
         <div id="modelsOut"></div>
       </section>
     </div>
@@ -532,10 +556,15 @@
             <tr><th>queued</th><td id="adminQueued" class="v">—</td></tr>
             <tr><th>tracked sessions</th><td id="adminSessions" class="v">—</td></tr>
           </tbody></table></div>
+          <div class="detail-block"><h3>Hot Reload</h3><table class="kv"><tbody>
+            <tr><th>reload count</th><td id="adminReloadCount" class="v">—</td></tr>
+            <tr><th>last reload</th><td id="adminLastReload" class="v">—</td></tr>
+          </tbody></table></div>
         </div>
         <div class="btn-row">
           <button class="btn tonal" id="adminRefreshBtn">Refresh info</button>
           <button class="btn" id="clearStateBtn">Clear state</button>
+          <button class="btn tonal" id="reloadBtn">Reload code</button>
           <button class="btn tonal" id="restartBtn">Restart proxy</button>
           <button class="btn danger" id="shutdownBtn">Shut down</button>
         </div>
@@ -795,21 +824,62 @@
       const models = Array.isArray(data?.data) ? data.data : [];
       if (!models.length) { el.innerHTML = '<div class="empty">No models returned.</div>'; return; }
       const q = ($('modelsFilter')?.value || '').trim().toLowerCase();
-      const filtered = q ? models.filter((m) => String(m.id ?? '').toLowerCase().includes(q) || String(m.owned_by ?? '').toLowerCase().includes(q)) : models;
+      const filtered = q ? models.filter((m) => {
+        const info = m._info || {};
+        const haystack = [m.id, m.owned_by, info.display_name, info.description, info.base_model?.provider, info.base_model?.name].filter(Boolean).join(' ').toLowerCase();
+        return haystack.includes(q);
+      }) : models;
       const enabled = new Set(($('models').value || '').split(/\r?\n/).map((s) => s.trim()).filter(Boolean));
       const head = q ? `<div class="sub" style="margin-bottom:10px;">${filtered.length} of ${models.length} matching “${esc(q)}”</div>` : `<div class="sub" style="margin-bottom:10px;">${models.length} model${models.length === 1 ? '' : 's'} available</div>`;
       if (!filtered.length) { el.innerHTML = `${head}<div class="empty">No models match “${esc(q)}”.</div>`; return; }
       el.innerHTML = `${head}<div class="modelgrid">${filtered.map((m) => {
-        const ctx = m.context_length ? (m.context_length >= 1024 ? `${Math.round(m.context_length / 1024)}K` : m.context_length) : '—';
+        const info = m._info || {};
+        const caps = info.capabilities || {};
+        const dep = info.deprecation;
+        const ctx = m.context_length || caps.context_window ? ((m.context_length || caps.context_window) >= 1024 ? `${Math.round((m.context_length || caps.context_window) / 1024)}K` : (m.context_length || caps.context_window)) : '—';
+        const maxComp = caps.max_completion_tokens ? (caps.max_completion_tokens >= 1024 ? `${Math.round(caps.max_completion_tokens / 1024)}K` : caps.max_completion_tokens) : null;
+        const recMax = caps.recommended_max_tokens ? (caps.recommended_max_tokens >= 1024 ? `${Math.round(caps.recommended_max_tokens / 1024)}K` : caps.recommended_max_tokens) : null;
         const p = m.pricing || {};
         const in$ = p.input != null ? `$${Number(p.input).toFixed(2)}` : null;
         const out$ = p.output != null ? `$${Number(p.output).toFixed(2)}` : null;
         const on = enabled.size === 0 || enabled.has(m.id);
-        return `<div class="modelcard${on ? '' : ' dim'}">
-          <div class="modelcard-head"><span class="modelname">${esc(m.id)}</span>${enabled.size ? `<span class="chip ${on ? 'ok' : ''}">${on ? 'enabled' : 'hidden'}</span>` : ''}</div>
-          <div class="modelcard-meta">
-            <span>${ctx} ctx</span>${in$ ? `<span>in ${in$}</span>` : ''}${out$ ? `<span>out ${out$}</span>` : ''}<span>${esc(m.owned_by ?? '—')}</span>
-          </div>
+        const r = m.reasoning || caps.reasoning || {};
+        const base = info.base_model || {};
+        const display = info.display_name || m.id;
+
+        // Capability badges
+        const badges = [];
+        if (r.supported) badges.push(`<span class="chip ok">reasoning</span>`);
+        if (r.supported && r.can_disable) badges.push(`<span class="chip">toggleable</span>`);
+        if (caps.supports_vision === true) badges.push(`<span class="chip ok">vision</span>`);
+        else if (caps.supports_vision === 'via-handoff') badges.push(`<span class="chip warn">vision*</span>`);
+        if (caps.supports_tools) badges.push(`<span class="chip ok">tools</span>`);
+        if (dep) badges.push(`<span class="chip warn">deprecated</span>`);
+
+        // Reasoning levels
+        let levelsHtml = '';
+        if (r.supported && Array.isArray(r.levels) && r.levels.length) {
+          levelsHtml = `<div class="modelcard-reasoning"><span>levels:</span> ${r.levels.map((l) => `<span class="lvl${l === r.default_level ? ' active' : ''}">${esc(l)}</span>`).join('')}${r.default_level ? ` <span style="opacity:.7;">default: ${esc(r.default_level)}</span>` : ''}</div>`;
+        } else if (r.supported) {
+          levelsHtml = `<div class="modelcard-reasoning"><span>reasoning: always on${r.can_disable ? ' (toggleable)' : ''}</span></div>`;
+        }
+
+        // Meta row: context, max output, pricing, provider
+        const metaParts = [`<span>${ctx} ctx</span>`];
+        if (maxComp) metaParts.push(`<span>out ${maxComp}</span>`);
+        if (recMax) metaParts.push(`<span>rec ${recMax}</span>`);
+        if (in$) metaParts.push(`<span>in ${in$}</span>`);
+        if (out$) metaParts.push(`<span>out ${out$}/M</span>`);
+        if (base.provider) metaParts.push(`<span>${esc(base.provider)}</span>`);
+        else if (m.owned_by) metaParts.push(`<span>${esc(m.owned_by)}</span>`);
+
+        return `<div class="modelcard${on ? '' : ' dim'}${dep ? ' modelcard-deprecated' : ''}">
+          <div class="modelcard-head"><span class="modelname">${esc(display)}</span>${enabled.size ? `<span class="chip ${on ? 'ok' : ''}">${on ? 'enabled' : 'hidden'}</span>` : ''}</div>
+          ${info.description ? `<div class="modelcard-desc">${esc(info.description)}</div>` : ''}
+          <div class="modelcard-badges">${badges.join('')}</div>
+          <div class="modelcard-meta">${metaParts.join('')}</div>
+          ${levelsHtml}
+          ${dep ? `<div class="modelcard-reasoning" style="color:var(--warn);">sunset ${dep.sunset_date || '?'} → ${esc(dep.replacement || '?')}</div>` : ''}
         </div>`;
       }).join('')}</div>`;
     }
@@ -1236,6 +1306,15 @@
       $('modelsBtn').disabled = true;
       try {
         lastModelsData = await json('/v1/models');
+        // Also fetch rich model info (capabilities, description, base model).
+        try {
+          const info = await json('/v1/models/info');
+          const map = new Map(Object.entries(info || {}));
+          lastModelsData.data = (lastModelsData.data || []).map((m) => {
+            const i = map.get(m.id);
+            return i ? { ...m, _info: i } : m;
+          });
+        } catch { /* models/info unavailable — render without it */ }
         renderModels(lastModelsData);
       }
       catch (err) { show('modelsOut', err.message); }
@@ -1369,6 +1448,8 @@
         $('adminActive').textContent = fmt(info.activeRequests);
         $('adminQueued').textContent = fmt(info.queuedRequests);
         $('adminSessions').textContent = fmt(info.sessionsTracked);
+        $('adminReloadCount').textContent = info.reloadCount || 0;
+        $('adminLastReload').textContent = info.lastReloadAt ? new Date(info.lastReloadAt).toLocaleString() : 'never';
         $('adminOut').textContent = '';
       } catch (err) {
         $('adminOut').textContent = err.message;
@@ -1381,9 +1462,18 @@
     function adminDie(msg) {
       setStatus('bad', msg);
       if (sse) { try { sse.close(); } catch {} sse = null; }
-      ['restartBtn', 'shutdownBtn', 'clearStateBtn', 'adminRefreshBtn'].forEach((id) => { $(id).disabled = true; });
+      ['restartBtn', 'reloadBtn', 'shutdownBtn', 'clearStateBtn', 'adminRefreshBtn'].forEach((id) => { $(id).disabled = true; });
     }
     $('adminRefreshBtn').onclick = refreshAdmin;
+    $('reloadBtn').onclick = async () => {
+      const done = adminBusy('reloadBtn', 'Reloading');
+      try {
+        const result = await json('/api/reload', { method: 'POST' });
+        $('adminOut').textContent = result.message || 'Reloaded.';
+        await refreshAdmin();
+      } catch (err) { $('adminOut').textContent = err.message; }
+      finally { done(); }
+    };
     $('clearStateBtn').onclick = async () => {
       if (!confirm('Clear all live session tracking and in-memory caches? Config is unaffected.')) return;
       const done = adminBusy('clearStateBtn', 'Clearing');

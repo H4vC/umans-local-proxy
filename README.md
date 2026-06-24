@@ -98,6 +98,10 @@ Sessions are pushed via the `/api/events` SSE stream (event: `sessions`) at most
 
 `GET /api/umans/status` proxies the upstream UMANS `/v1/status` endpoint and projects a public-safe subset: the overall status band, 24h uptime %, time-to-first-token p50 (ms), and decode tokens-per-second p50 — both overall and per served model. The response is cached for 15 seconds; `?force=1` bypasses the cache. If the upstream fetch fails but a cached copy exists, the cached copy is served with `stale: true`. The dashboard **Service Health** tab renders this as an overall status panel plus per-model cards.
 
+## Hot reload
+
+`POST /api/reload` re-requires all `lib/*.js` modules from disk without restarting the process — including `lib/server.js` itself. `proxy.js` is a ~10-line immutable bootstrap that never changes. The listening socket, SSE connections, and in-flight requests survive — in-flight requests continue with the old code (closure capture), new requests get the fresh code. `lib/state.js` is never purged, so live sessions, caches, and telemetry persist across reloads. If the new code throws on require, the old handler is kept — the proxy stays functional. The dashboard **Admin** tab has a "Reload code" button; `GET /api/system/info` shows `reloadCount` and `lastReloadAt`.
+
 ## API
 
 - `GET /health`
@@ -111,6 +115,8 @@ Sessions are pushed via the `/api/events` SSE stream (event: `sessions`) at most
 - `POST /v1/messages` (Anthropic shape; `x-api-key` + `anthropic-version`)
 - `GET /api/config`
 - `POST /api/config`
+- `POST /api/reload` (hot reload: re-require lib modules without restarting)
+- `POST /api/restart` · `POST /api/clear-state` · `POST /api/shutdown`
 
 No dependencies; run with Node.js 18+.
 

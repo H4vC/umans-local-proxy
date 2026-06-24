@@ -10,17 +10,14 @@
   },
   "files": [
     "proxy.js",
-    "launcher.js",
-    "dashboard.html",
-    "start.cmd",
-    "start.sh",
-    "README.md",
-    "LICENSE"
+    "lib/",
+    "launcher.js"
   ],
   "scripts": {
     "start": "node launcher.js --start",
     "proxy": "node proxy.js",
-    "configure": "node launcher.js --no-start"
+    "configure": "node launcher.js --no-start",
+    "test": "node --test test/*.test.js"
   },
   "keywords": [
     "openai",

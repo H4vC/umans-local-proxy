@@ -9,6 +9,9 @@ const { snapReasoningLevel, enrichModelsWithReasoning, REASONING_RANK } = requir
 const { firstNumber, concurrencyHardLimit, percentValue, burstQuota, concurrencyQuotaLimit, applyOverride } = require('../lib/concurrency');
 const { canonicalMessage, messageHash, chainHash } = require('../lib/coalesce');
 const { authorized } = require('../lib/auth');
+const state = require('../lib/state');
+const { readBody } = require('../lib/http');
+const { PassThrough } = require('node:stream');
 
 // ---- hash ----
 
@@ -94,6 +97,31 @@ test('chainHash prefix differs from full', () => {
 test('messageHash returns uint32', () => {
   const h = messageHash({ role: 'user', content: 'x' });
   assert.ok(Number.isInteger(h) && h >= 0 && h <= 0xffffffff);
+});
+test('messageHash skips cache for large serialized messages', () => {
+  const originalCache = state.messageHashCache;
+  state.messageHashCache = new Map();
+  try {
+    const h = messageHash({ role: 'user', content: 'x'.repeat(9000) });
+    assert.ok(Number.isInteger(h) && h >= 0 && h <= 0xffffffff);
+    assert.strictEqual(state.messageHashCache.size, 0);
+  } finally {
+    state.messageHashCache = originalCache;
+  }
+});
+
+test('readBody destroys oversized uploads', async () => {
+  const originalMax = state.MAX_BODY_SIZE;
+  state.MAX_BODY_SIZE = 4;
+  const req = new PassThrough();
+  try {
+    const body = readBody(req);
+    req.write(Buffer.alloc(5));
+    await assert.rejects(body, /request body too large/);
+    assert.strictEqual(req.destroyed, true);
+  } finally {
+    state.MAX_BODY_SIZE = originalMax;
+  }
 });
 
 test('canonicalMessage normalizes null content to empty', () => {

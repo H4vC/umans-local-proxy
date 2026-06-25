@@ -96,7 +96,7 @@ Sessions are pushed via the WebSocket (message type: `sessions`) at most once pe
 
 ## Service health
 
-`GET /api/umans/status` proxies the upstream UMANS `/v1/status` endpoint and projects a public-safe subset: the overall status band, 24h uptime %, time-to-first-token p50 (ms), and decode tokens-per-second p50 — both overall and per served model. The response is cached for 15 seconds; `?force=1` bypasses the cache. If the upstream fetch fails but a cached copy exists, the cached copy is served with `stale: true`. The dashboard **Service Health** tab renders this as an overall status panel plus per-model cards.
+`GET /api/umans/status` proxies the upstream UMANS `/v1/status` endpoint and projects a public-safe subset: the overall status band, 24h uptime %, time-to-first-token p50 (ms), and output tokens-per-second p50 — both overall and per served model. The response is cached for 15 seconds; `?force=1` bypasses the cache. If the upstream fetch fails but a cached copy exists, the cached copy is served with `stale: true`. The dashboard **Service Health** tab renders this as an overall status panel plus per-model cards.
 
 ## Hot reload
 
@@ -108,7 +108,7 @@ Sessions are pushed via the WebSocket (message type: `sessions`) at most once pe
 - `GET /api/umans/usage`
 - `GET /api/umans/concurrency`
 - `GET /api/umans/sessions` (live TPS + per-session tracking)
-- `GET /api/umans/status` (UMANS service health: status band, uptime, TTFT/decode p50)
+- `GET /api/umans/status` (UMANS service health: status band, uptime, TTFT/output tok/s p50)
 - `GET /ws` (WebSocket: live usage, sessions, and session events)
 - `GET /v1/models/:id`
 - `POST /v1/chat/completions` (OpenAI shape; snaps `reasoning_effort` to supported levels)

@@ -1400,7 +1400,7 @@
       if (!Number.isFinite(n)) return '—';
       return n.toFixed(n >= 99.9 ? 2 : 1) + '%';
     }
-    function fmtTpsP50(n) { n = Number(n || 0); return Number.isFinite(n) ? (n >= 100 ? Math.round(n) : n.toFixed(1)) + ' tok/s' : '—'; }
+    function fmtTpsP50(n) { if (n == null) return '—'; const v = Number(n); if (!Number.isFinite(v)) return '—'; return (v >= 100 ? Math.round(v) : v.toFixed(1)) + ' tok/s'; }
     function renderStatus(data) {
       const err = $('healthError'); if (err) err.style.display = 'none';
       const overall = data?.overall || {};
@@ -1413,7 +1413,7 @@
           <span class="band-sub">${fmtUptimePct(overall.uptimePct)} uptime · 24h</span>
         </div>
         <div class="stat"><strong>${fmtMs(overall.ttftMsP50)}</strong><span>TTFT p50</span></div>
-        <div class="stat accent"><strong>${fmtTpsP50(overall.decodeTpsP50).replace(' tok/s','')}</strong><span>decode tok/s p50</span></div>
+        <div class="stat accent"><strong>${fmtTpsP50(overall.tpsP50)}</strong><span>tok/s p50</span></div>
         <div class="stat"><strong>${fmtUptimePct(overall.uptimePct)}</strong><span>uptime 24h</span></div>`;
       const models = data?.models || {};
       const ids = Object.keys(models).sort();
@@ -1429,7 +1429,7 @@
               <div class="healthcard-band ${mc}">${esc(m.status || 'unknown')}</div>
               <div class="healthcard-meta">
                 <span class="k">TTFT p50</span><span class="v">${fmtMs(m.ttftMsP50)}</span>
-                <span class="k">decode p50</span><span class="v">${fmtTpsP50(m.decodeTpsP50).replace(' tok/s','')} tok/s</span>
+                <span class="k">tok/s p50</span><span class="v">${fmtTpsP50(m.tpsP50)}</span>
                 <span class="k">uptime</span><span class="v">${fmtUptimePct(m.uptimePct)}</span>
               </div>
             </div>`;

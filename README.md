@@ -68,6 +68,9 @@ Both API shapes are always live as passthrough routes — point your client at w
 - **Anthropic**: `POST /v1/messages` with `x-api-key: <key>` and `anthropic-version: 2023-06-01`. The `thinking` object is forwarded verbatim (UMANS normalizes it server-side).
 
 Throttling, session tracking, and live tok/s telemetry apply to both shapes. Claude Code (`ANTHROPIC_BASE_URL=http://127.0.0.1:8084`) and OpenAI-compatible clients (omp, Cursor, OpenCode) can both use the same proxy simultaneously.
+
+`GET /v1/models` advertises `supported_endpoint_types: ["openai"]` on every model so OMP `discovery.type: proxy` pins `api: openai-completions` — the path where UMANS emits a clean `reasoning_content` field for reasoning models (the Anthropic path surfaces thinking markers in content). `/v1/messages` stays available as a passthrough for direct Anthropic clients; the advertisement only steers discovery.
+
 ## Throttling and usage
 
 Before chat requests, the proxy reads the concurrency limit from UMANS `/usage` (`limits.concurrency.limit`) and queues requests when in-flight requests reach that limit. The effective in-flight count is the maximum of locally-tracked requests and the upstream-reported `concurrent_sessions` count, so other clients on the same key are counted toward the limit. Queued requests re-read the effective limit each iteration, so config changes or usage refreshes are honored without restarting. `OVERRIDE_CONCURRENCY` caps below the upstream limit.

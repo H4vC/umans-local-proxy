@@ -301,6 +301,25 @@ test('snapReasoningLevel with no levels list: drop none when can_disable false',
   assert.strictEqual(snapReasoningLevel('m1', 'off'), null);
 });
 
+test('snapReasoningLevel maps xhigh to highest declared level when its name is unknown', () => {
+  // 'ultra' is not in REASONING_RANK; it must still receive a max intent
+  // because it is the highest declared level (last by position).
+  setModelInfo({ 'm1': { capabilities: { reasoning: { supported: true, levels: ['none', 'high', 'ultra'], can_disable: true } } } });
+  assert.strictEqual(snapReasoningLevel('m1', 'xhigh'), 'ultra');
+  assert.strictEqual(snapReasoningLevel('m1', 'max'), 'ultra');
+});
+
+test('snapReasoningLevel snaps to an interpolated unknown intermediate level', () => {
+  // 'turbo' sits between 'low' and 'high'; a 'medium' request snaps up to it.
+  setModelInfo({ 'm1': { capabilities: { reasoning: { supported: true, levels: ['low', 'turbo', 'high'], can_disable: true } } } });
+  assert.strictEqual(snapReasoningLevel('m1', 'medium'), 'turbo');
+});
+
+test('snapReasoningLevel maps max to the only declared level when it is unknown', () => {
+  setModelInfo({ 'm1': { capabilities: { reasoning: { supported: true, levels: ['low', 'ultra'], can_disable: true } } } });
+  assert.strictEqual(snapReasoningLevel('m1', 'xhigh'), 'ultra');
+});
+
 // ---- reasoning: enrichModelsWithReasoning ----
 
 test('enrichModelsWithReasoning adds reasoning when supported', () => {
@@ -308,12 +327,14 @@ test('enrichModelsWithReasoning adds reasoning when supported', () => {
   const result = enrichModelsWithReasoning([{ id: 'm1', object: 'model' }]);
   assert.strictEqual(result[0].reasoning.supported, true);
   assert.deepStrictEqual(result[0].reasoning.levels, ['low', 'high']);
+  assert.deepStrictEqual(result[0].supported_endpoint_types, ['openai']);
 });
 
-test('enrichModelsWithReasoning leaves model untouched when not supported', () => {
+test('enrichModelsWithReasoning advertises openai endpoint even when reasoning unsupported', () => {
   setModelInfo({ 'm1': { capabilities: { reasoning: { supported: false } } } });
   const result = enrichModelsWithReasoning([{ id: 'm1', object: 'model' }]);
   assert.strictEqual(result[0].reasoning, undefined);
+  assert.deepStrictEqual(result[0].supported_endpoint_types, ['openai']);
 });
 
 // ---- concurrency: firstNumber ----

@@ -392,16 +392,20 @@ test('percentValue skips null and returns next valid', () => {
 
 // ---- concurrency: burstQuota ----
 
-test('burstQuota returns 0 when no fields present', () => {
-  assert.strictEqual(burstQuota({}), 0);
+test('burstQuota returns 1 (full) when no remaining field', () => {
+  assert.strictEqual(burstQuota({}), 1);
 });
 
 test('burstQuota reads burst_remaining_pct', () => {
   assert.strictEqual(burstQuota({ burst_remaining_pct: 0.7 }), 0.7);
 });
 
-test('burstQuota reads burst_percent (normalized)', () => {
-  assert.strictEqual(burstQuota({ burst_percent: 80 }), 0.8);
+test('burstQuota ignores burst_pct (hard-limit field, not quota)', () => {
+  assert.strictEqual(burstQuota({ burst_pct: 0.5 }), 1);
+});
+
+test('burstQuota ignores burst_percent (hard-limit field, not quota)', () => {
+  assert.strictEqual(burstQuota({ burst_percent: 80 }), 1);
 });
 
 // ---- concurrency: concurrencyQuotaLimit ----
@@ -421,6 +425,11 @@ test('concurrencyQuotaLimit returns hard when hard <= soft', () => {
 test('concurrencyQuotaLimit interpolates with burst quota', () => {
   // soft=10, hard=20, burst_quota=0.5 → 10 + floor(10*0.5) = 15
   assert.strictEqual(concurrencyQuotaLimit({ limit: 10, hard_cap: 20, burst_remaining_pct: 0.5 }), 15);
+});
+
+test('concurrencyQuotaLimit uses hard limit via burst_pct when no live quota', () => {
+  // soft=10, burst_pct=0.5 → hard=15; no live remaining field → full burst → 15
+  assert.strictEqual(concurrencyQuotaLimit({ limit: 10, burst_pct: 0.5 }), 15);
 });
 
 // ---- concurrency: applyOverride ----

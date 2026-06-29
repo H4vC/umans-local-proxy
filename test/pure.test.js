@@ -4,14 +4,17 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 
 const { fnv1a, fnv1a32, fnv1aMixNum } = require('../lib/hash');
-const { parseDuration, parseListenAddr, cleanKeys, fileProxyApiKeys } = require('../lib/config');
+const { parseDuration, parseListenAddr, cleanKeys, fileProxyApiKeys, readConfigFile, isLoopbackHost } = require('../lib/config');
 const { snapReasoningLevel, enrichModelsWithReasoning, REASONING_RANK } = require('../lib/reasoning');
-const { firstNumber, concurrencyHardLimit, percentValue, burstQuota, concurrencyQuotaLimit, applyOverride, extractThrottle, getEffectiveConcurrency } = require('../lib/concurrency');
+const { firstNumber, concurrencyHardLimit, percentValue, burstQuota, concurrencyQuotaLimit, applyOverride, extractThrottle, getEffectiveConcurrency, acquireThrottleSlot, releaseThrottleSlot } = require('../lib/concurrency');
 const { canonicalMessage, messageHash, chainHash } = require('../lib/coalesce');
-const { authorized } = require('../lib/auth');
+const { authorized, wsUpgradeAllowed, isLoopback } = require('../lib/auth');
 const state = require('../lib/state');
 const { readBody } = require('../lib/http');
 const { PassThrough } = require('node:stream');
+const fs = require('node:fs');
+const os = require('node:os');
+const nodePath = require('node:path');
 
 // ---- hash ----
 
@@ -530,4 +533,163 @@ test('getEffectiveConcurrency clamps active boxed cache to soft concurrency', ()
     require('../lib/state').concurrencyCache = origCache;
     require('../lib/state').burstDisabledUntil = origCooldown;
   }
+});
+
+test('extractThrottle clamps to soft while burst cooldown is active', () => {
+  const origConfig = require('../lib/state').config;
+  const origCooldown = require('../lib/state').burstDisabledUntil;
+  require('../lib/state').config = { ...origConfig, overrideConcurrency: 0 };
+  const until = Date.now() + 60000;
+  require('../lib/state').burstDisabledUntil = until;
+  try {
+    const throttle = extractThrottle({
+      limits: { concurrency: { limit: 4, hard_cap: 8, burst_pct: 1 } },
+      usage: { concurrent_sessions: 0 },
+    });
+    assert.strictEqual(throttle.limit, 4);
+    assert.strictEqual(throttle.softLimit, 4);
+    assert.strictEqual(throttle.quotaLimit, 8);
+    assert.strictEqual(throttle.burstCooldown, true);
+    assert.strictEqual(throttle.burstCooldownUntil, new Date(until).toISOString());
+  } finally {
+    require('../lib/state').config = origConfig;
+    require('../lib/state').burstDisabledUntil = origCooldown;
+  }
+});
+
+test('getEffectiveConcurrency clamps to soft while burst cooldown is active', () => {
+  const origConfig = require('../lib/state').config;
+  const origCache = require('../lib/state').concurrencyCache;
+  const origCooldown = require('../lib/state').burstDisabledUntil;
+  require('../lib/state').config = { ...origConfig, overrideConcurrency: 0 };
+  require('../lib/state').burstDisabledUntil = Date.now() + 60000;
+  try {
+    require('../lib/state').concurrencyCache = { concurrent: 1, limit: 8, softLimit: 4, boxedUntil: null, time: Date.now() };
+    const effective = getEffectiveConcurrency();
+    assert.strictEqual(effective.limit, 4);
+    assert.strictEqual(effective.softLimit, 4);
+    assert.strictEqual(effective.burstCooldown, true);
+    assert.ok(effective.burstCooldownUntil);
+  } finally {
+    require('../lib/state').config = origConfig;
+    require('../lib/state').concurrencyCache = origCache;
+    require('../lib/state').burstDisabledUntil = origCooldown;
+  }
+});
+
+test('acquireThrottleSlot releases a woken-then-aborted slot (no leak)', async () => {
+  const s = require('../lib/state');
+  const orig = {
+    config: s.config, concurrencyCache: s.concurrencyCache, usageCache: s.usageCache,
+    activeRequests: s.activeRequests, queuedRequests: s.queuedRequests,
+    throttleWaiters: s.throttleWaiters, burstDisabledUntil: s.burstDisabledUntil,
+    refreshUsageInFlight: s.refreshUsageInFlight, refreshUsageTimer: s.refreshUsageTimer,
+  };
+  s.config = { ...s.config, overrideConcurrency: 0, apiKey: '' };
+  s.concurrencyCache = { concurrent: 0, limit: 1, softLimit: 1, boxedUntil: null, time: Date.now() };
+  s.usageCache = { data: { ok: true }, time: Date.now() }; // refreshUsageSoon is a no-op (no network)
+  s.activeRequests = 1; // at the limit → next acquire queues
+  s.queuedRequests = 0;
+  s.throttleWaiters = [];
+  s.burstDisabledUntil = 0;
+  s.refreshUsageInFlight = false;
+  s.refreshUsageTimer = null;
+  try {
+    const controller = new AbortController();
+    // Queues (waiter pushed). releaseThrottleSlot wakes it (pre-increments
+    // activeRequests) and we abort before the await resumes — the exact
+    // woken-then-aborted race that used to leak a slot.
+    const p = acquireThrottleSlot({}, controller.signal);
+    releaseThrottleSlot();
+    controller.abort();
+    await assert.rejects(p, /aborted/);
+    assert.strictEqual(s.activeRequests, 0, 'woken-then-aborted slot must be released');
+  } finally {
+    s.config = orig.config; s.concurrencyCache = orig.concurrencyCache; s.usageCache = orig.usageCache;
+    s.activeRequests = orig.activeRequests; s.queuedRequests = orig.queuedRequests;
+    s.throttleWaiters = orig.throttleWaiters; s.burstDisabledUntil = orig.burstDisabledUntil;
+    s.refreshUsageInFlight = orig.refreshUsageInFlight; s.refreshUsageTimer = orig.refreshUsageTimer;
+  }
+});
+
+// ---- B6: authorized is header-only (no ?key= query param) ----
+
+test('authorized ignores ?key= query param — header only', () => {
+  const orig = state.config;
+  state.config = { ...orig, proxyApiKeys: ['secret-key'] };
+  try {
+    assert.strictEqual(authorized({ headers: {} }), false); // no header → rejected
+    assert.strictEqual(authorized({ headers: { 'x-api-key': 'secret-key' } }), true);
+  } finally { state.config = orig; }
+});
+
+// ---- B1: wsUpgradeAllowed (CSWSH defense) ----
+
+test('wsUpgradeAllowed accepts a same-origin browser (Origin authority === Host)', () => {
+  const orig = state.config;
+  state.config = { ...orig, proxyApiKeys: [] };
+  try {
+    const req = { headers: { origin: 'http://127.0.0.1:8084', host: '127.0.0.1:8084' }, socket: { remoteAddress: '127.0.0.1' } };
+    assert.strictEqual(wsUpgradeAllowed(req), true);
+  } finally { state.config = orig; }
+});
+
+test('wsUpgradeAllowed rejects a cross-origin browser (CSWSH)', () => {
+  const orig = state.config;
+  state.config = { ...orig, proxyApiKeys: [] };
+  try {
+    const req = { headers: { origin: 'https://evil.com', host: '127.0.0.1:8084' }, socket: { remoteAddress: '127.0.0.1' } };
+    assert.strictEqual(wsUpgradeAllowed(req), false);
+  } finally { state.config = orig; }
+});
+
+test('wsUpgradeAllowed trusts a no-Origin loopback client (local non-browser)', () => {
+  const orig = state.config;
+  state.config = { ...orig, proxyApiKeys: [] };
+  try {
+    const req = { headers: {}, socket: { remoteAddress: '127.0.0.1' } };
+    assert.strictEqual(wsUpgradeAllowed(req), true);
+  } finally { state.config = orig; }
+});
+
+test('wsUpgradeAllowed rejects a no-Origin non-loopback client without a key', () => {
+  const orig = state.config;
+  state.config = { ...orig, proxyApiKeys: ['secret-key'] };
+  try {
+    const req = { headers: {}, socket: { remoteAddress: '203.0.113.5' } };
+    assert.strictEqual(wsUpgradeAllowed(req), false);
+  } finally { state.config = orig; }
+});
+
+test('wsUpgradeAllowed accepts a no-Origin non-loopback client with a valid header key', () => {
+  const orig = state.config;
+  state.config = { ...orig, proxyApiKeys: ['secret-key'] };
+  try {
+    const req = { headers: { 'x-api-key': 'secret-key' }, socket: { remoteAddress: '203.0.113.5' } };
+    assert.strictEqual(wsUpgradeAllowed(req), true);
+  } finally { state.config = orig; }
+});
+
+// ---- B2: readConfigFile (strict at boot) ----
+
+test('readConfigFile returns {} for a missing file', () => {
+  assert.deepStrictEqual(readConfigFile(nodePath.join(os.tmpdir(), 'umans-missing-' + Date.now() + '.json')), {});
+});
+
+test('readConfigFile throws on a corrupt (unparseable) file', () => {
+  const file = nodePath.join(os.tmpdir(), 'umans-corrupt-' + Date.now() + '.json');
+  fs.writeFileSync(file, '{ not valid json');
+  try {
+    assert.throws(() => readConfigFile(file), /corrupt/);
+  } finally { try { fs.rmSync(file, { force: true }); } catch {} }
+});
+
+// ---- B3: isLoopbackHost (boot guard) ----
+
+test('isLoopbackHost identifies loopback listen hosts', () => {
+  assert.strictEqual(isLoopbackHost('127.0.0.1'), true);
+  assert.strictEqual(isLoopbackHost('::1'), true);
+  assert.strictEqual(isLoopbackHost('localhost'), true);
+  assert.strictEqual(isLoopbackHost('0.0.0.0'), false);
+  assert.strictEqual(isLoopbackHost('192.168.1.5'), false);
 });

@@ -20,6 +20,8 @@ const { pipeline } = require('node:stream/promises');
 const state = require('../lib/state');
 const { ChatTap, createTapStream } = require('../lib/chat-tap');
 const { proxyRequest } = require('../lib/chat');
+const fs = require('node:fs');
+const { BURST_COOLDOWN_FILE } = require('../lib/concurrency');
 
 // The tap worker thread keeps the process alive (unref isn't sufficient in
 // Node 23); terminate it after the suite so `node --test` can exit.
@@ -29,6 +31,11 @@ after(async () => {
   if (state.tapRestartTimer) { clearTimeout(state.tapRestartTimer); state.tapRestartTimer = null; }
   try { if (state.tapWorker) await state.tapWorker.terminate(); } catch {}
   state.tapWorker = null;
+  // The 429 test arms the burst cooldown via the real proxyRequest path, which
+  // persists a future epoch to .runtime/burst-cooldown.json. Without this
+  // cleanup the next real proxy boot re-arms backoff having never seen a 429.
+  state.burstDisabledUntil = 0;
+  try { fs.rmSync(BURST_COOLDOWN_FILE, { force: true }); } catch {}
 });
 
 // ---- helpers --------------------------------------------------------------
@@ -445,4 +452,59 @@ test('Anthropic streaming: counts text+thinking, decodes responseContent, exact 
   assert.strictEqual(session.outputTokens, 7);
   assert.strictEqual(session.promptTokens, 5);
   assert.strictEqual(session.cachedTokens, 2);
+});
+
+test('tap decodes multibyte UTF-8 split across fragments (no U+FFFD)', async () => {
+  state.modelCharRatio.clear();
+  // "héllo" — é is 0xC3 0xA9. Fragment the SSE so the two bytes land in
+  // separate fragments; a per-buffer decode would emit U+FFFD for each half.
+  const delta = 'data: {"choices":[{"index":0,"delta":{"content":"héllo"},"finish_reason":null}]}\n\n';
+  const buf = Buffer.from(delta, 'utf8');
+  const split = buf.indexOf(Buffer.from([0xC3])) + 1; // between 0xC3 and 0xA9
+  const fragments = [buf.subarray(0, split), buf.subarray(split)];
+  const session = makeSession();
+  const tap = new ChatTap(session, { stream: true, shape: 'openai' });
+  const { sink, done } = collect();
+  await pipeline(Readable.from(fragments), createTapStream(tap), sink);
+  await tap.onEnd();
+  assert.deepStrictEqual(done(), buf);
+  assert.strictEqual(session.responseContent, 'héllo');
+  assert.strictEqual(session.chars, 5);
+});
+
+test('tap carries split multibyte UTF-8 across batch flushes (streaming decoder)', async () => {
+  state.modelCharRatio.clear();
+  // Force the two bytes of é into separate worker batches via _flush; only a
+  // streaming TextDecoder (stream:true, carrying state across feed() calls)
+  // survives this — concat-before-decode alone would not.
+  const delta = 'data: {"choices":[{"index":0,"delta":{"content":"héllo"},"finish_reason":null}]}\n\n';
+  const buf = Buffer.from(delta, 'utf8');
+  const split = buf.indexOf(Buffer.from([0xC3])) + 1;
+  const a = buf.subarray(0, split);
+  const b = buf.subarray(split);
+  const session = makeSession();
+  const tap = new ChatTap(session, { stream: true, shape: 'openai' });
+  tap.onChunk(a); tap._flush();
+  tap.onChunk(b);
+  await tap.onEnd();
+  assert.strictEqual(session.responseContent, 'héllo');
+  assert.strictEqual(session.chars, 5);
+});
+
+test('OpenAI content delta whose JSON contains "usage" is still scanned', async () => {
+  state.modelCharRatio.clear();
+  // A content delta whose JSON literally contains "usage" (here as a value)
+  // must not be short-circuited by the usage fast-path — its content is scanned.
+  const sse = Buffer.from(
+    'data: {"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}],"meta":"usage"}\n\n' +
+    'data: [DONE]\n\n',
+    'utf8',
+  );
+  const session = makeSession();
+  const tap = new ChatTap(session, { stream: true, shape: 'openai' });
+  const { sink, done } = collect();
+  await pipeline(Readable.from([sse]), createTapStream(tap), sink);
+  await tap.onEnd();
+  assert.strictEqual(session.responseContent, 'hi'); // not dropped by the usage fast-path
+  assert.ok(session.chars >= 2);
 });

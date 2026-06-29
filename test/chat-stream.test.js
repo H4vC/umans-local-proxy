@@ -11,7 +11,7 @@
 //      disconnect aborts the upstream, and an upstream 500 surfaces as an SSE
 //      error event (headers already sent for streaming).
 
-const { test } = require('node:test');
+const { test, after } = require('node:test');
 const assert = require('node:assert/strict');
 const http = require('node:http');
 const { Readable, Writable } = require('node:stream');
@@ -20,6 +20,16 @@ const { pipeline } = require('node:stream/promises');
 const state = require('../lib/state');
 const { ChatTap, createTapStream } = require('../lib/chat-tap');
 const { proxyRequest } = require('../lib/chat');
+
+// The tap worker thread keeps the process alive (unref isn't sufficient in
+// Node 23); terminate it after the suite so `node --test` can exit.
+after(async () => {
+  // Prevent a pending restart timer from re-creating a worker after teardown.
+  state.tapWorkerDead = true;
+  if (state.tapRestartTimer) { clearTimeout(state.tapRestartTimer); state.tapRestartTimer = null; }
+  try { if (state.tapWorker) await state.tapWorker.terminate(); } catch {}
+  state.tapWorker = null;
+});
 
 // ---- helpers --------------------------------------------------------------
 
@@ -63,7 +73,7 @@ test('TapStream forwards bytes verbatim and counts tokens (prefilter skips role/
   const { sink, done } = collect();
 
   await pipeline(Readable.from([buf]), createTapStream(tap), sink);
-  tap.onEnd(); // flush deferred drain + finalize (mirrors proxyRequest finally)
+  await tap.onEnd(); // flush pending batches + worker round-trip finalize (mirrors proxyRequest finally)
 
   // Bytes pass through unchanged.
   assert.deepStrictEqual(done(), buf);
@@ -91,7 +101,7 @@ test('TapStream handles chunk boundaries that split an SSE line', async () => {
   const { sink, done } = collect();
 
   await pipeline(Readable.from(fragments), createTapStream(tap), sink);
-  tap.onEnd();
+  await tap.onEnd();
 
   assert.deepStrictEqual(done(), buf);
   assert.strictEqual(session.responseContent, 'Hello world');
@@ -146,6 +156,14 @@ function startUpstream(handler) {
   });
 }
 
+// Await full server close (drop keep-alive connections) so the process can exit.
+function closeServer(s) {
+  return new Promise((resolve) => {
+    if (typeof s.closeAllConnections === 'function') s.closeAllConnections();
+    s.close(() => resolve());
+  });
+}
+
 function bodyOf(req) {
   return JSON.stringify({ model: 'm', messages: [{ role: 'user', content: 'hi' }], stream: true, ...req });
 }
@@ -180,7 +198,7 @@ test('streaming: forwards bytes verbatim and counts tokens via the pipe', async 
   assert.strictEqual(session.status, 'done');
   assert.ok(session.finalTps > 0, 'finalTps computed from counted tokens');
 
-  proxy.close(); upstream.close();
+  await closeServer(proxy); await closeServer(upstream);
 });
 
 test('non-streaming: forwards body and counts exact tokens', async () => {
@@ -213,7 +231,7 @@ test('non-streaming: forwards body and counts exact tokens', async () => {
   assert.strictEqual(session.status, 'done');
   assert.ok(session.finalTps > 0, 'finalTps computed from counted tokens');
 
-  proxy.close(); upstream.close();
+  await closeServer(proxy); await closeServer(upstream);
 });
 
 test('client disconnect mid-stream aborts the upstream connection', async () => {
@@ -257,7 +275,7 @@ test('client disconnect mid-stream aborts the upstream connection', async () => 
   assert.ok(session);
   assert.strictEqual(session.status, 'aborted');
 
-  proxy.close(); upstream.close();
+  await closeServer(proxy); await closeServer(upstream);
 });
 
 test('upstream 500 on a streaming request surfaces as an SSE error event', async () => {
@@ -280,7 +298,7 @@ test('upstream 500 on a streaming request surfaces as an SSE error event', async
   assert.match(text, /data:\s*{"error":/);
   assert.match(text, /upstream 500/);
 
-  proxy.close(); upstream.close();
+  await closeServer(proxy); await closeServer(upstream);
 });
 
 // ---- scan correctness: escapes, surrogate emoji, deferred content decode ----
@@ -302,7 +320,7 @@ test('scan counts chars with escapes + emoji and decodes responseContent (deferr
   const { sink, done } = collect();
 
   await pipeline(Readable.from([buf]), createTapStream(tap), sink);
-  tap.onEnd();
+  await tap.onEnd();
 
   assert.deepStrictEqual(done(), buf); // bytes forwarded verbatim
   // Both content and reasoning contribute to the char estimate.
@@ -327,7 +345,7 @@ test('scan does not false-match a "content":" literal embedded in the content va
   const { sink, done } = collect();
 
   await pipeline(Readable.from([buf]), createTapStream(tap), sink);
-  tap.onEnd();
+  await tap.onEnd();
 
   assert.deepStrictEqual(done(), buf);
   assert.strictEqual(session.chars, content.length);
@@ -354,7 +372,7 @@ test('Anthropic streaming: counts text+thinking, decodes responseContent, exact 
   const { sink, done } = collect();
 
   await pipeline(Readable.from([buf]), createTapStream(tap), sink);
-  tap.onEnd();
+  await tap.onEnd();
 
   assert.deepStrictEqual(done(), buf);
   assert.strictEqual(session.chars, 'Hello world'.length + 'reasoning'.length);

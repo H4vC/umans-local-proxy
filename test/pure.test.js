@@ -6,7 +6,7 @@ const assert = require('node:assert/strict');
 const { fnv1a, fnv1a32, fnv1aMixNum } = require('../lib/hash');
 const { parseDuration, parseListenAddr, cleanKeys, fileProxyApiKeys } = require('../lib/config');
 const { snapReasoningLevel, enrichModelsWithReasoning, REASONING_RANK } = require('../lib/reasoning');
-const { firstNumber, concurrencyHardLimit, percentValue, burstQuota, concurrencyQuotaLimit, applyOverride } = require('../lib/concurrency');
+const { firstNumber, concurrencyHardLimit, percentValue, burstQuota, concurrencyQuotaLimit, applyOverride, extractThrottle, getEffectiveConcurrency } = require('../lib/concurrency');
 const { canonicalMessage, messageHash, chainHash } = require('../lib/coalesce');
 const { authorized } = require('../lib/auth');
 const state = require('../lib/state');
@@ -456,4 +456,44 @@ test('applyOverride override higher than apiLimit is not overridden', () => {
   const result = applyOverride(10, 5, 20);
   assert.strictEqual(result.limit, 10);
   assert.strictEqual(result.overridden, false);
+});
+
+test('extractThrottle clamps boxed accounts to soft concurrency', () => {
+  const orig = require('../lib/state').config;
+  require('../lib/state').config = { ...orig, overrideConcurrency: 0 };
+  try {
+    const boxedUntil = new Date(Date.now() + 60000).toISOString();
+    const throttle = extractThrottle({
+      limits: { concurrency: { limit: 4, hard_cap: 8, burst_pct: 1 } },
+      usage: { concurrent_sessions: 0, priority: { low: true, boxed_until: boxedUntil } },
+    });
+    assert.strictEqual(throttle.limit, 4);
+    assert.strictEqual(throttle.softLimit, 4);
+    assert.strictEqual(throttle.quotaLimit, 8);
+    assert.strictEqual(throttle.boxed, true);
+    assert.strictEqual(throttle.boxedUntil, boxedUntil);
+  } finally {
+    require('../lib/state').config = orig;
+  }
+});
+
+test('getEffectiveConcurrency clamps active boxed cache to soft concurrency', () => {
+  const origConfig = require('../lib/state').config;
+  const origCache = require('../lib/state').concurrencyCache;
+  const origCooldown = require('../lib/state').burstDisabledUntil;
+  require('../lib/state').config = { ...origConfig, overrideConcurrency: 0 };
+  require('../lib/state').burstDisabledUntil = 0;
+  try {
+    const boxedMs = Date.now() + 60000;
+    require('../lib/state').concurrencyCache = { concurrent: 1, limit: 8, softLimit: 4, boxedUntil: boxedMs, time: Date.now() };
+    const effective = getEffectiveConcurrency();
+    assert.strictEqual(effective.limit, 4);
+    assert.strictEqual(effective.softLimit, 4);
+    assert.strictEqual(effective.boxed, true);
+    assert.strictEqual(effective.boxedUntil, new Date(boxedMs).toISOString());
+  } finally {
+    require('../lib/state').config = origConfig;
+    require('../lib/state').concurrencyCache = origCache;
+    require('../lib/state').burstDisabledUntil = origCooldown;
+  }
 });

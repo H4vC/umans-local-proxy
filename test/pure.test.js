@@ -6,9 +6,9 @@ const assert = require('node:assert/strict');
 const { fnv1a, fnv1a32, fnv1aMixNum } = require('../lib/hash');
 const { parseDuration, parseListenAddr, cleanKeys, fileProxyApiKeys, readConfigFile, isLoopbackHost } = require('../lib/config');
 const { snapReasoningLevel, enrichModelsWithReasoning, REASONING_RANK } = require('../lib/reasoning');
-const { firstNumber, concurrencyHardLimit, percentValue, burstQuota, concurrencyQuotaLimit, applyOverride, extractThrottle, getEffectiveConcurrency, acquireThrottleSlot, releaseThrottleSlot } = require('../lib/concurrency');
+const { firstNumber, concurrencyHardLimit, percentValue, burstQuota, concurrencyQuotaLimit, applyOverride, extractThrottle, getEffectiveConcurrency, canStart, acquireThrottleSlot, releaseThrottleSlot, notifyUpstream429, BURST_COOLDOWN_FILE } = require('../lib/concurrency');
 const { canonicalMessage, messageHash, chainHash } = require('../lib/coalesce');
-const { authorized, wsUpgradeAllowed, isLoopback } = require('../lib/auth');
+const { authorized, wsUpgradeAllowed, isLoopback, safeHeaders } = require('../lib/auth');
 const state = require('../lib/state');
 const { readBody } = require('../lib/http');
 const { PassThrough } = require('node:stream');
@@ -692,4 +692,112 @@ test('isLoopbackHost identifies loopback listen hosts', () => {
   assert.strictEqual(isLoopbackHost('localhost'), true);
   assert.strictEqual(isLoopbackHost('0.0.0.0'), false);
   assert.strictEqual(isLoopbackHost('192.168.1.5'), false);
+});
+
+// ---- C7: safeHeaders strips content-encoding only for decoded encodings ----
+
+test('safeHeaders strips content-encoding + content-length for gzip (undici decodes)', () => {
+  const h = safeHeaders([['content-encoding', 'gzip'], ['content-length', '45'], ['content-type', 'application/json']]);
+  assert.strictEqual(h['content-encoding'], undefined);
+  assert.strictEqual(h['content-length'], undefined);
+  assert.strictEqual(h['content-type'], 'application/json');
+});
+
+test('safeHeaders keeps content-encoding for zstd (undici passes raw bytes through)', () => {
+  const h = safeHeaders([['content-encoding', 'zstd'], ['content-length', '45'], ['content-type', 'application/json']]);
+  assert.strictEqual(h['content-encoding'], 'zstd');
+  assert.strictEqual(h['content-length'], undefined); // always stripped — the pipe is chunked
+  assert.strictEqual(h['content-type'], 'application/json');
+});
+
+test('safeHeaders keeps content-encoding for unknown encodings (pass-through verbatim)', () => {
+  const h = safeHeaders([['content-encoding', 'weird'], ['content-type', 'text/plain']]);
+  assert.strictEqual(h['content-encoding'], 'weird');
+});
+
+// ---- C3: getEffectiveConcurrency collapses stale upstream concurrent ----
+
+test('getEffectiveConcurrency prefers activeRequests when the usage cache is stale (C3)', () => {
+  const s = require('../lib/state');
+  const orig = { config: s.config, concurrencyCache: s.concurrencyCache, burstDisabledUntil: s.burstDisabledUntil, activeRequests: s.activeRequests };
+  s.config = { ...s.config, overrideConcurrency: 0 };
+  s.burstDisabledUntil = 0;
+  // Stale cache: upstream reported 10 concurrent (all external), only 2 ours.
+  s.concurrencyCache = { concurrent: 10, limit: 10, softLimit: 5, boxedUntil: null, time: Date.now() - 60000 };
+  s.activeRequests = 2;
+  try {
+    assert.strictEqual(getEffectiveConcurrency().concurrent, 2, 'stale upstream concurrent collapses to activeRequests');
+  } finally {
+    s.config = orig.config; s.concurrencyCache = orig.concurrencyCache; s.burstDisabledUntil = orig.burstDisabledUntil; s.activeRequests = orig.activeRequests;
+  }
+});
+
+test('getEffectiveConcurrency trusts upstream concurrent when the cache is fresh (C3)', () => {
+  const s = require('../lib/state');
+  const orig = { config: s.config, concurrencyCache: s.concurrencyCache, burstDisabledUntil: s.burstDisabledUntil, activeRequests: s.activeRequests };
+  s.config = { ...s.config, overrideConcurrency: 0 };
+  s.burstDisabledUntil = 0;
+  s.concurrencyCache = { concurrent: 10, limit: 10, softLimit: 5, boxedUntil: null, time: Date.now() };
+  s.activeRequests = 2;
+  try {
+    assert.strictEqual(getEffectiveConcurrency().concurrent, 10, 'fresh upstream concurrent is trusted');
+  } finally {
+    s.config = orig.config; s.concurrencyCache = orig.concurrencyCache; s.burstDisabledUntil = orig.burstDisabledUntil; s.activeRequests = orig.activeRequests;
+  }
+});
+
+// ---- C2: canStart cold-start floor before the first /usage fetch ----
+
+test('canStart admits only the cold-start floor before the first /usage fetch (C2)', () => {
+  const s = require('../lib/state');
+  const orig = { concurrencyCache: s.concurrencyCache, usageEverFetched: s.usageEverFetched, activeRequests: s.activeRequests };
+  s.usageEverFetched = false;
+  s.activeRequests = 0;
+  try {
+    // null limit + never fetched → admit at most COLD_START_FLOOR (1).
+    assert.strictEqual(canStart({ limit: null, softLimit: null, concurrent: 0 }), true);  // 0 < 1
+    s.activeRequests = 1;
+    assert.strictEqual(canStart({ limit: null, softLimit: null, concurrent: 0 }), false); // 1 < 1 is false
+  } finally {
+    s.concurrencyCache = orig.concurrencyCache; s.usageEverFetched = orig.usageEverFetched; s.activeRequests = orig.activeRequests;
+  }
+});
+
+test('canStart treats a null limit as unlimited after the first /usage fetch (C2)', () => {
+  const s = require('../lib/state');
+  const orig = { usageEverFetched: s.usageEverFetched, activeRequests: s.activeRequests };
+  s.usageEverFetched = true;
+  s.activeRequests = 5;
+  try {
+    assert.strictEqual(canStart({ limit: null, softLimit: null, concurrent: 0 }), true); // genuinely uncapped
+  } finally {
+    s.usageEverFetched = orig.usageEverFetched; s.activeRequests = orig.activeRequests;
+  }
+});
+
+// ---- C5: notifyUpstream429 must not wake queued waiters (cascade guard) ----
+
+test('notifyUpstream429 does not wake queued waiters (cascade guard, C5)', () => {
+  const s = require('../lib/state');
+  const orig = { config: s.config, concurrencyCache: s.concurrencyCache, burstDisabledUntil: s.burstDisabledUntil, throttleWaiters: s.throttleWaiters, activeRequests: s.activeRequests, queuedRequests: s.queuedRequests, usageCache: s.usageCache };
+  s.config = { ...s.config, overrideConcurrency: 0 };
+  // A waiter WOULD be woken here (canStart true): limit 10, soft 5, nothing
+  // active. The fix is that notifyUpstream429 skips the wake entirely.
+  s.concurrencyCache = { concurrent: 0, limit: 10, softLimit: 5, boxedUntil: null, time: Date.now() };
+  s.burstDisabledUntil = 0;
+  s.activeRequests = 0;
+  s.queuedRequests = 1;
+  let resolved = false;
+  s.throttleWaiters = [{ resolve: () => { resolved = true; }, reject: () => {}, signal: undefined, onAbort: null }];
+  try {
+    notifyUpstream429();
+    assert.strictEqual(resolved, false, '429 must not wake queued waiters (cascade)');
+    assert.strictEqual(s.throttleWaiters.length, 1, 'waiter still queued');
+  } finally {
+    s.config = orig.config; s.concurrencyCache = orig.concurrencyCache;
+    s.throttleWaiters = orig.throttleWaiters; s.activeRequests = orig.activeRequests; s.queuedRequests = orig.queuedRequests;
+    s.usageCache = orig.usageCache;
+    s.burstDisabledUntil = 0;
+    try { fs.rmSync(BURST_COOLDOWN_FILE, { force: true }); } catch {}
+  }
 });

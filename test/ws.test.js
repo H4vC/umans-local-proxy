@@ -81,3 +81,45 @@ test('encodePong with no payload is a 2-byte frame', () => {
   assert.strictEqual(frame[0], 0x8A);
   assert.strictEqual(frame[1], 0);
 });
+
+// ---- C1: sweepClients half-open detection + C10: send try/catch ----
+
+test('sweepClients closes a client that missed its pong (half-open, C1)', () => {
+  const state = require('../lib/state');
+  const origClients = state.wsClients;
+  const clients = new Set();
+  state.wsClients = clients;
+  const client = { socket: { write: () => true, end: () => {} }, queue: [], paused: false, alive: true, awaitingPong: true };
+  clients.add(client);
+  try {
+    ws.sweepClients();
+    assert.strictEqual(client.alive, false, 'half-open client (awaitingPong) is closed');
+    assert.strictEqual(clients.has(client), false, 'closed client removed from the set');
+  } finally {
+    state.wsClients = origClients;
+  }
+});
+
+test('sweepClients pings a live client and marks it awaitingPong (C1)', () => {
+  const state = require('../lib/state');
+  const origClients = state.wsClients;
+  const clients = new Set();
+  state.wsClients = clients;
+  let writes = 0;
+  const client = { socket: { write: () => { writes++; return true; }, end: () => {} }, queue: [], paused: false, alive: true, awaitingPong: false };
+  clients.add(client);
+  try {
+    ws.sweepClients();
+    assert.strictEqual(writes, 1, 'live client is pinged (one frame written)');
+    assert.strictEqual(client.awaitingPong, true, 'awaitingPong set for the next sweep');
+    assert.strictEqual(client.alive, true, 'live client stays alive');
+  } finally {
+    state.wsClients = origClients;
+  }
+});
+
+test('send swallows a write error on a dead socket instead of throwing (C10)', () => {
+  const client = { socket: { write: () => { throw new Error('EPIPE'); } }, queue: [], paused: false, alive: true };
+  assert.doesNotThrow(() => ws.send(client, 'hello'));
+  assert.strictEqual(client.alive, false, 'dead socket marks the client not alive');
+});

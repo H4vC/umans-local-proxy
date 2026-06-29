@@ -508,3 +508,66 @@ test('OpenAI content delta whose JSON contains "usage" is still scanned', async 
   assert.strictEqual(session.responseContent, 'hi'); // not dropped by the usage fast-path
   assert.ok(session.chars >= 2);
 });
+
+// ---- C6: mid-stream upstream error → terminal SSE error frame ----
+
+test('mid-stream upstream error emits a terminal SSE error frame (C6)', async () => {
+  const upstream = await startUpstream((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+    res.write('data: {"choices":[{"delta":{"content":"partial"}}]}\n\n');
+    // Kill the socket mid-stream AFTER the proxy has received headers and
+    // started piping — undici surfaces this as a body-stream error, which the
+    // proxy must convert to a terminal SSE error frame instead of a silent
+    // truncation (clients can't otherwise tell a real failure from a clean end).
+    setTimeout(() => { try { res.socket.destroy(new Error('upstream stream died')); } catch {} }, 100);
+  });
+  const proxy = await startProxy();
+  seedState(`http://127.0.0.1:${upstream.address().port}`);
+
+  const resp = await fetch(`http://127.0.0.1:${proxy.address().port}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: bodyOf({ stream: true }),
+  });
+  assert.strictEqual(resp.status, 200); // headers already sent before the error
+  const text = await resp.text();
+  await new Promise((r) => setTimeout(r, 5)); // let finalize drain
+
+  assert.match(text, /partial/);                        // partial content delivered
+  assert.match(text, /data: \{"error":\{"message":/);  // C6 terminal error frame
+  assert.match(text, /data: \[DONE\]/);                 // terminal marker
+  const session = state.sessions.values().next().value;
+  assert.ok(session);
+  assert.strictEqual(session.status, 'error');          // real failure, not 'done'
+
+  await closeServer(proxy); await closeServer(upstream);
+});
+
+// ---- C8: ChatTap tracks active taps so a worker restart can re-init them ----
+
+test('ChatTap tracks active taps for worker-restart re-init (C8)', async () => {
+  const prevActive = state.tapActiveTaps;
+  const prevPending = state.tapPendingFinals;
+  const prevWorker = state.tapWorker;
+  const prevDead = state.tapWorkerDead;
+  const prevRestart = state.tapRestartTimer;
+  try {
+    state.tapActiveTaps = new Map();
+    const session = makeSession();
+    const tap = new ChatTap(session, { stream: true, shape: 'openai' });
+    // Constructed with a model → registered so a restart can re-init its parser.
+    assert.ok(state.tapActiveTaps.has(tap.id), 'tap registered on construct');
+    tap.onChunk(Buffer.from('data: [DONE]\n\n'));
+    await tap.onEnd();
+    // Finalized → unregistered (a restart must not re-init a completed tap).
+    assert.ok(!state.tapActiveTaps.has(tap.id), 'tap unregistered on finalize');
+  } finally {
+    if (state.tapRestartTimer && state.tapRestartTimer !== prevRestart) clearTimeout(state.tapRestartTimer);
+    if (state.tapWorker && state.tapWorker !== prevWorker) { try { await state.tapWorker.terminate(); } catch {} }
+    state.tapActiveTaps = prevActive instanceof Map ? prevActive : new Map();
+    state.tapPendingFinals = prevPending instanceof Map ? prevPending : new Map();
+    state.tapWorker = prevWorker || null;
+    state.tapWorkerDead = typeof prevDead === 'boolean' ? prevDead : false;
+    state.tapRestartTimer = prevRestart || null;
+  }
+});

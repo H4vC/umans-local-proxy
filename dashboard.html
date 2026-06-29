@@ -175,14 +175,14 @@
 
     /* ── Inputs ──────────────────────────────────────────────────────────────── */
     label { display: block; margin: 15px 0 6px; color: var(--muted); font-size: 11px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; }
-    input, textarea {
+    input, textarea, select {
       width: 100%; border: 1px solid var(--line); border-radius: var(--radius-sm);
       background: var(--surface-2); color: var(--text); padding: 10px 13px;
       font: inherit; font-size: 13px; outline: none;
       transition: border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease), background var(--dur) var(--ease);
     }
     textarea { min-height: 84px; resize: vertical; }
-    input:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--focus); background: var(--surface); }
+    input:focus, textarea:focus, select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--focus); background: var(--surface); }
     input::placeholder, textarea::placeholder { color: var(--muted); opacity: 1; }
 
     /* ── Buttons ─────────────────────────────────────────────────────────────── */
@@ -610,6 +610,12 @@
         <input id="timeout" placeholder="15m">
         <label for="overrideConcurrency">Override concurrency (0 = use UMANS limits)</label>
         <input id="overrideConcurrency" type="number" min="0" step="1" value="0">
+        <label for="websearchProvider">Websearch provider</label>
+        <select id="websearchProvider">
+          <option value="none">none — no web search</option>
+          <option value="native">native — UMANS built-in</option>
+          <option value="exa">exa — Exa search</option>
+        </select>
         <label for="models">Enabled models</label>
         <textarea id="models" placeholder="One model id per line. Empty exposes upstream models."></textarea>
         <div class="btn-row">
@@ -1162,6 +1168,7 @@
         ['backend routes', routeStr],
         ['timeout', esc(config.requestTimeout ?? '—')],
         ['override concurrency', config.overrideConcurrency ?? 0],
+        ['websearch provider', esc(config.websearchProvider ?? 'none')],
         ['enabled models', esc((config.enabledModels?.length ? config.enabledModels : []).join(', ') || 'all (no filter)')],
       ])}</tbody></table></div></div>`;
     }
@@ -1548,7 +1555,8 @@
           $('apiKey').placeholder = config.hasApiKey ? 'Configured; leave blank to keep' : 'sk-...';
           $('sessionCookie').placeholder = config.hasSessionCookie ? 'Configured; leave blank to keep' : 'Optional — for app.umans.ai account endpoints';
           $('timeout').value = config.requestTimeout || '15m';
-          $('overrideConcurrency').value = config.overrideConcurrency || 0;
+        $('overrideConcurrency').value = config.overrideConcurrency || 0;
+        $('websearchProvider').value = config.websearchProvider || 'none';
           $('models').value = (config.enabledModels || []).join('\n');
           renderConfig(config, health.routes);
         }
@@ -1569,7 +1577,8 @@
       try {
         const payload = {
           requestTimeout: $('timeout').value.trim(),
-          overrideConcurrency: Number($('overrideConcurrency').value || 0)
+          overrideConcurrency: Number($('overrideConcurrency').value || 0),
+          websearchProvider: $('websearchProvider').value
         };
         if (configLoaded) payload.enabledModels = $('models').value.split(/\r?\n/).map(x => x.trim()).filter(Boolean);
         if ($('apiKey').value.trim()) payload.apiKey = $('apiKey').value.trim();

@@ -42,16 +42,19 @@ Use the launcher, dashboard, or create `.config/config.json`:
   "ENABLED_MODELS": ["model-id"],
   "API_KEYS": ["optional-proxy-access-key"],
   "REQUEST_TIMEOUT": "15m",
-  "OVERRIDE_CONCURRENCY": 0
+  "OVERRIDE_CONCURRENCY": 0,
+  "WEBSEARCH_PROVIDER": "none"
 }
 ```
 
 `.config/` is gitignored and never committed — it holds your live API key. `UMANS_API_KEY` overrides `API_KEY`; `UMANS_SESSION_COOKIE` overrides `SESSION_COOKIE`. `API_KEYS` or comma-separated env `API_KEYS` protects `/api/config`, `/api/umans/*`, and `/v1/*`. Proxy auth is **disabled by default** (empty `API_KEYS`): intended for a localhost single-user tool. The proxy refuses to boot if bound to a non-loopback address with empty `API_KEYS` — set `API_KEYS` first. When auth is disabled, `GET /api/debug/coalesce` exposes conversation-prefix hashes and short response-content previews — protect it if you have untrusted local users. `SESSION_COOKIE` is optional: when set, the proxy sends it as a `Cookie` header **only to `app.umans.ai`** for the cap-health account endpoint (not to the `api.code.umans.ai` chat upstream) — it authenticates the browser session the web app uses, not the API bearer key. See [UMANS session cookie (cap-health)](#umans-session-cookie-cap-health) for the exact cookie name and format.
 
+`WEBSEARCH_PROVIDER` selects the value sent as the `X-Umans-Websearch-Provider` header on chat upstream requests: `none` (default, no web search), `native` (UMANS built-in), or `exa` (Exa search). Env `WEBSEARCH_PROVIDER` overrides the file value; an unknown value fails fast at boot.
+
 Launcher flags:
 
 ```bash
-node launcher.js --listen=127.0.0.1:8084 --key=sk-... --sessionCookie="name=value; ..." --models=model-a,model-b --proxyKeys=local-secret --timeout=15m --concurrency=0 --start
+node launcher.js --listen=127.0.0.1:8084 --key=sk-... --sessionCookie="name=value; ..." --models=model-a,model-b --proxyKeys=local-secret --timeout=15m --concurrency=0 --websearch=none --start
 ```
 
 Add `--no-start` to save settings without starting the proxy.

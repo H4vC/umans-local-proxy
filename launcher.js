@@ -13,6 +13,7 @@ const DEFAULTS = {
   API_KEYS: [],
   REQUEST_TIMEOUT: '15m',
   OVERRIDE_CONCURRENCY: 0,
+  WEBSEARCH_PROVIDER: 'none',
 };
 
 function readJSON(file) {
@@ -39,6 +40,7 @@ function loadConfig() {
     API_KEYS: cleanList(raw.API_KEYS),
     REQUEST_TIMEOUT: raw.REQUEST_TIMEOUT || DEFAULTS.REQUEST_TIMEOUT,
     OVERRIDE_CONCURRENCY: Math.max(0, Number(raw.OVERRIDE_CONCURRENCY || DEFAULTS.OVERRIDE_CONCURRENCY) || 0),
+    WEBSEARCH_PROVIDER: raw.WEBSEARCH_PROVIDER || DEFAULTS.WEBSEARCH_PROVIDER,
   };
 }
 
@@ -70,6 +72,7 @@ function applyArgs(config) {
     proxyKeys: 'API_KEYS',
     timeout: 'REQUEST_TIMEOUT',
     concurrency: 'OVERRIDE_CONCURRENCY',
+    websearch: 'WEBSEARCH_PROVIDER',
   };
   for (const [arg, field] of Object.entries(map)) {
     const value = parseArg(arg);
@@ -100,6 +103,9 @@ async function promptSettings(config) {
     const concurrency = await question(rl, `Override concurrency, 0 = use UMANS limits [${config.OVERRIDE_CONCURRENCY}]: `);
     if (concurrency.trim()) config.OVERRIDE_CONCURRENCY = Math.max(0, Number(concurrency) || 0);
 
+    const websearch = await question(rl, `Websearch provider (native|exa|none) [${config.WEBSEARCH_PROVIDER}]: `);
+    if (websearch.trim()) config.WEBSEARCH_PROVIDER = websearch.trim();
+
     const apiKey = await question(rl, `UMANS API key [${mask(config.API_KEY)}]: `);
     if (apiKey.trim()) config.API_KEY = apiKey.trim();
 
@@ -122,6 +128,7 @@ function printSettings(config) {
   console.log(`  LISTEN_ADDR:       ${config.LISTEN_ADDR}`);
   console.log(`  REQUEST_TIMEOUT:   ${config.REQUEST_TIMEOUT}`);
   console.log(`  OVERRIDE_CONCURRENCY: ${config.OVERRIDE_CONCURRENCY}`);
+  console.log(`  WEBSEARCH_PROVIDER:   ${config.WEBSEARCH_PROVIDER}`);
   console.log(`  API_KEY:           ${mask(config.API_KEY)}`);
   console.log(`  SESSION_COOKIE:    ${mask(config.SESSION_COOKIE)}`);
   console.log(`  ENABLED_MODELS:    ${config.ENABLED_MODELS.join(', ') || '(all upstream models)'}`);

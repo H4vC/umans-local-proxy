@@ -5,7 +5,7 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 
 const { fnv1a, fnv1a32, fnv1aMixNum } = require('../lib/hash');
-const { parseDuration, parseListenAddr, cleanKeys, fileProxyApiKeys, readConfigFile, isLoopbackHost, normalizeSessionCookie } = require('../lib/config');
+const { parseDuration, parseWebsearchProvider, parseListenAddr, cleanKeys, fileProxyApiKeys, readConfigFile, isLoopbackHost, normalizeSessionCookie } = require('../lib/config');
 const { snapReasoningLevel, enrichModelsWithReasoning, REASONING_RANK } = require('../lib/reasoning');
 const { firstNumber, concurrencyHardLimit, percentValue, burstQuota, concurrencyQuotaLimit, applyOverride, extractThrottle, getEffectiveConcurrency, canStart, acquireThrottleSlot, releaseThrottleSlot, notifyUpstream429, BURST_COOLDOWN_FILE } = require('../lib/concurrency');
 const { canonicalMessage, messageHash, chainHash, resolveGroupKey, storeStateKey } = require('../lib/coalesce');
@@ -233,6 +233,30 @@ test('parseDuration case-insensitive', () => {
 
 test('parseDuration throws on invalid', () => {
   assert.throws(() => parseDuration('abc'), /REQUEST_TIMEOUT/);
+});
+
+// ---- config: parseWebsearchProvider ----
+
+test('parseWebsearchProvider accepts native/exa/none', () => {
+  assert.strictEqual(parseWebsearchProvider('native'), 'native');
+  assert.strictEqual(parseWebsearchProvider('exa'), 'exa');
+  assert.strictEqual(parseWebsearchProvider('none'), 'none');
+});
+
+test('parseWebsearchProvider defaults to none on empty/missing', () => {
+  assert.strictEqual(parseWebsearchProvider(''), 'none');
+  assert.strictEqual(parseWebsearchProvider(undefined), 'none');
+  assert.strictEqual(parseWebsearchProvider(null), 'none');
+});
+
+test('parseWebsearchProvider is case-insensitive and trims', () => {
+  assert.strictEqual(parseWebsearchProvider(' NATIVE '), 'native');
+  assert.strictEqual(parseWebsearchProvider('Exa'), 'exa');
+});
+
+test('parseWebsearchProvider throws on unknown value', () => {
+  assert.throws(() => parseWebsearchProvider('google'), /WEBSEARCH_PROVIDER/);
+  assert.throws(() => parseWebsearchProvider('nativ'), /WEBSEARCH_PROVIDER/);
 });
 
 // ---- config: parseListenAddr ----

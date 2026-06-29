@@ -128,6 +128,40 @@ test('canonicalMessage normalizes null content to empty', () => {
   assert.deepStrictEqual(canonicalMessage({ role: 'user', content: null }), { role: 'user', content: '' });
 });
 
+test('canonicalMessage flattens assistant array content to joined text', () => {
+  // proxy captured the text string; client replays text+thinking as an array
+  const proxy = canonicalMessage({ role: 'assistant', content: 'hello' });
+  const client = canonicalMessage({ role: 'assistant', content: [
+    { type: 'thinking', thinking: 'secret', signature: 'sig' },
+    { type: 'text', text: 'hello' },
+  ] });
+  assert.deepStrictEqual(proxy, client);
+  assert.deepStrictEqual(proxy, { role: 'assistant', content: 'hello' });
+});
+
+test('canonicalMessage drops assistant tool_use blocks, keeps text', () => {
+  const got = canonicalMessage({ role: 'assistant', content: [
+    { type: 'text', text: 'calling foo' },
+    { type: 'tool_use', id: 'c1', name: 'foo', input: { x: 1 } },
+  ] });
+  assert.deepStrictEqual(got, { role: 'assistant', content: 'calling foo' });
+});
+
+test('canonicalMessage keeps full stringify for non-assistant array content (vision)', () => {
+  const blocks = [{ type: 'text', text: 'see this' }, { type: 'image_url', image_url: { url: 'data:…' } }];
+  assert.deepStrictEqual(canonicalMessage({ role: 'user', content: blocks }), { role: 'user', content: JSON.stringify(blocks) });
+});
+
+test('assistant array and string with same text coalesce in chainHash', () => {
+  const model = 'm';
+  const user = { role: 'user', content: 'q' };
+  const viaString = chainHash(model, [user, { role: 'assistant', content: 'a' }]);
+  const viaArray = chainHash(model, [user, { role: 'assistant', content: [
+    { type: 'thinking', thinking: 'x' }, { type: 'text', text: 'a' },
+  ] }]);
+  assert.strictEqual(viaString, viaArray);
+});
+
 // ---- auth: constant-time comparison (L3) ----
 
 test('authorized returns true when no proxy keys configured', () => {

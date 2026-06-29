@@ -45,7 +45,7 @@ Use the launcher, dashboard, or create `.config/config.json`:
 }
 ```
 
-`.config/` is gitignored and never committed — it holds your live API key. `UMANS_API_KEY` overrides `API_KEY`. `API_KEYS` or comma-separated env `API_KEYS` protects `/api/config`, `/api/umans/*`, and `/v1/*`. Proxy auth is **disabled by default** (empty `API_KEYS`): intended for a localhost single-user tool. Set `API_KEYS` before binding to a non-loopback address. When auth is disabled, `GET /api/debug/coalesce` exposes conversation-prefix hashes and short response-content previews — protect it if you have untrusted local users.
+`.config/` is gitignored and never committed — it holds your live API key. `UMANS_API_KEY` overrides `API_KEY`. `API_KEYS` or comma-separated env `API_KEYS` protects `/api/config`, `/api/umans/*`, and `/v1/*`. Proxy auth is **disabled by default** (empty `API_KEYS`): intended for a localhost single-user tool. The proxy refuses to boot if bound to a non-loopback address with empty `API_KEYS` — set `API_KEYS` first. When auth is disabled, `GET /api/debug/coalesce` exposes conversation-prefix hashes and short response-content previews — protect it if you have untrusted local users.
 
 Launcher flags:
 
@@ -81,7 +81,7 @@ The dashboard connects to `/ws` (WebSocket) for live updates — the proxy pushe
 
 ## Sessions and live TPS
 
-The proxy tracks each in-flight chat request as a session and computes live tokens-per-second (tok/s) without mutating the bytes forwarded to the client. A read-only `ChatTap` observes the upstream stream asynchronously — `onChunk` is O(1) (pushes to a queue), and all JSON parsing / char scanning runs in a `setImmediate` drain between I/O ticks, so telemetry never delays bytes reaching the client.
+The proxy tracks each in-flight chat request as a session and computes live tokens-per-second (tok/s) without mutating the bytes forwarded to the client. A read-only `ChatTap` observes the upstream stream asynchronously — `onChunk` is O(1) (pushes to a queue), and all JSON parsing / char scanning runs in a dedicated worker thread (`lib/tap-worker.js`) on its own core, so telemetry never delays bytes reaching the client.
 
 Token counting: when the upstream response includes a `usage` block (non-streaming responses, or streaming responses with `stream_options: { include_usage: true }`), the exact token count is used. Otherwise, output tokens are estimated from content/reasoning chars (~4 chars/token) and marked as estimated. Per-session token breakdown shows input cached, input uncached, and output tokens, plus a cache hit rate derived from `prompt_tokens_details.cached_tokens`.
 
@@ -95,7 +95,7 @@ The dashboard **Sessions** tab shows per-session cards with:
 - Token breakdown: input cached, input uncached, output, cache hit rate
 - Elapsed time, bytes forwarded, session id
 
-Sessions are pushed via the WebSocket (message type: `sessions`) at most once per second while sessions are active. Completed sessions remain visible for 5 seconds before being dropped. A local timer in the dashboard updates elapsed times at 2fps between WebSocket pushes.
+Sessions are pushed via the WebSocket (message type: `sessions`) at most once per second while sessions are active. Completed sessions remain visible for 5 minutes before being dropped. A local timer in the dashboard updates elapsed times at 2fps between WebSocket pushes.
 
 ## Service health
 
@@ -103,7 +103,7 @@ Sessions are pushed via the WebSocket (message type: `sessions`) at most once pe
 
 ## Hot reload
 
-`POST /api/reload` re-requires all `lib/*.js` modules from disk without restarting the process — including `lib/server.js` itself. `proxy.js` is a ~10-line immutable bootstrap that never changes. The listening socket, WebSocket connections, and in-flight requests survive — in-flight requests continue with the old code (closure capture), new requests get the fresh code. `lib/state.js` is never purged, so live sessions, caches, and telemetry persist across reloads. If the new code throws on require, the old handler is kept — the proxy stays functional. The dashboard **Admin** tab has a "Reload code" button; `GET /api/system/info` shows `reloadCount` and `lastReloadAt`.
+`POST /api/reload` re-requires all `lib/*.js` modules from disk without restarting the process — including `lib/server.js` itself. `proxy.js` is a ~10-line immutable bootstrap that never changes. The listening socket, WebSocket connections, and in-flight requests survive — in-flight requests continue with the old code (closure capture), new requests get the fresh code. `lib/state.js` is never purged, so live sessions, caches, and telemetry persist across reloads. Reload also re-reads `config.json`, so external edits to API keys, listen address, or enabled models apply without a restart; a parse error is logged and the prior config is kept. If the new code throws on require, the old handler is kept — the proxy stays functional. The dashboard **Admin** tab has a "Reload code" button; `GET /api/system/info` shows `reloadCount` and `lastReloadAt`.
 
 ## API
 

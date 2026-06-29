@@ -8,7 +8,9 @@ const { parseDuration, parseListenAddr, cleanKeys, fileProxyApiKeys, readConfigF
 const { snapReasoningLevel, enrichModelsWithReasoning, REASONING_RANK } = require('../lib/reasoning');
 const { firstNumber, concurrencyHardLimit, percentValue, burstQuota, concurrencyQuotaLimit, applyOverride, extractThrottle, getEffectiveConcurrency, canStart, acquireThrottleSlot, releaseThrottleSlot, notifyUpstream429, BURST_COOLDOWN_FILE } = require('../lib/concurrency');
 const { canonicalMessage, messageHash, chainHash } = require('../lib/coalesce');
-const { authorized, wsUpgradeAllowed, isLoopback, safeHeaders } = require('../lib/auth');
+const { authorized, wsUpgradeAllowed, isLoopback, safeHeaders, requiresProxyAuth } = require('../lib/auth');
+const { createSession, finalizeSession } = require('../lib/sessions');
+const { projectStatus } = require('../lib/upstream');
 const state = require('../lib/state');
 const { readBody } = require('../lib/http');
 const { PassThrough } = require('node:stream');
@@ -799,5 +801,85 @@ test('notifyUpstream429 does not wake queued waiters (cascade guard, C5)', () =>
     s.usageCache = orig.usageCache;
     s.burstDisabledUntil = 0;
     try { fs.rmSync(BURST_COOLDOWN_FILE, { force: true }); } catch {}
+  }
+});
+
+// ---- E: config parseListenAddr IPv6 + parseDuration clamp ----
+
+test('parseListenAddr strips IPv6 brackets (E)', () => {
+  assert.deepStrictEqual(parseListenAddr('[::1]:8084'), { host: '::1', port: 8084 });
+});
+
+test('parseDuration clamps a unitless footgun to >=1s (E)', () => {
+  assert.strictEqual(parseDuration('30'), 1000);   // 30ms → clamped to 1s
+  assert.strictEqual(parseDuration('30s'), 30000); // explicit unit unaffected
+});
+
+// ---- E/F: requiresProxyAuth / router parity ----
+
+test('requiresProxyAuth covers every /api and /v1 route the router serves (parity, E/F)', () => {
+  // Update this list when adding a route — a mismatch is a silent auth bypass.
+  const authed = [
+    '/api/config', '/api/shutdown', '/api/restart', '/api/reload', '/api/clear-state',
+    '/api/system/info', '/api/debug/coalesce',
+    '/api/umans/sessions', '/api/umans/usage', '/api/umans/concurrency',
+    '/api/umans/cooldown/clear', '/api/umans/status',
+    '/v1/models/info', '/v1/models', '/v1/chat/completions', '/v1/messages',
+  ];
+  for (const p of authed) assert.ok(requiresProxyAuth(p), `${p} must require proxy auth`);
+  for (const p of ['/', '/dashboard', '/health']) assert.strictEqual(requiresProxyAuth(p), false);
+  assert.strictEqual(requiresProxyAuth('/v1/models/anything'), true);
+  assert.strictEqual(requiresProxyAuth('/api/umans/anything'), true);
+});
+
+// ---- F: upstream projectStatus (pure) ----
+
+test('projectStatus projects overall + per-model status (F)', () => {
+  const out = projectStatus({
+    overall: { status: 'ok', uptime_pct_24h: 99.9, latency: { ttft_ms: { p50: 120 } }, output_tokens_per_second: { p50: 80 } },
+    models: { 'm1': { status: 'degraded', uptime_pct_24h: 95, latency: { ttft_ms: { p50: 300 } }, output_tokens_per_second: { p50: 40 } } },
+  });
+  assert.strictEqual(out.ok, true);
+  assert.strictEqual(out.overall.status, 'ok');
+  assert.strictEqual(out.overall.uptimePct, 99.9);
+  assert.strictEqual(out.overall.ttftMsP50, 120);
+  assert.strictEqual(out.overall.tpsP50, 80);
+  assert.strictEqual(out.models['m1'].status, 'degraded');
+  assert.strictEqual(out.models['m1'].ttftMsP50, 300);
+  assert.strictEqual(out.models['m1'].tpsP50, 40);
+});
+
+test('projectStatus tolerates missing/empty fields (F)', () => {
+  const out = projectStatus({});
+  assert.strictEqual(out.overall, null);
+  assert.deepStrictEqual(out.models, {});
+});
+
+// ---- F: finalizeSession idempotency (double-finalize guard) ----
+
+test('finalizeSession is idempotent — a double call does not double-count (F)', () => {
+  const s = state;
+  const orig = {
+    sessions: s.sessions, groupSummaries: s.groupSummaries, sessionsByGroup: s.sessionsByGroup,
+    groupSummaryTimers: s.groupSummaryTimers, sessionsBroadcastTimer: s.sessionsBroadcastTimer,
+    broadcastThrottled: s.broadcastThrottled, sessionSeq: s.sessionSeq,
+  };
+  s.sessions = new Map(); s.groupSummaries = new Map(); s.sessionsByGroup = new Map();
+  s.groupSummaryTimers = new Map(); s.sessionsBroadcastTimer = null; s.broadcastThrottled = false;
+  try {
+    const sess = createSession({ model: 'm', stream: true, groupKey: 'g1' });
+    sess.completionTokens = 10; sess.cachedTokens = 5; sess.promptTokens = 8; sess.firstTokenAt = Date.now() - 100;
+    finalizeSession(sess, 'done');
+    const turns1 = s.groupSummaries.get('g1').turnCount;
+    const tokens1 = s.groupSummaries.get('g1').totalTokens;
+    finalizeSession(sess, 'done'); // double — must be a no-op (endedAt guard)
+    assert.strictEqual(s.groupSummaries.get('g1').turnCount, turns1, 'turnCount not double-counted');
+    assert.strictEqual(s.groupSummaries.get('g1').totalTokens, tokens1, 'totalTokens not double-counted');
+  } finally {
+    for (const t of s.groupSummaryTimers.values()) clearTimeout(t);
+    clearTimeout(s.sessionsBroadcastTimer);
+    s.sessions = orig.sessions; s.groupSummaries = orig.groupSummaries; s.sessionsByGroup = orig.sessionsByGroup;
+    s.groupSummaryTimers = orig.groupSummaryTimers; s.sessionsBroadcastTimer = orig.sessionsBroadcastTimer;
+    s.broadcastThrottled = orig.broadcastThrottled; s.sessionSeq = orig.sessionSeq;
   }
 });

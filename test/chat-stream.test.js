@@ -423,6 +423,30 @@ test('scan does not false-match a "content":" literal embedded in the content va
   assert.strictEqual(session.responseContent, content);
 });
 
+test('scan handles spaced JSON (UMANS API: "content": "…" not "content":"…")', async () => {
+  state.modelCharRatio.clear();
+  // The UMANS API serializes JSON with spaces after colons. The scanner must
+  // skip : <whitespace> " after the field name to find the value.
+  const content = 'Hi there, friend!';
+  const buf = Buffer.from(
+    'data: {"id": "x", "object": "chat.completion.chunk", "model": "m", "choices": [{"index": 0, "delta": {"content": "", "role": "assistant"}}]}\n\n' +
+    'data: {"id": "x", "object": "chat.completion.chunk", "model": "m", "choices": [{"index": 0, "delta": {"reasoning_content": "thinking..."}}]}\n\n' +
+    'data: {"id": "x", "object": "chat.completion.chunk", "model": "m", "choices": [{"index": 0, "delta": {"content": ' + JSON.stringify(content) + '}}]}\n\n' +
+    'data: {"id": "x", "object": "chat.completion.chunk", "model": "m", "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}\n\n' +
+    'data: {"id": "x", "object": "chat.completion.chunk", "model": "m", "choices": [{"index": 0, "delta": {}}], "usage": {"prompt_tokens": 5, "completion_tokens": 8}}\n\n' +
+    'data: [DONE]\n\n', 'utf8');
+  const session = makeSession();
+  const tap = new ChatTap(session, { stream: true, shape: 'openai' });
+  const { sink, done } = collect();
+  await pipeline(Readable.from([buf]), createTapStream(tap), sink);
+  await tap.onEnd();
+  assert.deepStrictEqual(done(), buf);
+  assert.strictEqual(session.responseContent, content, 'responseContent captured from spaced JSON');
+  assert.ok(session.chars > 0, 'chars counted from content + reasoning_content');
+  assert.ok(session.firstTokenAt != null, 'firstTokenAt set (reasoning_content chars counted)');
+  assert.strictEqual(session.exactTokens, true, 'usage chunk found despite spaces');
+});
+
 test('Anthropic streaming: counts text+thinking, decodes responseContent, exact usage', async () => {
   state.modelCharRatio.clear();
   // Anthropic emits event:/data: pairs; only data: lines parse. text_delta

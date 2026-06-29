@@ -206,6 +206,20 @@
     .btn-row { margin-top: 16px; display: flex; gap: 8px; flex-wrap: wrap; }
     .grow { flex: 1; min-width: 0; }
     .btn-sm { padding: 5px 12px; font-size: 12px; margin: 0; box-shadow: none; }
+    /* ── API endpoint list ───────────────────────────────────────────────────── */
+    .endpoint-list { display: flex; flex-direction: column; gap: 4px; margin-top: 4px; }
+    .endpoint-row { display: flex; align-items: baseline; gap: 10px; padding: 8px 12px; border-radius: var(--radius-sm); background: var(--surface-2); border: 1px solid var(--line); font-size: 12.5px; }
+    .endpoint-row:hover { border-color: var(--line-2); }
+    .ep-method { font-size: 10px; font-weight: 700; letter-spacing: .05em; width: 36px; flex: none; }
+    .ep-method.get  { color: var(--good); }
+    .ep-method.post { color: var(--accent); }
+    .ep-method.ws   { color: var(--warn); }
+    .ep-path { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; color: var(--text); }
+    .ep-desc { font-size: 11px; color: var(--muted-2); margin-left: auto; }
+    /* ── Admin actions / danger zone ─────────────────────────────────────────── */
+    .admin-actions { display: flex; gap: 8px; flex-wrap: wrap; padding-top: 18px; border-top: 1px solid var(--line); }
+    .danger-zone { margin-top: 10px; padding-top: 14px; border-top: 1px solid rgba(196,78,60,.25); display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    .danger-label { font-size: 11px; font-weight: 600; color: var(--bad); opacity: .7; text-transform: uppercase; letter-spacing: .05em; margin-right: 4px; }
 
     /* ── Spinner ─────────────────────────────────────────────────────────────── */
     .spin { display: inline-block; width: 11px; height: 11px; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: spin .7s linear infinite; vertical-align: -2px; margin-right: 5px; }
@@ -233,21 +247,27 @@
     .stat.accent { background: var(--accent-soft); }
     .stat.accent strong { color: var(--accent-ink); }
     .stat .sub { color: var(--muted-2); font-size: 11px; margin-top: 5px; text-transform: none; letter-spacing: 0; font-weight: 400; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .stat .sub.multiline { white-space: normal; overflow: visible; line-height: 1.7; }
-    .stat .sub.multiline > div { display: flex; justify-content: space-between; gap: 8px; }
-    .modelstats { background: var(--surface-2); border-radius: var(--radius-sm); overflow: hidden; margin-top: 12px; }
-    .modelstats-row { display: grid; grid-template-columns: minmax(0, 1fr) auto auto auto; gap: 18px; align-items: center; padding: 12px 16px; }
-    .modelstats-row + .modelstats-row { border-top: 1px solid var(--line); }
-    .modelstats-head { font-size: 10px; text-transform: uppercase; letter-spacing: .06em; font-weight: 600; color: var(--muted); background: var(--surface-3); padding: 9px 16px; }
-    .modelstats-head span:nth-child(n+2) { text-align: right; }
-    .ms-name { display: flex; align-items: baseline; gap: 8px; min-width: 0; font-weight: 600; font-size: 13px; }
-    .ms-name-text { word-break: break-all; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .ms-status { flex: none; font-size: 10px; padding: 1px 6px; border-radius: var(--radius-xs); font-weight: 600; text-transform: uppercase; letter-spacing: .04em; }
+    .stat .sub.token-rows { white-space: normal; overflow: visible; display: flex; flex-direction: column; gap: 5px; }
+    /* ── Per-model TPS bars + token bars ─────────────────────────────────────── */
+    #modelStats { margin-top: 12px; display: flex; flex-direction: column; gap: 6px; }
+    .model-row { display: flex; align-items: center; gap: 16px; background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 10px 16px; }
+    .model-row-name { display: flex; align-items: baseline; gap: 8px; min-width: 130px; flex: none; }
+    .model-row-name .mn-text { font-size: 11px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .model-row-value { font-size: 20px; font-weight: 600; font-variant-numeric: tabular-nums; letter-spacing: -0.02em; color: var(--text); flex: none; min-width: 64px; text-align: right; }
+    .model-row-unit { font-size: 11px; font-weight: 500; color: var(--muted); }
+    .model-row-bars { flex: 1; display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+    .token-row, .tps-row { display: flex; align-items: center; gap: 6px; font-size: 11px; font-variant-numeric: tabular-nums; }
+    .token-row .t-label, .tps-row .t-label { color: var(--muted-2); flex: none; overflow: hidden; }
+    .token-row .t-label { width: 44px; }
+    .tps-row .t-label { width: 28px; }
+    .token-row .t-track, .tps-row .t-track { flex: 1; height: 3px; border-radius: 2px; background: var(--surface-3); min-width: 0; overflow: hidden; }
+    .token-row .t-fill, .tps-row .t-fill { height: 3px; border-radius: 2px; display: block; }
+    .token-row .t-count, .tps-row .t-count { color: var(--muted); text-align: right; flex: none; }
+    .token-row .t-count { min-width: 48px; }
+    .tps-row .t-count { min-width: 36px; }
+    .ms-status { flex: none; font-size: 9px; padding: 1px 5px; border-radius: var(--radius-xs); font-weight: 700; text-transform: uppercase; letter-spacing: .04em; }
     .ms-status.warn { color: var(--warn); background: var(--warn-soft); }
     .ms-status.bad { color: var(--bad); background: var(--bad-soft); }
-    .ms-live { font-size: 18px; font-weight: 600; font-variant-numeric: tabular-nums; color: var(--accent-ink); text-align: right; letter-spacing: -0.01em; }
-    .ms-live.idle { color: var(--muted-2); font-weight: 500; }
-    .ms-med, .ms-p10 { font-size: 13px; font-variant-numeric: tabular-nums; color: var(--text-2); text-align: right; min-width: 48px; }
     .stat.warn { background: var(--warn-soft); }
     .stat.warn strong { color: var(--warn); }
 
@@ -596,19 +616,22 @@
     <div id="panel-api" class="tabpanel" role="tabpanel" aria-labelledby="tab-api">
       <section class="full">
         <h2>Endpoints</h2>
-        <ul>
-          <li><code>GET /health</code></li>
-          <li><code>GET /api/umans/usage</code></li>
-          <li><code>GET /api/umans/concurrency</code></li>
-          <li><code>GET /api/umans/sessions</code> <span class="muted" style="font-size:11px">live TPS + per-session</span></li>
-          <li><code>GET /api/umans/status</code> <span class="muted" style="font-size:11px">UMANS service health</span></li>
-          <li><code>GET /v1/models</code></li>
-          <li><code>POST /v1/chat/completions</code> <span class="muted" style="font-size:11px">OpenAI shape</span></li>
-          <li><code>POST /v1/messages</code> <span class="muted" style="font-size:11px">Anthropic shape</span></li>
-          <li><code>GET /ws</code> <span class="muted" style="font-size:11px">WebSocket</span></li>
-          <li><code>GET /api/system/info</code> <span class="muted" style="font-size:11px">pid, uptime</span></li>
-          <li><code>POST /api/reload</code> · <code>POST /api/restart</code> · <code>POST /api/clear-state</code> · <code>POST /api/shutdown</code></li>
-        </ul>
+        <div class="endpoint-list">
+          <div class="endpoint-row"><span class="ep-method get">GET</span><span class="ep-path">/health</span></div>
+          <div class="endpoint-row"><span class="ep-method get">GET</span><span class="ep-path">/api/umans/usage</span></div>
+          <div class="endpoint-row"><span class="ep-method get">GET</span><span class="ep-path">/api/umans/concurrency</span></div>
+          <div class="endpoint-row"><span class="ep-method get">GET</span><span class="ep-path">/api/umans/sessions</span><span class="ep-desc">live TPS + per-session</span></div>
+          <div class="endpoint-row"><span class="ep-method get">GET</span><span class="ep-path">/api/umans/status</span><span class="ep-desc">UMANS service health</span></div>
+          <div class="endpoint-row"><span class="ep-method get">GET</span><span class="ep-path">/v1/models</span></div>
+          <div class="endpoint-row"><span class="ep-method post">POST</span><span class="ep-path">/v1/chat/completions</span><span class="ep-desc">OpenAI shape</span></div>
+          <div class="endpoint-row"><span class="ep-method post">POST</span><span class="ep-path">/v1/messages</span><span class="ep-desc">Anthropic shape</span></div>
+          <div class="endpoint-row"><span class="ep-method ws">WS</span><span class="ep-path">/ws</span><span class="ep-desc">live updates</span></div>
+          <div class="endpoint-row"><span class="ep-method get">GET</span><span class="ep-path">/api/system/info</span><span class="ep-desc">pid, uptime</span></div>
+          <div class="endpoint-row"><span class="ep-method post">POST</span><span class="ep-path">/api/reload</span><span class="ep-desc">hot reload code</span></div>
+          <div class="endpoint-row"><span class="ep-method post">POST</span><span class="ep-path">/api/restart</span><span class="ep-desc">spawn successor</span></div>
+          <div class="endpoint-row"><span class="ep-method post">POST</span><span class="ep-path">/api/clear-state</span><span class="ep-desc">clear sessions/caches</span></div>
+          <div class="endpoint-row"><span class="ep-method post">POST</span><span class="ep-path">/api/shutdown</span><span class="ep-desc">stop proxy</span></div>
+        </div>
       </section>
     </div>
 
@@ -656,11 +679,14 @@
             <tr><th>last reload</th><td id="adminLastReload" class="v">—</td></tr>
           </tbody></table></div>
         </div>
-        <div class="btn-row">
+        <div class="admin-actions">
           <button class="btn tonal" id="adminRefreshBtn">Refresh info</button>
-          <button class="btn" id="clearStateBtn">Clear state</button>
           <button class="btn tonal" id="adminReloadBtn">Reload code</button>
+          <button class="btn" id="clearStateBtn">Clear state</button>
           <button class="btn tonal" id="restartBtn">Restart proxy</button>
+        </div>
+        <div class="danger-zone">
+          <span class="danger-label">Danger</span>
           <button class="btn danger" id="shutdownBtn">Shut down</button>
         </div>
         <pre id="adminOut"></pre>
@@ -802,8 +828,18 @@
       const cachePct = Math.round((tokensCached / total) * 100);
       const inPct = Math.round((uncachedIn / total) * 100);
       const outPct = Math.round((tokensOut / total) * 100);
-      $('usageTokensSub').className = 'sub multiline';
-      $('usageTokensSub').innerHTML = `<div><span>${fmtTokens(tokensCached)} cache</span><span class="v good">${cachePct}%</span></div><div><span>${fmtTokens(uncachedIn)} input</span><span class="v muted-2">${inPct}%</span></div><div><span>${fmtTokens(tokensOut)} output</span><span class="v accent">${outPct}%</span></div>`;
+      $('usageTokensSub').className = 'sub token-rows';
+      $('usageTokensSub').innerHTML = [
+        ['cache',  tokensCached, cachePct, 'var(--good)'],
+        ['input',  uncachedIn,   inPct,    'var(--muted-2)'],
+        ['output', tokensOut,    outPct,   'var(--accent)'],
+      ].map(([label, count, pct, color]) =>
+        `<div class="token-row">` +
+          `<span class="t-label">${label}</span>` +
+          `<span class="t-track"><span class="t-fill" style="width:${pct}%;background:${color};"></span></span>` +
+          `<span class="t-count">${fmtTokens(count)}</span>` +
+        `</div>`
+      ).join('');
       $('usageConcurrent').textContent = fmt(upstreamConc);
       $('usageConcSub').textContent = `${localActive} active · ${localQueued} queued`;
       $('usageLimit').textContent = concLimit != null ? fmt(concLimit) : '--';
@@ -1289,37 +1325,42 @@
       // Only filter out models with no stats at all (no live TPS, no median, no p10).
       const used = models.filter((m) => m.tps > 0 || m.medianTps != null || m.p10Tps != null);
       if (!used.length) { el.innerHTML = ''; return; }
-      const row = (m) => {
-        const med = m.medianTps != null ? fmtTps(m.medianTps) : '--';
-        const p10 = m.p10Tps != null ? fmtTps(m.p10Tps) : '--';
-        const liveCls = m.tps > 0 ? 'ms-live' : 'ms-live idle';
+      // Scale bars relative to the highest median seen across all models.
+      const maxMed = Math.max(...used.map((m) => m.medianTps ?? 0), 1);
+      el.innerHTML = used.map((m) => {
+        const isLive = m.tps > 0;
+        const liveVal = isLive ? fmtTps(m.tps) : null;
+        const med = m.medianTps != null ? fmtTps(m.medianTps) : null;
+        const p10 = m.p10Tps != null ? fmtTps(m.p10Tps) : null;
+        const medPct = m.medianTps != null ? Math.round((m.medianTps / maxMed) * 100) : 0;
+        const p10Pct = m.p10Tps != null ? Math.round((m.p10Tps / maxMed) * 100) : 0;
+        const livePct = isLive ? Math.min(100, Math.round((m.tps / maxMed) * 100)) : 0;
         const st = String(lastStatusData?.models?.[m.model]?.status || '').toLowerCase();
         const badge = st === 'degraded' ? '<span class="ms-status warn">degraded</span>'
           : (st === 'down' || st === 'outage') ? `<span class="ms-status bad">${esc(st)}</span>` : '';
-        return `<div class="modelstats-row">
-          <span class="ms-name"><span class="ms-name-text">${esc(m.model)}</span>${badge}</span>
-          <span class="${liveCls}">${m.tps > 0 ? fmtTps(m.tps) : '—'}</span>
-          <span class="ms-med">${med}</span>
-          <span class="ms-p10">${p10}</span>
+        const rows = [
+          med != null ? `<div class="tps-row"><span class="t-label">med</span><span class="t-track"><span class="t-fill" style="width:${medPct}%;background:var(--muted-2);"></span></span><span class="t-count">${med}</span></div>` : '',
+          p10 != null ? `<div class="tps-row"><span class="t-label">p10</span><span class="t-track"><span class="t-fill" style="width:${p10Pct}%;background:var(--line-2);"></span></span><span class="t-count">${p10}</span></div>` : '',
+          isLive     ? `<div class="tps-row"><span class="t-label" style="color:var(--accent)">live</span><span class="t-track"><span class="t-fill" style="width:${livePct}%;background:var(--accent);"></span></span><span class="t-count" style="color:var(--accent)">${liveVal}</span></div>` : '',
+        ].filter(Boolean).join('');
+        const headline = isLive ? `<span style="color:var(--accent)">${liveVal}</span>` : (med ?? '—');
+        return `<div class="model-row">
+          <div class="model-row-name"><span class="mn-text">${esc(m.model)}</span>${badge}</div>
+          <div class="model-row-value">${headline} <span class="model-row-unit">tok/s</span></div>
+          <div class="model-row-bars">${rows}</div>
         </div>`;
-      };
-      el.innerHTML = `<div class="modelstats">
-        <div class="modelstats-row modelstats-head">
-          <span>model</span><span>live tok/s</span><span>median</span><span>p10 (low)</span>
-        </div>
-        ${used.map(row).join('')}
-      </div>`;
+      }).join('');
     }
 
-    // Local timer: between WS updates, re-render with a smooth TPS decay.
+    // Local timer: between WS updates, re-render to keep elapsed times live.
     // The server pushes ~1/sec; this keeps the numbers feeling live at 2fps.
     function scheduleSessionsTimer() {
       const hasActive = lastSessionsData?.sessions?.some((s) => s.active);
       if (hasActive && !sessionsTimer) {
         sessionsTimer = setInterval(() => {
           if (!lastSessionsData) return;
-          // Refresh elapsed times; TPS values come from the server's rolling
-          // window so we just re-render the last snapshot with updated elapsed.
+          // Refresh elapsed times; TPS values are estimated server-side per
+          // session, so we just re-render the last snapshot with updated elapsed.
           const data = lastSessionsData;
           const now = Date.now();
           data.sessions = data.sessions.map((s) => ({

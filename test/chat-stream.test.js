@@ -1,0 +1,366 @@
+'use strict';
+
+// Hot-path tests for the streaming pipe + SSE pre-filter.
+//
+// Two layers:
+//   1. createTapStream (Transform) + ChatTap pre-filter — isolated: feed SSE
+//      through the pipe, assert bytes pass through verbatim AND token counts
+//      are correct, including lines the pre-filter must skip (role/finish only).
+//   2. proxyRequest end-to-end — a real http.Server running the NEW pipeline
+//      code against a mock upstream: bytes forwarded, tokens counted, client
+//      disconnect aborts the upstream, and an upstream 500 surfaces as an SSE
+//      error event (headers already sent for streaming).
+
+const { test } = require('node:test');
+const assert = require('node:assert/strict');
+const http = require('node:http');
+const { Readable, Writable } = require('node:stream');
+const { pipeline } = require('node:stream/promises');
+
+const state = require('../lib/state');
+const { ChatTap, createTapStream } = require('../lib/chat-tap');
+const { proxyRequest } = require('../lib/chat');
+
+// ---- helpers --------------------------------------------------------------
+
+function sseOpenAI() {
+  // role-only line (prefilter must skip), two content deltas, usage chunk, [DONE].
+  return Buffer.from(
+    'data: {"id":"x","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}\n\n' +
+    'data: {"id":"x","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}\n\n' +
+    'data: {"id":"x","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":" world"},"finish_reason":null}]}\n\n' +
+    'data: {"id":"x","object":"chat.completion.chunk","created":1,"model":"m","choices":[],"finish_reason":"stop"}\n\n' +
+    'data: {"id":"x","object":"chat.completion.chunk","created":1,"model":"m","choices":[],"usage":{"prompt_tokens":3,"completion_tokens":2}}\n\n' +
+    'data: [DONE]\n\n',
+    'utf8',
+  );
+}
+
+function makeSession() {
+  return {
+    bytes: 0, chars: 0, outputTokens: 0, exactTokens: false, responseContent: '',
+    model: 'm', firstTokenAt: null, promptTokens: 0, cachedTokens: 0, completionTokens: 0,
+    groupKey: null,
+  };
+}
+
+function collect() {
+  const chunks = [];
+  const sink = new Writable({
+    write(chunk, enc, cb) { chunks.push(chunk); cb(); },
+  });
+  const done = () => Buffer.concat(chunks.map((c) => Buffer.isBuffer(c) ? c : Buffer.from(c)));
+  return { sink, done };
+}
+
+// ---- 1. createTapStream + pre-filter (isolated) ---------------------------
+
+test('TapStream forwards bytes verbatim and counts tokens (prefilter skips role/finish lines)', async () => {
+  state.modelCharRatio.clear();
+  const buf = sseOpenAI();
+  const session = makeSession();
+  const tap = new ChatTap(session, { stream: true, shape: 'openai' });
+  const { sink, done } = collect();
+
+  await pipeline(Readable.from([buf]), createTapStream(tap), sink);
+  tap.onEnd(); // flush deferred drain + finalize (mirrors proxyRequest finally)
+
+  // Bytes pass through unchanged.
+  assert.deepStrictEqual(done(), buf);
+  // Content accumulated from the two content deltas (role/finish skipped).
+  assert.strictEqual(session.responseContent, 'Hello world');
+  assert.strictEqual(session.chars, 11); // "Hello" + " world"
+  // Usage chunk set exact tokens.
+  assert.strictEqual(session.exactTokens, true);
+  assert.strictEqual(session.outputTokens, 2);
+  assert.strictEqual(session.completionTokens, 2);
+  assert.strictEqual(session.promptTokens, 3);
+  // bytes counted (every chunk, including skipped-parse ones).
+  assert.strictEqual(session.bytes, buf.length);
+});
+
+test('TapStream handles chunk boundaries that split an SSE line', async () => {
+  state.modelCharRatio.clear();
+  const buf = sseOpenAI();
+  // Split into 7-byte fragments so SSE lines span chunk boundaries — _drain's
+  // lineBuf must reassemble them. This is the realistic undici read regime.
+  const fragments = [];
+  for (let i = 0; i < buf.length; i += 7) fragments.push(buf.subarray(i, i + 7));
+  const session = makeSession();
+  const tap = new ChatTap(session, { stream: true, shape: 'openai' });
+  const { sink, done } = collect();
+
+  await pipeline(Readable.from(fragments), createTapStream(tap), sink);
+  tap.onEnd();
+
+  assert.deepStrictEqual(done(), buf);
+  assert.strictEqual(session.responseContent, 'Hello world');
+  assert.strictEqual(session.chars, 11);
+  assert.strictEqual(session.exactTokens, true);
+  assert.strictEqual(session.outputTokens, 2);
+});
+
+// ---- 2. proxyRequest end-to-end -----------------------------------------
+
+function seedState(upstreamBase) {
+  state.config = {
+    apiKey: 'test-key',
+    upstreamBaseURL: upstreamBase,
+    enabledModels: [],
+    requestTimeout: 30000,
+    proxyApiKeys: [],
+    overrideConcurrency: 0,
+  };
+  // Fresh usage/concurrency caches so the throttle admits immediately and
+  // refreshUsageSoon() is a no-op (no network fetch of /usage).
+  state.usageCache = { data: { ok: true }, time: Date.now() };
+  state.concurrencyCache = { concurrent: 0, limit: 100, softLimit: 10, time: Date.now() };
+  state.activeRequests = 0;
+  state.queuedRequests = 0;
+  state.throttleWaiters = [];
+  state.burstDisabledUntil = 0;
+  state.sessions.clear();
+  state.seenModels.clear();
+  state.modelCharRatio.clear();
+  state.groupSummaries.clear();
+  if (state.groupSummaryTimers) state.groupSummaryTimers.clear();
+  if (state.stateMapTimers) state.stateMapTimers.clear();
+  if (state.sessionsBroadcastTimer) { clearTimeout(state.sessionsBroadcastTimer); state.sessionsBroadcastTimer = null; }
+  if (state.refreshUsageTimer) { clearTimeout(state.refreshUsageTimer); state.refreshUsageTimer = null; }
+  state.broadcastThrottled = false;
+}
+
+function startProxy() {
+  return new Promise((resolve) => {
+    const server = http.createServer((req, res) => {
+      proxyRequest(req, res, { shape: 'openai' });
+    });
+    server.listen(0, '127.0.0.1', () => resolve(server));
+  });
+}
+
+function startUpstream(handler) {
+  return new Promise((resolve) => {
+    const server = http.createServer(handler);
+    server.listen(0, '127.0.0.1', () => resolve(server));
+  });
+}
+
+function bodyOf(req) {
+  return JSON.stringify({ model: 'm', messages: [{ role: 'user', content: 'hi' }], stream: true, ...req });
+}
+
+test('streaming: forwards bytes verbatim and counts tokens via the pipe', async () => {
+  const sse = sseOpenAI();
+  const upstream = await startUpstream((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+    res.end(sse);
+  });
+  const proxy = await startProxy();
+  seedState(`http://127.0.0.1:${upstream.address().port}`);
+
+  const resp = await fetch(`http://127.0.0.1:${proxy.address().port}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: bodyOf({ stream: true }),
+  });
+  const text = await resp.text();
+  await new Promise((r) => setTimeout(r, 5)); // let trailing setImmediate drain flush
+
+  assert.strictEqual(resp.status, 200);
+  assert.strictEqual(text, sse.toString('utf8')); // bytes forwarded verbatim
+
+  const session = state.sessions.values().next().value;
+  assert.ok(session, 'session recorded');
+  assert.strictEqual(session.exactTokens, true);
+  assert.strictEqual(session.outputTokens, 2);
+  // onFinalize clears responseContent after coalescing — assert the durable
+  // post-finalize outputs instead: status, exact tokens, and a finalTps
+  // computed from the counted output tokens.
+  assert.strictEqual(session.status, 'done');
+  assert.ok(session.finalTps > 0, 'finalTps computed from counted tokens');
+
+  proxy.close(); upstream.close();
+});
+
+test('non-streaming: forwards body and counts exact tokens', async () => {
+  const json = Buffer.from(JSON.stringify({
+    id: 'x', object: 'chat.completion', model: 'm',
+    choices: [{ index: 0, message: { role: 'assistant', content: 'Hi there' }, finish_reason: 'stop' }],
+    usage: { prompt_tokens: 4, completion_tokens: 3 },
+  }));
+  const upstream = await startUpstream((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(json);
+  });
+  const proxy = await startProxy();
+  seedState(`http://127.0.0.1:${upstream.address().port}`);
+
+  const resp = await fetch(`http://127.0.0.1:${proxy.address().port}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: 'm', messages: [{ role: 'user', content: 'hi' }] }),
+  });
+  const text = await resp.text();
+  await new Promise((r) => setTimeout(r, 5));
+
+  assert.strictEqual(resp.status, 200);
+  assert.strictEqual(text, json.toString('utf8'));
+  const session = state.sessions.values().next().value;
+  assert.ok(session);
+  assert.strictEqual(session.exactTokens, true);
+  assert.strictEqual(session.outputTokens, 3);
+  assert.strictEqual(session.status, 'done');
+  assert.ok(session.finalTps > 0, 'finalTps computed from counted tokens');
+
+  proxy.close(); upstream.close();
+});
+
+test('client disconnect mid-stream aborts the upstream connection', async () => {
+  // Upstream streams slowly; records whether its response closed BEFORE all
+  // chunks were sent (i.e. the proxy aborted the fetch on client disconnect).
+  const total = 8;
+  const upstreamState = { sent: 0, aborted: false, done: false };
+  const upstream = await startUpstream((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+    let i = 0;
+    res.on('close', () => { if (!upstreamState.done) upstreamState.aborted = true; });
+    const pump = () => {
+      if (i >= total) { upstreamState.done = true; res.end(); return; }
+      upstreamState.sent = ++i;
+      res.write(`data: {"choices":[{"delta":{"content":"x"}}]}\n\n`);
+      setTimeout(pump, 25);
+    };
+    pump();
+  });
+  const proxy = await startProxy();
+  seedState(`http://127.0.0.1:${upstream.address().port}`);
+
+  const ac = new AbortController();
+  const resp = await fetch(`http://127.0.0.1:${proxy.address().port}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: bodyOf({ stream: true }),
+    signal: ac.signal,
+  });
+  const reader = resp.body.getReader();
+  await reader.read(); // receive first chunk, then bail
+  ac.abort();
+  try { await reader.read(); } catch {}
+
+  // Give the abort time to propagate: client close -> proxy res close ->
+  // controller.abort -> upstream fetch abort -> upstream res close.
+  await new Promise((r) => setTimeout(r, 250));
+
+  assert.ok(upstreamState.aborted, `upstream was not aborted (sent ${upstreamState.sent}/${total})`);
+  const session = state.sessions.values().next().value;
+  assert.ok(session);
+  assert.strictEqual(session.status, 'aborted');
+
+  proxy.close(); upstream.close();
+});
+
+test('upstream 500 on a streaming request surfaces as an SSE error event', async () => {
+  const upstream = await startUpstream((req, res) => {
+    res.writeHead(500, { 'Content-Type': 'application/json' });
+    res.end(Buffer.from(JSON.stringify({ error: 'boom' })));
+  });
+  const proxy = await startProxy();
+  seedState(`http://127.0.0.1:${upstream.address().port}`);
+
+  const resp = await fetch(`http://127.0.0.1:${proxy.address().port}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: bodyOf({ stream: true }),
+  });
+  const text = await resp.text();
+
+  // Streaming sends 200 + SSE headers first; the 500 must arrive as an SSE error.
+  assert.strictEqual(resp.status, 200);
+  assert.match(text, /data:\s*{"error":/);
+  assert.match(text, /upstream 500/);
+
+  proxy.close(); upstream.close();
+});
+
+// ---- scan correctness: escapes, surrogate emoji, deferred content decode ----
+
+test('scan counts chars with escapes + emoji and decodes responseContent (deferred) to match JSON', async () => {
+  state.modelCharRatio.clear();
+  // newline, escaped quotes, escaped backslash, a surrogate-pair emoji, non-ASCII
+  const content = 'line1\nline2 "quoted" \\backslash \uD83D\uDE00 café end';
+  const reasoning = 'thinking about it';
+  const lines = [
+    'data: ' + JSON.stringify({ id: 'c1', object: 'chat.completion.chunk', model: 'm', choices: [{ index: 0, delta: { content }, finish_reason: null }] }),
+    'data: ' + JSON.stringify({ id: 'c2', object: 'chat.completion.chunk', model: 'm', choices: [{ index: 0, delta: { reasoning_content: reasoning }, finish_reason: null }] }),
+    'data: ' + JSON.stringify({ id: 'u', object: 'chat.completion.chunk', model: 'm', choices: [], usage: { prompt_tokens: 5, completion_tokens: 7 } }),
+    'data: [DONE]',
+  ];
+  const buf = Buffer.from(lines.join('\n\n') + '\n\n', 'utf8');
+  const session = makeSession();
+  const tap = new ChatTap(session, { stream: true, shape: 'openai' });
+  const { sink, done } = collect();
+
+  await pipeline(Readable.from([buf]), createTapStream(tap), sink);
+  tap.onEnd();
+
+  assert.deepStrictEqual(done(), buf); // bytes forwarded verbatim
+  // Both content and reasoning contribute to the char estimate.
+  assert.strictEqual(session.chars, content.length + reasoning.length);
+  // responseContent is the DECODED content only (reasoning excluded), via the
+  // deferred decode at _finish — must match what JSON.parse would produce.
+  assert.strictEqual(session.responseContent, content);
+  assert.strictEqual(session.exactTokens, true);
+  assert.strictEqual(session.outputTokens, 7);
+});
+
+test('scan does not false-match a "content":" literal embedded in the content value', async () => {
+  state.modelCharRatio.clear();
+  // The value itself contains the bytes "content":" — JSON escapes the quotes,
+  // so the scan must find only the real key and stop at the real closing quote.
+  const content = 'the key "content":"x" is here';
+  const buf = Buffer.from(
+    'data: ' + JSON.stringify({ id: 'c', object: 'chat.completion.chunk', model: 'm', choices: [{ index: 0, delta: { content }, finish_reason: null }] }) + '\n\n' +
+    'data: [DONE]\n\n', 'utf8');
+  const session = makeSession();
+  const tap = new ChatTap(session, { stream: true, shape: 'openai' });
+  const { sink, done } = collect();
+
+  await pipeline(Readable.from([buf]), createTapStream(tap), sink);
+  tap.onEnd();
+
+  assert.deepStrictEqual(done(), buf);
+  assert.strictEqual(session.chars, content.length);
+  assert.strictEqual(session.responseContent, content);
+});
+
+test('Anthropic streaming: counts text+thinking, decodes responseContent, exact usage', async () => {
+  state.modelCharRatio.clear();
+  // Anthropic emits event:/data: pairs; only data: lines parse. text_delta
+  // accumulates responseContent; thinking_delta counts chars only.
+  const buf = Buffer.from(
+    'event: message_start\n' +
+    'data: {"type":"message_start","message":{"usage":{"input_tokens":5,"cache_read_input_tokens":2}}}\n\n' +
+    'event: content_block_delta\n' +
+    'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello world"}}\n\n' +
+    'event: content_block_delta\n' +
+    'data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"reasoning"}}\n\n' +
+    'event: message_delta\n' +
+    'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":7}}\n\n' +
+    'event: message_stop\n' +
+    'data: [DONE]\n\n', 'utf8');
+  const session = makeSession();
+  const tap = new ChatTap(session, { stream: true, shape: 'anthropic' });
+  const { sink, done } = collect();
+
+  await pipeline(Readable.from([buf]), createTapStream(tap), sink);
+  tap.onEnd();
+
+  assert.deepStrictEqual(done(), buf);
+  assert.strictEqual(session.chars, 'Hello world'.length + 'reasoning'.length);
+  assert.strictEqual(session.responseContent, 'Hello world'); // thinking excluded
+  assert.strictEqual(session.exactTokens, true);
+  assert.strictEqual(session.outputTokens, 7);
+  assert.strictEqual(session.promptTokens, 5);
+  assert.strictEqual(session.cachedTokens, 2);
+});

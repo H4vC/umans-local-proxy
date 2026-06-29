@@ -610,3 +610,68 @@ test('coalescing: turn 2 joins turn 1 group when the assistant replay matches', 
 
   await closeServer(proxy); await closeServer(upstream);
 });
+
+// ---- live tok/s + TTFT surface during streaming (E2E) ----
+
+test('live snapshot shows tps > 0 and ttftMs during an active stream', async () => {
+  // Stream SSE chunks with 50ms gaps over ~700ms so the session stays active
+  // long enough for the tap worker's 100ms sync throttle to fire multiple
+  // times with non-zero outputTokens. The first sync (from the role-only
+  // chunk) carries outputTokens=0; real content syncs land ~100ms later.
+  const chunks = [
+    'data: {"id":"x","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{"role":"assistant"}}]}\n\n',
+    'data: {"id":"x","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{"content":"Hello "}}]}\n\n',
+    'data: {"id":"x","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{"content":"world "}}]}\n\n',
+    'data: {"id":"x","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{"content":"streaming "}}]}\n\n',
+    'data: {"id":"x","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{"content":"tokens "}}]}\n\n',
+    'data: {"id":"x","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{"content":"through "}}]}\n\n',
+    'data: {"id":"x","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{"content":"the "}}]}\n\n',
+    'data: {"id":"x","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{"content":"pipe "}}]}\n\n',
+    'data: {"id":"x","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{"content":"now "}}]}\n\n',
+    'data: {"id":"x","object":"chat.completion.chunk","model":"m","choices":[],"finish_reason":"stop"}\n\n',
+    'data: {"id":"x","object":"chat.completion.chunk","model":"m","choices":[],"usage":{"prompt_tokens":2,"completion_tokens":9}}\n\n',
+    'data: [DONE]\n\n',
+  ];
+  const upstream = await startUpstream((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+    let i = 0;
+    const send = () => {
+      if (i < chunks.length) { res.write(chunks[i++]); setTimeout(send, 50); }
+      else res.end();
+    };
+    setTimeout(send, 50);
+  });
+  const proxy = await startProxy();
+  seedState(`http://127.0.0.1:${upstream.address().port}`);
+  const { getSessionsSnapshot } = require('../lib/sessions');
+
+  const port = proxy.address().port;
+  const fetchPromise = fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: 'm', messages: [{ role: 'user', content: 'hi' }], stream: true }),
+  });
+
+  // Wait until multiple content syncs have fired (~350ms: role sync at ~70ms,
+  // first content sync at ~170ms, second at ~270ms — all well within the
+  // ~600ms stream).
+  await new Promise((r) => setTimeout(r, 350));
+  const snap = getSessionsSnapshot();
+  const active = snap.sessions.find((s) => s.active);
+  assert.ok(active, 'an active session exists mid-stream');
+  assert.ok(active.tps > 0, `active session tps > 0 (got ${active.tps})`);
+  assert.ok(active.ttftMs != null && active.ttftMs >= 0, `active session ttftMs set (got ${active.ttftMs})`);
+
+  // Let the stream finish and check the finalized session.
+  const resp = await fetchPromise;
+  await resp.text();
+  await new Promise((r) => setTimeout(r, 30)); // let tap.onEnd + finalizeSession run
+  const snap2 = getSessionsSnapshot();
+  const done = snap2.sessions.find((s) => !s.active);
+  assert.ok(done, 'a finished session exists');
+  assert.ok(done.finalTps > 0, `finished session finalTps > 0 (got ${done.finalTps})`);
+  assert.ok(done.ttftMs != null && done.ttftMs >= 0, `finished session ttftMs set (got ${done.ttftMs})`);
+  assert.ok(snap2.aggregate.ttftMsP50 != null, 'aggregate ttftMsP50 set from finished sessions');
+  assert.ok(snap2.aggregate.medianTps != null, 'aggregate medianTps (tok/s p50) set from finished sessions');
+
+  await closeServer(proxy); await closeServer(upstream);
+});

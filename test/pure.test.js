@@ -932,3 +932,24 @@ test('coalescing survives a cache_control marker shift between turns (fix)', () 
     assert.notStrictEqual(r3.groupKey, r1.groupKey, 'different content still forks');
   } finally { restoreCoalesceState(orig); }
 });
+
+test('coalescing survives string→array content promotion (cache_control attach)', () => {
+  // Claude Code sends a user message as a plain string on turn 1, then
+  // promotes it to [{type:'text',text:…,cache_control:…}] on turn 2 to cache
+  // it. stableContent normalizes text-only arrays to joined text so the prefix
+  // hash stays stable across the string↔array promotion.
+  const orig = resetCoalesceState();
+  try {
+    const model = 'm';
+    const user1str = { role: 'user', content: 'hi' };
+    const r1 = resolveGroupKey(model, [user1str]);
+    storeStateKey(model, [user1str], 'Hello', r1.groupKey, r1.prefixChain);
+    // Turn 2: same user message promoted to a text-block array with cache_control.
+    const user1arr = { role: 'user', content: [{ type: 'text', text: 'hi', cache_control: { type: 'ephemeral' } }] };
+    const r2 = resolveGroupKey(model, [user1arr, { role: 'assistant', content: 'Hello' }, { role: 'user', content: 'bye' }]);
+    assert.strictEqual(r2.groupKey, r1.groupKey, 'string→array promotion must not break coalescing');
+    // A genuinely different user message still forks.
+    const r3 = resolveGroupKey(model, [{ role: 'user', content: [{ type: 'text', text: 'different' }] }]);
+    assert.notStrictEqual(r3.groupKey, r1.groupKey, 'different text still forks');
+  } finally { restoreCoalesceState(orig); }
+});

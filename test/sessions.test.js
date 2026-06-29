@@ -143,3 +143,51 @@ test('session view exposes exactTokens (exact once usage arrives)', () => {
   const snap = sessions.getSessionsSnapshot();
   assert.equal(snap.sessions[0].exactTokens, true);
 });
+
+// ---- proxy-derived TTFT metrics (local, not upstream) ----
+
+test('session view exposes ttftMs from firstTokenAt', () => {
+  reset();
+  const startedAt = Date.now() - 5000;
+  mk({ model: 'gpt-5', status: 'done', startedAt, firstTokenAt: startedAt + 800, finalTps: 50, endedAt: Date.now() });
+  const snap = sessions.getSessionsSnapshot();
+  assert.equal(snap.sessions[0].ttftMs, 800);
+});
+
+test('session view ttftMs is null when firstTokenAt is missing', () => {
+  reset();
+  mk({ model: 'gpt-5', status: 'done', finalTps: 50, endedAt: Date.now() });
+  const snap = sessions.getSessionsSnapshot();
+  assert.equal(snap.sessions[0].ttftMs, null);
+});
+
+test('aggregate ttftMsP50 is the median of finished sessions TTFT', () => {
+  reset();
+  const t = Date.now() - 10000;
+  mk({ model: 'gpt-5', status: 'done', startedAt: t, firstTokenAt: t + 100, finalTps: 50, endedAt: Date.now() });
+  mk({ model: 'gpt-5', status: 'done', startedAt: t, firstTokenAt: t + 300, finalTps: 60, endedAt: Date.now() });
+  mk({ model: 'gpt-5', status: 'done', startedAt: t, firstTokenAt: t + 500, finalTps: 70, endedAt: Date.now() });
+  const snap = sessions.getSessionsSnapshot();
+  assert.equal(snap.aggregate.ttftMsP50, 300, 'p50 = median of {100,300,500}');
+});
+
+test('aggregate ttftMsP50 excludes active sessions', () => {
+  reset();
+  const t = Date.now() - 10000;
+  mk({ model: 'gpt-5', status: 'done', startedAt: t, firstTokenAt: t + 200, finalTps: 50, endedAt: Date.now() });
+  mk({ model: 'gpt-5', status: 'active', startedAt: t, firstTokenAt: t + 9999, tps: 30 });
+  const snap = sessions.getSessionsSnapshot();
+  assert.equal(snap.aggregate.ttftMsP50, 200, 'only the finished session contributes');
+});
+
+test('per-model ttftMsP50 surfaces in the snapshot models array', () => {
+  reset();
+  const t = Date.now() - 10000;
+  mk({ model: 'claude', status: 'done', startedAt: t, firstTokenAt: t + 120, finalTps: 40, endedAt: Date.now() });
+  mk({ model: 'gpt-5', status: 'done', startedAt: t, firstTokenAt: t + 400, finalTps: 50, endedAt: Date.now() });
+  const snap = sessions.getSessionsSnapshot();
+  const claude = snap.aggregate.models.find((m) => m.model === 'claude');
+  const gpt5 = snap.aggregate.models.find((m) => m.model === 'gpt-5');
+  assert.equal(claude.ttftMsP50, 120);
+  assert.equal(gpt5.ttftMsP50, 400);
+});

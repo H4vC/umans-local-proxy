@@ -1,4 +1,5 @@
 'use strict';
+require('./fetch-guard');
 
 // Behavior tests for per-session tok/s estimation. The dashboard's live tok/s
 // is driven by each in-flight session's own rolling TPS_WINDOW_MS rate (fed by

@@ -1,16 +1,18 @@
 'use strict';
+require('./fetch-guard');
 
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 
 const { fnv1a, fnv1a32, fnv1aMixNum } = require('../lib/hash');
-const { parseDuration, parseListenAddr, cleanKeys, fileProxyApiKeys, readConfigFile, isLoopbackHost } = require('../lib/config');
+const { parseDuration, parseListenAddr, cleanKeys, fileProxyApiKeys, readConfigFile, isLoopbackHost, normalizeSessionCookie } = require('../lib/config');
 const { snapReasoningLevel, enrichModelsWithReasoning, REASONING_RANK } = require('../lib/reasoning');
 const { firstNumber, concurrencyHardLimit, percentValue, burstQuota, concurrencyQuotaLimit, applyOverride, extractThrottle, getEffectiveConcurrency, canStart, acquireThrottleSlot, releaseThrottleSlot, notifyUpstream429, BURST_COOLDOWN_FILE } = require('../lib/concurrency');
 const { canonicalMessage, messageHash, chainHash, resolveGroupKey, storeStateKey } = require('../lib/coalesce');
 const { authorized, wsUpgradeAllowed, isLoopback, safeHeaders, requiresProxyAuth } = require('../lib/auth');
 const { createSession, finalizeSession } = require('../lib/sessions');
 const { projectStatus } = require('../lib/upstream');
+const { decide429Backoff, CAP_HEALTH_BASELINE_FILE } = require('../lib/cap-health');
 const state = require('../lib/state');
 const { readBody } = require('../lib/http');
 const { PassThrough } = require('node:stream');
@@ -275,6 +277,30 @@ test('fileProxyApiKeys extracts .key from objects', () => {
 
 test('fileProxyApiKeys empty when no API_KEYS', () => {
   assert.deepStrictEqual(fileProxyApiKeys({}), []);
+});
+
+// ---- config: normalizeSessionCookie (paste just the token) ----
+
+test('normalizeSessionCookie wraps a bare token with the cookie name', () => {
+  assert.strictEqual(normalizeSessionCookie('eyJabc.def.sig'), '__Secure-authjs.session-token=eyJabc.def.sig');
+});
+
+test('normalizeSessionCookie passes a full name=value header through as-is', () => {
+  assert.strictEqual(normalizeSessionCookie('__Secure-authjs.session-token=eyJabc.def.sig'), '__Secure-authjs.session-token=eyJabc.def.sig');
+});
+
+test('normalizeSessionCookie passes a full multi-cookie header through as-is', () => {
+  assert.strictEqual(normalizeSessionCookie('__Secure-authjs.session-token=eyJabc.def.sig; other=foo'), '__Secure-authjs.session-token=eyJabc.def.sig; other=foo');
+});
+
+test('normalizeSessionCookie strips a leading "Cookie:" prefix', () => {
+  assert.strictEqual(normalizeSessionCookie('Cookie: __Secure-authjs.session-token=eyJabc.def.sig'), '__Secure-authjs.session-token=eyJabc.def.sig');
+});
+
+test('normalizeSessionCookie returns empty for empty/whitespace/null input', () => {
+  assert.strictEqual(normalizeSessionCookie(''), '');
+  assert.strictEqual(normalizeSessionCookie('   '), '');
+  assert.strictEqual(normalizeSessionCookie(null), '');
 });
 
 // ---- reasoning: snapReasoningLevel ----
@@ -782,7 +808,7 @@ test('canStart treats a null limit as unlimited after the first /usage fetch (C2
 test('notifyUpstream429 does not wake queued waiters (cascade guard, C5)', () => {
   const s = require('../lib/state');
   const orig = { config: s.config, concurrencyCache: s.concurrencyCache, burstDisabledUntil: s.burstDisabledUntil, throttleWaiters: s.throttleWaiters, activeRequests: s.activeRequests, queuedRequests: s.queuedRequests, usageCache: s.usageCache };
-  s.config = { ...s.config, overrideConcurrency: 0 };
+  s.config = { ...s.config, overrideConcurrency: 0, sessionCookie: '' };
   // A waiter WOULD be woken here (canStart true): limit 10, soft 5, nothing
   // active. The fix is that notifyUpstream429 skips the wake entirely.
   s.concurrencyCache = { concurrent: 0, limit: 10, softLimit: 5, boxedUntil: null, time: Date.now() };
@@ -800,6 +826,97 @@ test('notifyUpstream429 does not wake queued waiters (cascade guard, C5)', () =>
     s.throttleWaiters = orig.throttleWaiters; s.activeRequests = orig.activeRequests; s.queuedRequests = orig.queuedRequests;
     s.usageCache = orig.usageCache;
     s.burstDisabledUntil = 0;
+    try { fs.rmSync(BURST_COOLDOWN_FILE, { force: true }); } catch {}
+  }
+});
+
+// ---- cap-health 429 backoff gate ----
+
+test('decide429Backoff arms on increment', () => {
+  assert.strictEqual(decide429Backoff(5, 6), true);
+});
+
+test('decide429Backoff does not arm when unchanged', () => {
+  assert.strictEqual(decide429Backoff(5, 5), false);
+});
+
+test('decide429Backoff does not arm on decrement (new-day reset)', () => {
+  assert.strictEqual(decide429Backoff(5, 1), false);
+});
+
+test('decide429Backoff fail-safe arms when current unknown (fetch failed)', () => {
+  assert.strictEqual(decide429Backoff(5, null), true);
+});
+
+test('decide429Backoff fail-safe arms when no prior baseline (first fetch)', () => {
+  assert.strictEqual(decide429Backoff(null, 3), true);
+});
+
+test('decide429Backoff arms when both unknown', () => {
+  assert.strictEqual(decide429Backoff(null, null), true);
+});
+
+test('notifyUpstream429 without a cookie arms synchronously (legacy fail-safe)', () => {
+  const s = require('../lib/state');
+  const orig = { config: s.config, burstDisabledUntil: s.burstDisabledUntil };
+  s.config = { ...s.config, sessionCookie: '' };
+  s.burstDisabledUntil = 0;
+  try {
+    notifyUpstream429();
+    assert.ok(s.burstDisabledUntil > Date.now(), 'no cookie → arm immediately');
+  } finally {
+    s.config = orig.config; s.burstDisabledUntil = 0;
+    try { fs.rmSync(BURST_COOLDOWN_FILE, { force: true }); } catch {}
+  }
+});
+
+test('notifyUpstream429 with cookie arms only when blocksToday increments', async () => {
+  const s = require('../lib/state');
+  const origFetch = global.fetch;
+  const orig = { config: s.config, burstDisabledUntil: s.burstDisabledUntil, lastBlocksToday: s.lastBlocksToday, capHealthCache: s.capHealthCache, capHealthInFlight: s.capHealthInFlight };
+  let nextBlocks = 5;
+  global.fetch = async () => ({ status: 200, json: async () => ({ blocksToday: nextBlocks }) });
+  s.config = { ...s.config, sessionCookie: 'test-cookie' };
+  s.burstDisabledUntil = 0;
+  s.lastBlocksToday = 5;                 // baseline == current → no increment
+  s.capHealthCache = { data: null, time: 0 };
+  s.capHealthInFlight = null;
+  try {
+    notifyUpstream429();
+    await new Promise(r => setImmediate(r));   // flush the fire-and-forget gate (fetchCapHealth is async → its wrapper promise resolves after the raw IIFE)
+    assert.strictEqual(s.burstDisabledUntil, 0, 'no arm when blocksToday unchanged');
+
+    nextBlocks = 6;                       // increment → real cap block
+    notifyUpstream429();
+    await new Promise(r => setImmediate(r));
+    assert.ok(s.burstDisabledUntil > Date.now(), 'arms when blocksToday incremented');
+  } finally {
+    global.fetch = origFetch;
+    s.config = orig.config; s.burstDisabledUntil = 0; s.lastBlocksToday = orig.lastBlocksToday;
+    s.capHealthCache = orig.capHealthCache; s.capHealthInFlight = orig.capHealthInFlight;
+    try { fs.rmSync(BURST_COOLDOWN_FILE, { force: true }); } catch {}
+    try { fs.rmSync(CAP_HEALTH_BASELINE_FILE, { force: true }); } catch {}
+  }
+});
+
+test('notifyUpstream429 with cookie arms fail-safe when cap-health fetch fails', async () => {
+  const s = require('../lib/state');
+  const origFetch = global.fetch;
+  const orig = { config: s.config, burstDisabledUntil: s.burstDisabledUntil, lastBlocksToday: s.lastBlocksToday, capHealthCache: s.capHealthCache, capHealthInFlight: s.capHealthInFlight };
+  global.fetch = async () => { throw new Error('network down'); };
+  s.config = { ...s.config, sessionCookie: 'test-cookie' };
+  s.burstDisabledUntil = 0;
+  s.lastBlocksToday = 5;
+  s.capHealthCache = { data: null, time: 0 };
+  s.capHealthInFlight = null;
+  try {
+    notifyUpstream429();
+    await new Promise(r => setImmediate(r));
+    assert.ok(s.burstDisabledUntil > Date.now(), 'fetch failure → arm fail-safe');
+  } finally {
+    global.fetch = origFetch;
+    s.config = orig.config; s.burstDisabledUntil = 0; s.lastBlocksToday = orig.lastBlocksToday;
+    s.capHealthCache = orig.capHealthCache; s.capHealthInFlight = orig.capHealthInFlight;
     try { fs.rmSync(BURST_COOLDOWN_FILE, { force: true }); } catch {}
   }
 });

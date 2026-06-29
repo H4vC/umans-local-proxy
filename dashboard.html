@@ -248,6 +248,10 @@
     .stat.accent strong { color: var(--accent-ink); }
     .stat .sub { color: var(--muted-2); font-size: 11px; margin-top: 5px; text-transform: none; letter-spacing: 0; font-weight: 400; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .stat .sub.token-rows { white-space: normal; overflow: visible; display: flex; flex-direction: column; gap: 5px; }
+    .stat .sub.limit-lines { white-space: normal; overflow: visible; display: flex; flex-direction: column; gap: 2px; }
+    .stat .sub.limit-lines .ll { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; }
+    .stat .sub.limit-lines .k { color: var(--muted-2); font-size: 11px; font-weight: 400; text-transform: none; letter-spacing: 0; }
+    .stat .sub.limit-lines .v { font-size: 11px; font-weight: 600; text-transform: none; letter-spacing: 0; font-variant-numeric: tabular-nums; }
     /* ── Per-model TPS bars + token bars ─────────────────────────────────────── */
     #modelStats { margin-top: 12px; display: flex; flex-direction: column; gap: 6px; }
     .model-row { display: flex; align-items: center; gap: 16px; background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 10px 16px; }
@@ -600,6 +604,8 @@
         <input id="proxyKey" type="password" autocomplete="off" placeholder="Only needed when API_KEYS is configured">
         <label for="apiKey">UMANS API key</label>
         <input id="apiKey" type="password" autocomplete="off" placeholder="sk-...">
+        <label for="sessionCookie">UMANS session cookie</label>
+        <input id="sessionCookie" type="password" autocomplete="off" placeholder="Optional — app.umans.ai cap-health. Paste the __Secure-authjs.session-token value (token only, or full cookie). DevTools → Application → Cookies → app.umans.ai">
         <label for="timeout">Request timeout</label>
         <input id="timeout" placeholder="15m">
         <label for="overrideConcurrency">Override concurrency (0 = use UMANS limits)</label>
@@ -681,6 +687,12 @@
             <tr><th>last reload</th><td id="adminLastReload" class="v">—</td></tr>
           </tbody></table></div>
         </div>
+        <h2 style="margin-top:8px;">Cap health</h2>
+        <p class="sub" style="margin:0 0 10px;color:var(--muted);font-size:13px;">Account cap/abuse status from <code>app.umans.ai/api/account/cap-health</code>. Requires a UMANS session cookie (Configuration). On a 429, the proxy fetches this and only arms the burst cooldown if <code>blocksToday</code> incremented since the last check.</p>
+        <div class="btn-row" style="margin:0 0 4px;">
+          <button class="btn tonal" id="capHealthRefreshBtn">Refresh cap health</button>
+        </div>
+        <details class="details-wrap" open><summary>Raw cap-health</summary><pre id="capHealthOut"></pre></details>
         <div class="admin-actions">
           <button class="btn tonal" id="adminRefreshBtn">Refresh info</button>
           <button class="btn tonal" id="adminReloadBtn">Reload code</button>
@@ -799,8 +811,9 @@
 
     let lastUsageData = null;
     let cooldownUntil = null;      // ms epoch of the active 429 burst cooldown — drives the client-side countdown
-    let baseLimitSub = '';          // limit-box sub-text segments without the cooldown line
+    let baseLimitLines = [];      // limit-box rows from concurrency limits (without the cooldown/cap rows)
     let lastQueued = 0;            // last queued count, for the delay-banner reason
+    let lastCapHealth = null;      // last cap-health result (app.umans.ai) — rendered into the limit box
 
     function updateDelayBanner(queued) {
       lastQueued = number(queued);
@@ -816,7 +829,13 @@
       const until = cooldownUntil;
       const left = until ? timeUntil(new Date(until).toISOString()) : '';
       const active = !!left;
-      $('usageLimitSub').textContent = (active ? `429 cooldown · ${left} left` : '') + (active && baseLimitSub ? ' · ' : '') + baseLimitSub;
+      const rows = [];
+      if (active) rows.push({ k: '429 cooldown', v: `${left} left`, cls: 'v warn' });
+      rows.push(...capHealthLines());
+      rows.push(...baseLimitLines);
+      const sub = $('usageLimitSub');
+      sub.innerHTML = renderLimitLines(rows);
+      sub.classList.toggle('limit-lines', rows.length > 0);
       const chips = $('chips');
       let chip = document.getElementById('cooldownChip');
       if (active) {
@@ -832,6 +851,47 @@
       }
       const cdb = $('clearCooldownBtn');
       if (cdb) cdb.disabled = !active;
+    }
+    // Cap-health rows for the limit-box breakdown. Returns [{k,v,cls}] — one
+    // per line. Empty when no cookie / no data, so the limit box stays clean.
+    function capHealthLines() {
+      const cap = lastCapHealth;
+      if (!cap || cap.ok === false || !cap.data) return [];
+      const d = cap.data;
+      const blocks = typeof d.blocksToday === 'number' ? d.blocksToday : null;
+      const thresh = typeof d.capAbuseThreshold === 'number' ? d.capAbuseThreshold : null;
+      const rows = [];
+      if (d.pausedUntil) {
+        rows.push({ k: 'status', v: 'suspended', cls: 'v bad' });
+        const left = timeUntil(d.pausedUntil);
+        if (left) rows.push({ k: 'resumes', v: left, cls: 'v num' });
+      } else if (d.available === false || (d.status && d.status !== 'active')) {
+        rows.push({ k: 'status', v: d.status || 'paused', cls: 'v warn' });
+      }
+      if (blocks != null && thresh != null && thresh > 0) {
+        const ratio = blocks / thresh;
+        const cls = ratio >= 0.8 ? 'v bad' : ratio >= 0.5 ? 'v warn' : 'v good';
+        rows.push({ k: 'cap', v: `${blocks}/${thresh}`, cls });
+        if (blocks > 0 && d.replenishAt) {
+          const left = timeUntil(d.replenishAt);
+          if (left) rows.push({ k: 'resets', v: left, cls: 'v num' });
+        }
+      }
+      return rows;
+    }
+    // Render limit-box breakdown rows as a stacked label/value list.
+    function renderLimitLines(rows) {
+      return rows.map((r) => `<div class="ll"><span class="k">${esc(r.k)}</span><span class="${r.cls || 'v num'}">${esc(r.v)}</span></div>`).join('');
+    }
+    // Poll cap-health for the Overview limit box. Server-side TTL is 30s, so
+    // this is a cache hit except once per window. Fire-and-forget; never
+    // surfaces errors (the admin panel's raw view is the diagnostic surface).
+    async function refreshCapHealthOverview() {
+      try {
+        const cap = await json('/api/umans/cap-health');
+        lastCapHealth = cap;
+        renderCooldown();
+      } catch {}
     }
     function renderUsage(data) {
       lastUsageData = data;
@@ -883,14 +943,13 @@
       $('usageConcSub').textContent = `${localActive} active · ${localQueued} queued`;
       $('usageLimit').textContent = concLimit != null ? fmt(concLimit) : '--';
       const used = Math.max(upstreamConc, localActive);
-      const limitSub = [];
-      if (throttle.overridden) limitSub.push(quotaLimit && quotaLimit !== concLimit ? `overridden from ${fmt(quotaLimit)}` : 'overridden');
-      if (concSoft != null && concSoft !== concLimit) limitSub.push(`soft ${fmt(concSoft)}`);
-      if (concHard != null && concHard !== concLimit) limitSub.push(`hard ${fmt(concHard)}`);
+      baseLimitLines = [];
+      if (throttle.overridden) baseLimitLines.push({ k: 'override', v: (quotaLimit && quotaLimit !== concLimit) ? `from ${fmt(quotaLimit)}` : 'on', cls: 'v accent' });
+      if (concSoft != null && concSoft !== concLimit) baseLimitLines.push({ k: 'soft', v: fmt(concSoft), cls: 'v num' });
+      if (concHard != null && concHard !== concLimit) baseLimitLines.push({ k: 'hard', v: fmt(concHard), cls: 'v num' });
       if (concHard != null && concSoft != null && concHard > concSoft) {
-        limitSub.push(`burst quota ${Math.round((throttle.burstQuota ?? 0) * 100)}%`);
+        baseLimitLines.push({ k: 'burst', v: `${Math.round((throttle.burstQuota ?? 0) * 100)}%`, cls: 'v num' });
       }
-      baseLimitSub = limitSub.join(' · ');
       $('concUsed').textContent = fmt(used);
       $('concLimit').textContent = concLimit != null ? fmt(concLimit) : '--';
       const pct = concLimit ? (used / concLimit) * 100 : 0;
@@ -1098,11 +1157,12 @@
         ['listen addr', esc(config.listenAddr ?? '—')],
         ['upstream', esc(config.upstreamBaseURL ?? '—')],
         ['api key', config.hasApiKey ? 'configured' : 'missing'],
+        ['session cookie', config.hasSessionCookie ? 'configured' : 'none'],
         ['proxy auth', bool(config.proxyAuthEnabled)],
         ['backend routes', routeStr],
         ['timeout', esc(config.requestTimeout ?? '—')],
         ['override concurrency', config.overrideConcurrency ?? 0],
-        ['enabled models', (config.enabledModels?.length ? config.enabledModels : []).join(', ') || 'all (no filter)'],
+        ['enabled models', esc((config.enabledModels?.length ? config.enabledModels : []).join(', ') || 'all (no filter)')],
       ])}</tbody></table></div></div>`;
     }
 
@@ -1486,6 +1546,7 @@
         setStatus('ok', 'Online');
         if (config) {
           $('apiKey').placeholder = config.hasApiKey ? 'Configured; leave blank to keep' : 'sk-...';
+          $('sessionCookie').placeholder = config.hasSessionCookie ? 'Configured; leave blank to keep' : 'Optional — for app.umans.ai account endpoints';
           $('timeout').value = config.requestTimeout || '15m';
           $('overrideConcurrency').value = config.overrideConcurrency || 0;
           $('models').value = (config.enabledModels || []).join('\n');
@@ -1495,6 +1556,7 @@
         configLoaded = true;
         if (sessionsData) renderSessions(sessionsData);
         refreshUsage(false);
+        refreshCapHealthOverview();
       } catch (err) {
         proxyReachable = false;
         setStatus('bad', err.message === 'invalid proxy api key' ? 'Auth required' : 'Offline');
@@ -1511,6 +1573,7 @@
         };
         if (configLoaded) payload.enabledModels = $('models').value.split(/\r?\n/).map(x => x.trim()).filter(Boolean);
         if ($('apiKey').value.trim()) payload.apiKey = $('apiKey').value.trim();
+        if ($('sessionCookie').value.trim()) payload.sessionCookie = $('sessionCookie').value.trim();
         if ($('proxyKey').value.trim()) sessionStorage.setItem('proxyKey', $('proxyKey').value.trim());
         renderConfig(await json('/api/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) }));
         await refresh();
@@ -1650,7 +1713,9 @@
       const id = ++toastSeq;
       const el = document.createElement('div');
       el.className = 'toast ' + kind;
-      el.innerHTML = `<span class="toast-icon">${TOAST_ICONS[kind] || ''}</span><div class="toast-body"><div class="toast-title">${esc(title)}</div>${msg ? `<div class="toast-msg">${msg}</div>` : ''}${detail ? `<div class="toast-detail">${detail}</div>` : ''}</div><button class="toast-close" aria-label="dismiss">×</button>`;
+      const safeMsg = msg ? esc(msg) : '';
+      const safeDetail = detail ? esc(detail) : '';
+      el.innerHTML = `<span class="toast-icon">${TOAST_ICONS[kind] || ''}</span><div class="toast-body"><div class="toast-title">${esc(title)}</div>${safeMsg ? `<div class="toast-msg">${safeMsg}</div>` : ''}${safeDetail ? `<div class="toast-detail">${safeDetail}</div>` : ''}</div><button class="toast-close" aria-label="dismiss">×</button>`;
       $('toasts').appendChild(el);
       const remove = () => { el.classList.add('out'); setTimeout(() => el.remove(), 300); };
       el.querySelector('.toast-close').onclick = remove;
@@ -1685,6 +1750,17 @@
       } catch (err) {
         toast('bad', 'Admin refresh failed', err.message);
       }
+      refreshCapHealth();   // fire-and-forget; renders into its own pre
+    }
+    async function refreshCapHealth(force = false) {
+      const el = $('capHealthOut');
+      if (!el) return;
+      try {
+        const data = await json('/api/umans/cap-health' + (force ? '?force=1' : ''));
+        show('capHealthOut', data);
+      } catch (err) {
+        show('capHealthOut', err.message);
+      }
     }
     function adminBusy(id, label) {
       const btn = $(id); const old = btn.innerHTML; btn.disabled = true; btn.innerHTML = '<span class="spin"></span>' + label;
@@ -1701,6 +1777,12 @@
       const done = adminBusy('adminRefreshBtn', 'Refreshing');
       try { await refreshAdmin(); toast('ok', 'System info refreshed'); }
       catch (err) { toast('bad', 'Refresh failed', err.message); }
+      finally { done(); }
+    };
+    $('capHealthRefreshBtn').onclick = async () => {
+      const done = adminBusy('capHealthRefreshBtn', 'Fetching');
+      try { await refreshCapHealth(true); toast('ok', 'Cap health refreshed'); }
+      catch (err) { toast('bad', 'Cap health failed', err.message); }
       finally { done(); }
     };
     $('adminReloadBtn').onclick = async () => {
@@ -1858,6 +1940,9 @@
         $('usageWindowSub').textContent = `${timeUntil(win.resets_at)} left`;
       }
     }, 1000);
+    // Cap-health poll for the Overview limit box. Server TTL is 30s, so this
+    // is a cache hit except once per window; keeps cap blocks/resets live.
+    setInterval(refreshCapHealthOverview, 30000);
 
     refresh();
     checkStatus();

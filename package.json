@@ -17,7 +17,7 @@
     "start": "node launcher.js --start",
     "proxy": "node proxy.js",
     "configure": "node launcher.js --no-start",
-    "test": "node --test test/*.test.js"
+  "test": "node --require ./test/fetch-guard.js --test test/*.test.js"
   },
   "keywords": [
     "openai",

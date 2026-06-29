@@ -38,6 +38,7 @@ Use the launcher, dashboard, or create `.config/config.json`:
 {
   "LISTEN_ADDR": "127.0.0.1:8084",
   "API_KEY": "sk-your-umans-api-key",
+  "SESSION_COOKIE": "optional app.umans.ai session cookie for account endpoints",
   "ENABLED_MODELS": ["model-id"],
   "API_KEYS": ["optional-proxy-access-key"],
   "REQUEST_TIMEOUT": "15m",
@@ -45,15 +46,46 @@ Use the launcher, dashboard, or create `.config/config.json`:
 }
 ```
 
-`.config/` is gitignored and never committed — it holds your live API key. `UMANS_API_KEY` overrides `API_KEY`. `API_KEYS` or comma-separated env `API_KEYS` protects `/api/config`, `/api/umans/*`, and `/v1/*`. Proxy auth is **disabled by default** (empty `API_KEYS`): intended for a localhost single-user tool. The proxy refuses to boot if bound to a non-loopback address with empty `API_KEYS` — set `API_KEYS` first. When auth is disabled, `GET /api/debug/coalesce` exposes conversation-prefix hashes and short response-content previews — protect it if you have untrusted local users.
+`.config/` is gitignored and never committed — it holds your live API key. `UMANS_API_KEY` overrides `API_KEY`; `UMANS_SESSION_COOKIE` overrides `SESSION_COOKIE`. `API_KEYS` or comma-separated env `API_KEYS` protects `/api/config`, `/api/umans/*`, and `/v1/*`. Proxy auth is **disabled by default** (empty `API_KEYS`): intended for a localhost single-user tool. The proxy refuses to boot if bound to a non-loopback address with empty `API_KEYS` — set `API_KEYS` first. When auth is disabled, `GET /api/debug/coalesce` exposes conversation-prefix hashes and short response-content previews — protect it if you have untrusted local users. `SESSION_COOKIE` is optional: when set, the proxy sends it as a `Cookie` header **only to `app.umans.ai`** for the cap-health account endpoint (not to the `api.code.umans.ai` chat upstream) — it authenticates the browser session the web app uses, not the API bearer key. See [UMANS session cookie (cap-health)](#umans-session-cookie-cap-health) for the exact cookie name and format.
 
 Launcher flags:
 
 ```bash
-node launcher.js --listen=127.0.0.1:8084 --key=sk-... --models=model-a,model-b --proxyKeys=local-secret --timeout=15m --concurrency=0 --start
+node launcher.js --listen=127.0.0.1:8084 --key=sk-... --sessionCookie="name=value; ..." --models=model-a,model-b --proxyKeys=local-secret --timeout=15m --concurrency=0 --start
 ```
 
 Add `--no-start` to save settings without starting the proxy.
+
+## UMANS session cookie (cap-health)
+
+`SESSION_COOKIE` authenticates against the **web app** (`app.umans.ai`), not the API — it lets the proxy read the `app.umans.ai/api/account/cap-health` endpoint, which is used two ways:
+
+- **429 backoff gate**: on an upstream 429, the proxy fetches cap-health and arms the 72-minute burst cooldown **only if `blocksToday` incremented** since the last check — a real cap block, not a transient per-minute rate limit.
+- **Dashboard Cap health panel**: raw `blocksToday` display (`GET /api/umans/cap-health`).
+
+Without it, cap-health is unreachable and the 429 gate falls back to arming unconditionally (the legacy fail-safe).
+
+### Exact cookie
+
+| | |
+|---|---|
+| **Name** | `__Secure-authjs.session-token` |
+| **Host** | `app.umans.ai` |
+| **Type** | Auth.js (NextAuth) session token — a signed JWT |
+| **Format** | Paste **just the token value** — the proxy wraps it as `__Secure-authjs.session-token=<token>` automatically. A full `name=value` or the whole `Cookie:` line also works (used as-is). |
+
+### How to get it
+
+You must be logged in to `app.umans.ai` in a browser. Then, in DevTools (F12):
+
+1. **Application → Cookies → `https://app.umans.ai`** → find `__Secure-authjs.session-token`, copy its **Value**, and paste it directly — the proxy adds the `__Secure-authjs.session-token=` prefix. **— or —**
+2. **Network → any `app.umans.ai/api/...` request → Request Headers → `Cookie:`** → copy the value (or the whole line — both work).
+
+Put the token (raw, not URL-encoded) into `.config/config.json` as `SESSION_COOKIE`, set env `UMANS_SESSION_COOKIE`, or pass `--sessionCookie="..."` to the launcher.
+
+### Security
+
+This cookie **is** your logged-in `app.umans.ai` session — full account access. Treat it like a password. It lives only in gitignored `.config/config.json` or your environment; the proxy sends it **only to `app.umans.ai`** (never to `api.code.umans.ai`, never logged to stdout). Rotate it by signing out and back in on the web app.
 
 ## Reasoning levels
 
@@ -112,6 +144,7 @@ Sessions are pushed via the WebSocket (message type: `sessions`) at most once pe
 - `GET /api/umans/concurrency`
 - `GET /api/umans/sessions` (live TPS + per-session tracking)
 - `GET /api/umans/status` (UMANS service health: status band, uptime, TTFT/output tok/s p50)
+- `GET /api/umans/cap-health` (app.umans.ai account cap/abuse health: `blocksToday`; backs the 429 backoff gate; requires `SESSION_COOKIE`)
 - `GET /ws` (WebSocket: live usage, sessions, and session events)
 - `GET /v1/models/:id`
 - `POST /v1/chat/completions` (OpenAI shape; snaps `reasoning_effort` to supported levels)

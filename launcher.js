@@ -8,6 +8,7 @@ const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json');
 const DEFAULTS = {
   LISTEN_ADDR: '127.0.0.1:8084',
   API_KEY: 'sk_dummy',
+  SESSION_COOKIE: '',
   ENABLED_MODELS: [],
   API_KEYS: [],
   REQUEST_TIMEOUT: '15m',
@@ -33,6 +34,7 @@ function loadConfig() {
   return {
     LISTEN_ADDR: raw.LISTEN_ADDR || DEFAULTS.LISTEN_ADDR,
     API_KEY: process.env.UMANS_API_KEY || raw.API_KEY || DEFAULTS.API_KEY,
+    SESSION_COOKIE: process.env.UMANS_SESSION_COOKIE || raw.SESSION_COOKIE || DEFAULTS.SESSION_COOKIE,
     ENABLED_MODELS: cleanList(raw.ENABLED_MODELS),
     API_KEYS: cleanList(raw.API_KEYS),
     REQUEST_TIMEOUT: raw.REQUEST_TIMEOUT || DEFAULTS.REQUEST_TIMEOUT,
@@ -63,6 +65,7 @@ function applyArgs(config) {
   const map = {
     listen: 'LISTEN_ADDR',
     key: 'API_KEY',
+    sessionCookie: 'SESSION_COOKIE',
     models: 'ENABLED_MODELS',
     proxyKeys: 'API_KEYS',
     timeout: 'REQUEST_TIMEOUT',
@@ -100,6 +103,8 @@ async function promptSettings(config) {
     const apiKey = await question(rl, `UMANS API key [${mask(config.API_KEY)}]: `);
     if (apiKey.trim()) config.API_KEY = apiKey.trim();
 
+    const sessionCookie = await question(rl, `UMANS session cookie (for app.umans.ai account endpoints) [${mask(config.SESSION_COOKIE)}]: `);
+    if (sessionCookie.trim()) config.SESSION_COOKIE = sessionCookie.trim();
     const models = await question(rl, `Enabled models [${config.ENABLED_MODELS.join(', ')}]: `);
     if (models.trim()) config.ENABLED_MODELS = cleanList(models);
 
@@ -118,6 +123,7 @@ function printSettings(config) {
   console.log(`  REQUEST_TIMEOUT:   ${config.REQUEST_TIMEOUT}`);
   console.log(`  OVERRIDE_CONCURRENCY: ${config.OVERRIDE_CONCURRENCY}`);
   console.log(`  API_KEY:           ${mask(config.API_KEY)}`);
+  console.log(`  SESSION_COOKIE:    ${mask(config.SESSION_COOKIE)}`);
   console.log(`  ENABLED_MODELS:    ${config.ENABLED_MODELS.join(', ') || '(all upstream models)'}`);
   console.log(`  API_KEYS:          ${config.API_KEYS.map(mask).join(', ') || '(proxy auth disabled)'}`);
 }

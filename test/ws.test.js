@@ -1,4 +1,5 @@
 'use strict';
+require('./fetch-guard');
 
 // Unit tests for the minimal WebSocket frame layer (lib/ws.js): parseFrame
 // hardening (masked-only, control-frame ≤125, tooLarge) and pong encoding.

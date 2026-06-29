@@ -1,4 +1,5 @@
 'use strict';
+require('./fetch-guard');
 
 // Hot-path tests for the streaming pipe + SSE pre-filter.
 //

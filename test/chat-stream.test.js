@@ -201,6 +201,39 @@ test('streaming: forwards bytes verbatim and counts tokens via the pipe', async 
   await closeServer(proxy); await closeServer(upstream);
 });
 
+test('streaming: injects stream_options.include_usage into the upstream body without corrupting it', async () => {
+  // The proxy splices ,"stream_options":{"include_usage":true} before the
+  // top-level '}' instead of re-serializing the whole payload. Assert the body
+  // the upstream receives is valid JSON, include_usage is set, and a '}'
+  // inside a string value survives intact — the insert must target the
+  // top-level closer, not a brace in the content.
+  const sse = sseOpenAI();
+  let captured = null;
+  const upstream = await startUpstream((req, res) => {
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', () => { captured = Buffer.concat(chunks).toString('utf8'); res.writeHead(200, { 'Content-Type': 'text/event-stream' }); res.end(sse); });
+  });
+  const proxy = await startProxy();
+  seedState(`http://127.0.0.1:${upstream.address().port}`);
+
+  const resp = await fetch(`http://127.0.0.1:${proxy.address().port}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: 'm', messages: [{ role: 'user', content: '}{' }], stream: true }),
+  });
+  await resp.text();
+  await new Promise((r) => setTimeout(r, 5));
+
+  assert.ok(captured, 'upstream received a body');
+  const parsed = JSON.parse(captured); // throws if the surgical insert corrupted JSON
+  assert.strictEqual(parsed.model, 'm');
+  assert.deepStrictEqual(parsed.messages, [{ role: 'user', content: '}{' }]);
+  assert.deepStrictEqual(parsed.stream_options, { include_usage: true });
+
+  await closeServer(proxy); await closeServer(upstream);
+});
+
 test('non-streaming: forwards body and counts exact tokens', async () => {
   const json = Buffer.from(JSON.stringify({
     id: 'x', object: 'chat.completion', model: 'm',

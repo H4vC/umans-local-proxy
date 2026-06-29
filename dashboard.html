@@ -542,6 +542,8 @@
             <div class="pair"><strong id="aggTps">0.0</strong><span>tok/s aggregate</span></div>
             <div class="pair"><strong id="aggActive">0</strong><span>active</span></div>
             <div class="pair"><strong id="aggTotal">0</strong><span>total</span></div>
+            <div class="pair"><strong id="aggTtft">—</strong><span>ttft p50</span></div>
+            <div class="pair"><strong id="aggTpsP50">—</strong><span>tok/s p50</span></div>
           </div>
         </div>
         <p class="sub" style="margin:4px 0 0;color:var(--muted);font-size:13px;">Per-session tok/s and details for in-flight and recently completed requests.</p>
@@ -684,6 +686,7 @@
           <button class="btn tonal" id="adminReloadBtn">Reload code</button>
           <button class="btn" id="clearStateBtn">Clear state</button>
           <button class="btn tonal" id="restartBtn">Restart proxy</button>
+          <button class="btn tonal" id="clearCooldownBtn" disabled>Clear 429 backoff</button>
         </div>
         <div class="danger-zone">
           <span class="danger-label">Danger</span>
@@ -794,26 +797,62 @@
       s.lastElementChild.textContent = text;
     }
 
+    let lastUsageData = null;
+    let cooldownUntil = null;      // ms epoch of the active 429 burst cooldown — drives the client-side countdown
+    let baseLimitSub = '';          // limit-box sub-text segments without the cooldown line
+    let lastQueued = 0;            // last queued count, for the delay-banner reason
+
     function updateDelayBanner(queued) {
-      const n = number(queued);
-      $('delayedCard').classList.toggle('warn', n > 0);
-      const banner = $('delayBanner');
-      banner.hidden = n === 0;
-      if (!banner.hidden) $('delayBannerText').textContent = `${fmt(n)} request${n === 1 ? '' : 's'} delayed — waiting for a concurrency slot`;
+      lastQueued = number(queued);
+      $('delayedCard').classList.toggle('warn', lastQueued > 0);
+      $('delayBanner').hidden = lastQueued === 0;
+      renderCooldown();
     }
 
-    let lastUsageData = null;
+    // Render the 429 burst-cooldown surfaces purely from the persisted epoch
+    // (cooldownUntil). Called by a 1s ticker so the countdown is live and the
+    // badge never flickers out between server usage pushes (~10s cadence).
+    function renderCooldown() {
+      const until = cooldownUntil;
+      const left = until ? timeUntil(new Date(until).toISOString()) : '';
+      const active = !!left;
+      $('usageLimitSub').textContent = (active ? `429 cooldown · ${left} left` : '') + (active && baseLimitSub ? ' · ' : '') + baseLimitSub;
+      const chips = $('chips');
+      let chip = document.getElementById('cooldownChip');
+      if (active) {
+        if (!chip) { chip = document.createElement('span'); chip.id = 'cooldownChip'; chip.className = 'chip warn'; chips.appendChild(chip); }
+        chip.innerHTML = `<span class="icon-warn"></span> 429 cooldown · ${left}`;
+      } else if (chip) {
+        chip.remove();
+      }
+      const banner = $('delayBanner');
+      if (!banner.hidden) {
+        const reason = active ? `upstream 429 cooldown · ${left} left` : 'waiting for a concurrency slot';
+        $('delayBannerText').textContent = `${fmt(lastQueued)} request${lastQueued === 1 ? '' : 's'} delayed — ${reason}`;
+      }
+      const cdb = $('clearCooldownBtn');
+      if (cdb) cdb.disabled = !active;
+    }
     function renderUsage(data) {
       lastUsageData = data;
       const usage = data?.usage || {};
       const throttle = data?.throttle || {};
+      // Refresh the cooldown epoch only when the server confirms it's active.
+      // A usage fetch can race past a 429 (fetched before the cooldown armed,
+      // broadcast after) and report a stale false — never clear on false.
+      // Expiry is handled by the 1s ticker (timeUntil → ''); clearing by the
+      // burst-cooldown event (manual clear / re-arm).
+      if (throttle.burstCooldown) cooldownUntil = Date.parse(throttle.burstCooldownUntil) || null;
       const limits = data?.limits || {};
       const plan = data?.plan || null;
       const win = data?.window || {};
       const concSoft = positive(throttle.soft) ?? throttle.softLimit ?? null;
       const concHard = positive(throttle.hard);
       const quotaLimit = positive(throttle.quotaLimit) ?? concSoft;
-      const concLimit = throttle.limit ?? quotaLimit;
+      let concLimit = throttle.limit ?? quotaLimit;
+      // While the cooldown is active the enforced limit is the soft limit; a
+      // stale usage event fetched before the 429 may report the unclamped ceiling.
+      if (cooldownUntil && concSoft != null && (concLimit == null || concLimit > concSoft)) concLimit = concSoft;
       const upstreamConc = number(usage.concurrent_sessions ?? throttle.concurrent);
       const localActive = number(throttle.active);
       const localQueued = number(throttle.queued);
@@ -851,7 +890,7 @@
       if (concHard != null && concSoft != null && concHard > concSoft) {
         limitSub.push(`burst quota ${Math.round((throttle.burstQuota ?? 0) * 100)}%`);
       }
-      $('usageLimitSub').textContent = limitSub.join(' · ');
+      baseLimitSub = limitSub.join(' · ');
       $('concUsed').textContent = fmt(used);
       $('concLimit').textContent = concLimit != null ? fmt(concLimit) : '--';
       const pct = concLimit ? (used / concLimit) * 100 : 0;
@@ -874,8 +913,6 @@
       $('liveQueued').textContent = fmt(localQueued);
       $('liveRemaining').textContent = concLimit != null ? fmt(Math.max(0, concLimit - used)) : '--';
 
-      // surface delayed requests prominently
-      updateDelayBanner(localQueued);
 
       $('windowLine').textContent = win.resets_at ? `resets in ${timeUntil(win.resets_at)}` : '';
       $('usageWindowSub').textContent = win.resets_at ? `${timeUntil(win.resets_at)} left` : (win.remaining_minutes != null ? `${win.remaining_minutes}m left` : '');
@@ -895,6 +932,9 @@
       }
       if (throttle.overridden) { const c = document.createElement('span'); c.className = 'chip ok'; c.textContent = `override ${fmt(concLimit)}`; chips.appendChild(c); }
       if (data?.stale) { const c = document.createElement('span'); c.className = 'chip warn'; c.textContent = 'stale cache'; chips.appendChild(c); }
+      // Surface delayed requests prominently. Called after the chips rebuild
+      // so the cooldown chip renderCooldown adds isn't immediately wiped.
+      updateDelayBanner(localQueued);
 
       // Status badge reflects usage fetch result. On error: red "Usage error"
       // (only when the proxy is reachable — otherwise the HTTP error state wins).
@@ -1109,6 +1149,7 @@
           uncached: fmt(s.uncachedTokens),
           output: fmt(s.completionTokens),
           elapsed: fmtElapsed(s.elapsedMs),
+          ttft: s.ttftMs != null ? fmtMs(s.ttftMs) : '—',
           mode: s.stream ? 'stream' : 'sync',
           bytes: fmtBytes(s.bytes),
           id: s.id || '',
@@ -1128,6 +1169,7 @@
         <span class="k">output</span><span class="v" data-f="output"></span>
         <span class="k">cache hit</span><span class="v" data-f="cacheHit"></span>
         <span class="k">elapsed</span><span class="v" data-f="elapsed"></span>
+        <span class="k">ttft</span><span class="v" data-f="ttft"></span>
         <span class="k">mode</span><span class="v" data-f="mode"></span>
         <span class="k">bytes</span><span class="v" data-f="bytes"></span>
       </div>
@@ -1139,6 +1181,8 @@
       if ($('aggTps')) $('aggTps').textContent = fmtTps(agg.tps);
       if ($('aggActive')) $('aggActive').textContent = fmt(agg.activeSessions ?? 0);
       if ($('aggTotal')) $('aggTotal').textContent = fmt(agg.totalSessions ?? 0);
+      if ($('aggTtft')) $('aggTtft').textContent = fmtMs(agg.ttftMsP50);
+      if ($('aggTpsP50')) $('aggTpsP50').textContent = fmtTps(agg.medianTps);
       renderModelStats(agg.models || [], agg.medianTps, agg.p10Tps);
     }
 
@@ -1245,11 +1289,13 @@
       const cacheRate = (totalCached + totalUncached) > 0 ? Math.round((totalCached / (totalCached + totalUncached)) * 1000) / 10 : null;
       const cacheCls = cacheRate == null ? '' : cacheRate >= 50 ? 'good' : cacheRate > 0 ? 'warn' : '';
       const cacheStr = cacheRate != null ? cacheRate + '%' : '—';
-      const tps = Math.round(sessions.reduce((a, s) => a + number(s.tps), 0) * 10) / 10;
+      const tps = Math.round(sessions.filter((s) => s.active).reduce((a, s) => a + number(s.tps), 0) * 10) / 10;
       const finalVals = sessions.filter((s) => !s.active && s.finalTps != null && s.finalTps > 0).map((s) => s.finalTps);
       const avgFinal = summary?.avgFinalTps != null
         ? summary.avgFinalTps
         : finalVals.length ? Math.round(finalVals.reduce((a, b) => a + b, 0) / finalVals.length * 10) / 10 : null;
+      const ttftVals = sessions.map((s) => s.ttftMs).filter((v) => v != null && v >= 0).sort((a, b) => a - b);
+      const ttft = ttftVals.length ? Math.round(ttftVals[Math.floor(ttftVals.length / 2)] * 10) / 10 : null;
       return {
         key: group.groupKey,
         cardCls: active ? 'active' : '',
@@ -1267,6 +1313,7 @@
           uncached: fmt(totalUncached),
           output: fmt(totalTokens),
           elapsed: fmtElapsed(elapsed),
+          ttft: ttft != null ? fmtMs(ttft) : '—',
           requests: String(turnCount),
           bytes: fmtBytes(totalBytes),
           id: group.groupKey || '',
@@ -1287,6 +1334,7 @@
         <span class="k">cache hit</span><span class="v" data-f="cacheHit"></span>
         <span class="k">elapsed</span><span class="v" data-f="elapsed"></span>
         <span class="k">requests</span><span class="v" data-f="requests"></span>
+        <span class="k">ttft</span><span class="v" data-f="ttft"></span>
         <span class="k">bytes</span><span class="v" data-f="bytes"></span>
       </div>
       <div class="sessioncard-id" data-f="id"></div>
@@ -1646,7 +1694,7 @@
       proxyReachable = false;
       setStatus('bad', msg);
       if (ws) { try { ws.close(); } catch {} ws = null; }
-      ['restartBtn', 'adminReloadBtn', 'shutdownBtn', 'clearStateBtn', 'adminRefreshBtn'].forEach((id) => { $(id).disabled = true; });
+      ['restartBtn', 'adminReloadBtn', 'shutdownBtn', 'clearStateBtn', 'adminRefreshBtn', 'clearCooldownBtn'].forEach((id) => { $(id).disabled = true; });
       toast('bad', 'Proxy stopped', msg);
     }
     $('adminRefreshBtn').onclick = async () => {
@@ -1678,6 +1726,15 @@
         if (c.stateMap) parts.push(`${c.stateMap} state keys`);
         toast('ok', 'State cleared', parts.length ? parts.join(' · ') + ' dropped' : 'caches empty');
       } catch (err) { toast('bad', 'Clear state failed', err.message); }
+      finally { done(); }
+    };
+    $('clearCooldownBtn').onclick = async () => {
+      if (!confirm('Clear the 429 burst cooldown? Concurrency will be allowed to burst again immediately.')) return;
+      const done = adminBusy('clearCooldownBtn', 'Clearing');
+      try {
+        await json('/api/umans/cooldown/clear', { method: 'POST' });
+        toast('ok', '429 backoff cleared', 'Bursting re-enabled');
+      } catch (err) { toast('bad', 'Clear failed', err.message); }
       finally { done(); }
     };
     $('restartBtn').onclick = async () => {
@@ -1760,6 +1817,19 @@
             case 'sessions':
               renderSessions(msg.data);
               break;
+            case 'burst-cooldown':
+              cooldownUntil = (msg.data?.disabledUntil && msg.data.disabledUntil > Date.now()) ? msg.data.disabledUntil : null;
+              if (lastUsageData?.throttle) {
+                const t = lastUsageData.throttle;
+                t.burstCooldown = !!cooldownUntil;
+                t.burstCooldownUntil = cooldownUntil ? new Date(cooldownUntil).toISOString() : null;
+                if (cooldownUntil && t.softLimit != null && (t.limit == null || t.limit > t.softLimit)) t.limit = t.softLimit;
+                else if (!cooldownUntil && t.quotaLimit != null) t.limit = t.quotaLimit;
+                renderUsage(lastUsageData);
+              } else {
+                renderCooldown();
+              }
+              break;
           }
         } catch {}
       };
@@ -1780,6 +1850,7 @@
 
     // Tick time labels every second so seconds-precision feels live.
     setInterval(() => {
+      renderCooldown();
       if (!lastUsageData) return;
       const win = lastUsageData?.window || {};
       if (win.resets_at) {

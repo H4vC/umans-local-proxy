@@ -953,3 +953,39 @@ test('coalescing survives string→array content promotion (cache_control attach
     assert.notStrictEqual(r3.groupKey, r1.groupKey, 'different text still forks');
   } finally { restoreCoalesceState(orig); }
 });
+
+test('coalescing survives tool-use turns (extra tool_result in prefix)', () => {
+  // Tool-use turns add an extra message (tool_result) between the assistant
+  // response and the next user message. The stored stateChain covers
+  // [lastUser, assistant] but the next prefix has [lastUser, assistant, tool_result].
+  // resolveGroupKey must check multiple prefix positions to find the hit.
+  const orig = resetCoalesceState();
+  try {
+    const model = 'm';
+    const user1 = { role: 'user', content: 'what is 2+2?' };
+    // Turn 1: user → assistant "Let me calculate" (text only, stores stateChain)
+    const r1 = resolveGroupKey(model, [user1]);
+    storeStateKey(model, [user1], 'Let me calculate', r1.groupKey, r1.prefixChain);
+
+    // Turn 2: assistant did a tool call. The client replays:
+    // [user1, assistant1, {role:'tool', content:'4'}, user2]
+    // prefix = [user1, assistant1, {role:'tool', content:'4'}]
+    // The tool message is EXTRA — the stored chain only covers [user1, assistant1].
+    const r2 = resolveGroupKey(model, [
+      user1,
+      { role: 'assistant', content: 'Let me calculate' },
+      { role: 'tool', content: '4' },
+      { role: 'user', content: 'thanks' },
+    ]);
+    assert.strictEqual(r2.groupKey, r1.groupKey, 'tool-use turn must coalesce despite extra tool_result');
+
+    // Also test Anthropic-style tool_result (user role with tool_result block)
+    const r3 = resolveGroupKey(model, [
+      user1,
+      { role: 'assistant', content: 'Let me calculate' },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: '4' }] },
+      { role: 'user', content: 'thanks' },
+    ]);
+    assert.strictEqual(r3.groupKey, r1.groupKey, 'Anthropic tool_result in user message must coalesce');
+  } finally { restoreCoalesceState(orig); }
+});

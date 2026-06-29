@@ -8,8 +8,8 @@
 //      are correct, including lines the pre-filter must skip (role/finish only).
 //   2. proxyRequest end-to-end — a real http.Server running the NEW pipeline
 //      code against a mock upstream: bytes forwarded, tokens counted, client
-//      disconnect aborts the upstream, and an upstream 500 surfaces as an SSE
-//      error event (headers already sent for streaming).
+//      disconnect aborts the upstream, and upstream non-2xx status is preserved
+//      even for streaming responses.
 
 const { test, after } = require('node:test');
 const assert = require('node:assert/strict');
@@ -108,6 +108,38 @@ test('TapStream handles chunk boundaries that split an SSE line', async () => {
   assert.strictEqual(session.chars, 11);
   assert.strictEqual(session.exactTokens, true);
   assert.strictEqual(session.outputTokens, 2);
+});
+
+test('ChatTap repairs tap worker state missing from a hot-reloaded singleton', async () => {
+  const prevPending = state.tapPendingFinals;
+  const prevWorker = state.tapWorker;
+  const prevDead = state.tapWorkerDead;
+  const prevRestart = state.tapRestartTimer;
+  try {
+    delete state.tapPendingFinals;
+    delete state.tapWorker;
+    delete state.tapWorkerDead;
+    delete state.tapRestartTimer;
+
+    const session = makeSession();
+    const tap = new ChatTap(session, { stream: true, shape: 'openai' });
+    tap.onChunk(Buffer.from('data: [DONE]\n\n'));
+    await tap.onEnd();
+
+    assert.ok(state.tapPendingFinals instanceof Map);
+    assert.ok(Object.prototype.hasOwnProperty.call(state, 'tapWorker'));
+    assert.strictEqual(typeof state.tapWorkerDead, 'boolean');
+    assert.ok(Object.prototype.hasOwnProperty.call(state, 'tapRestartTimer'));
+  } finally {
+    if (state.tapRestartTimer && state.tapRestartTimer !== prevRestart) clearTimeout(state.tapRestartTimer);
+    if (state.tapWorker && state.tapWorker !== prevWorker) {
+      try { await state.tapWorker.terminate(); } catch {}
+    }
+    state.tapPendingFinals = prevPending instanceof Map ? prevPending : new Map();
+    state.tapWorker = prevWorker || null;
+    state.tapWorkerDead = typeof prevDead === 'boolean' ? prevDead : false;
+    state.tapRestartTimer = prevRestart || null;
+  }
 });
 
 // ---- 2. proxyRequest end-to-end -----------------------------------------
@@ -311,10 +343,10 @@ test('client disconnect mid-stream aborts the upstream connection', async () => 
   await closeServer(proxy); await closeServer(upstream);
 });
 
-test('upstream 500 on a streaming request surfaces as an SSE error event', async () => {
+test('upstream non-2xx on a streaming request preserves HTTP status', async () => {
   const upstream = await startUpstream((req, res) => {
-    res.writeHead(500, { 'Content-Type': 'application/json' });
-    res.end(Buffer.from(JSON.stringify({ error: 'boom' })));
+    res.writeHead(429, { 'Content-Type': 'application/json' });
+    res.end(Buffer.from(JSON.stringify({ error: 'rate limited' })));
   });
   const proxy = await startProxy();
   seedState(`http://127.0.0.1:${upstream.address().port}`);
@@ -326,10 +358,9 @@ test('upstream 500 on a streaming request surfaces as an SSE error event', async
   });
   const text = await resp.text();
 
-  // Streaming sends 200 + SSE headers first; the 500 must arrive as an SSE error.
-  assert.strictEqual(resp.status, 200);
-  assert.match(text, /data:\s*{"error":/);
-  assert.match(text, /upstream 500/);
+  assert.strictEqual(resp.status, 429);
+  assert.match(text, /rate limited/);
+  assert.ok(state.burstDisabledUntil > Date.now());
 
   await closeServer(proxy); await closeServer(upstream);
 });

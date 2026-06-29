@@ -571,3 +571,42 @@ test('ChatTap tracks active taps for worker-restart re-init (C8)', async () => {
     state.tapRestartTimer = prevRestart || null;
   }
 });
+
+// ---- coalescing: 2-turn grouping through the full proxyRequest path ----
+
+test('coalescing: turn 2 joins turn 1 group when the assistant replay matches', async () => {
+  const sse = (content) => Buffer.from(
+    'data: {"id":"x","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{"role":"assistant"}}]}\n\n' +
+    `data: {"id":"x","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{"content":${JSON.stringify(content)}}]}\n\n` +
+    'data: {"id":"x","object":"chat.completion.chunk","model":"m","choices":[],"finish_reason":"stop"}\n\n' +
+    'data: {"id":"x","object":"chat.completion.chunk","model":"m","choices":[],"usage":{"prompt_tokens":2,"completion_tokens":1}}\n\n' +
+    'data: [DONE]\n\n', 'utf8');
+  const upstream = await startUpstream((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+    res.end(sse('Hello'));
+  });
+  const proxy = await startProxy();
+  seedState(`http://127.0.0.1:${upstream.address().port}`);
+  for (const t of state.stateMapTimers.values()) clearTimeout(t);
+  state.stateMap.clear(); state.stateMapTimers.clear();
+  state.messageHashCache.clear();
+
+  const port = proxy.address().port;
+  // Turn 1: [user "hi"] -> assistant "Hello" (proxy captures responseContent "Hello").
+  const r1 = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ model: 'm', messages: [{ role: 'user', content: 'hi' }], stream: true }) });
+  await r1.text();
+  await new Promise((r) => setTimeout(r, 15)); // let tap.onEnd + storeStateKey finalize
+  const s1 = [...state.sessions.values()].find((s) => s.status === 'done');
+  assert.ok(s1, 'turn1 session recorded');
+  const group1 = s1.groupKey;
+
+  // Turn 2: client replays the assistant verbatim + a new user message.
+  const r2 = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ model: 'm', messages: [{ role: 'user', content: 'hi' }, { role: 'assistant', content: 'Hello' }, { role: 'user', content: 'bye' }], stream: true }) });
+  await r2.text();
+  await new Promise((r) => setTimeout(r, 15));
+  const s2 = [...state.sessions.values()].filter((s) => s !== s1).pop();
+  assert.ok(s2 && s2 !== s1, 'turn2 session recorded');
+  assert.strictEqual(s2.groupKey, group1, 'turn2 must coalesce into turn1 group (replay matched responseContent)');
+
+  await closeServer(proxy); await closeServer(upstream);
+});

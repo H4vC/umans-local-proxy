@@ -7,7 +7,7 @@ const { fnv1a, fnv1a32, fnv1aMixNum } = require('../lib/hash');
 const { parseDuration, parseListenAddr, cleanKeys, fileProxyApiKeys, readConfigFile, isLoopbackHost } = require('../lib/config');
 const { snapReasoningLevel, enrichModelsWithReasoning, REASONING_RANK } = require('../lib/reasoning');
 const { firstNumber, concurrencyHardLimit, percentValue, burstQuota, concurrencyQuotaLimit, applyOverride, extractThrottle, getEffectiveConcurrency, canStart, acquireThrottleSlot, releaseThrottleSlot, notifyUpstream429, BURST_COOLDOWN_FILE } = require('../lib/concurrency');
-const { canonicalMessage, messageHash, chainHash } = require('../lib/coalesce');
+const { canonicalMessage, messageHash, chainHash, resolveGroupKey, storeStateKey } = require('../lib/coalesce');
 const { authorized, wsUpgradeAllowed, isLoopback, safeHeaders, requiresProxyAuth } = require('../lib/auth');
 const { createSession, finalizeSession } = require('../lib/sessions');
 const { projectStatus } = require('../lib/upstream');
@@ -882,4 +882,53 @@ test('finalizeSession is idempotent — a double call does not double-count (F)'
     s.groupSummaryTimers = orig.groupSummaryTimers; s.sessionsBroadcastTimer = orig.sessionsBroadcastTimer;
     s.broadcastThrottled = orig.broadcastThrottled; s.sessionSeq = orig.sessionSeq;
   }
+});
+
+// ---- coalesce investigation: why sessions don't group across turns ----
+
+function resetCoalesceState() {
+  const s = state;
+  const orig = { stateMap: s.stateMap, messageHashCache: s.messageHashCache, stateMapTimers: s.stateMapTimers, sessionSeq: s.sessionSeq };
+  for (const t of s.stateMapTimers.values()) clearTimeout(t);
+  s.stateMap = new Map(); s.messageHashCache = new Map(); s.stateMapTimers = new Map(); s.sessionSeq = 0;
+  return orig;
+}
+function restoreCoalesceState(orig) {
+  const s = state;
+  for (const t of s.stateMapTimers.values()) clearTimeout(t);
+  s.stateMap = orig.stateMap; s.messageHashCache = orig.messageHashCache; s.stateMapTimers = orig.stateMapTimers; s.sessionSeq = orig.sessionSeq;
+}
+
+test('coalescing groups turn 2 into turn 1 when the replay matches exactly (baseline)', () => {
+  const orig = resetCoalesceState();
+  try {
+    const model = 'm';
+    const user1 = { role: 'user', content: 'hi' };
+    const r1 = resolveGroupKey(model, [user1]);
+    storeStateKey(model, [user1], 'Hello', r1.groupKey, r1.prefixChain);
+    const r2 = resolveGroupKey(model, [user1, { role: 'assistant', content: 'Hello' }, { role: 'user', content: 'bye' }]);
+    assert.strictEqual(r2.groupKey, r1.groupKey, 'exact replay coalesces');
+  } finally { restoreCoalesceState(orig); }
+});
+
+test('coalescing survives a cache_control marker shift between turns (fix)', () => {
+  // Claude Code re-marks cacheable blocks as the conversation grows: a system
+  // block sent without cache_control on turn 1 gains it on turn 2. cache_control
+  // is a volatile caching hint, not conversation-distinctive, so canonicalMessage
+  // strips it — the prefix hash stays stable and turn 2 coalesces into turn 1.
+  const orig = resetCoalesceState();
+  try {
+    const model = 'm';
+    const system = { role: 'system', content: [{ type: 'text', text: 'You are helpful.' }] };
+    const user1 = { role: 'user', content: 'hi' };
+    const r1 = resolveGroupKey(model, [system, user1]);
+    storeStateKey(model, [system, user1], 'Hello', r1.groupKey, r1.prefixChain);
+    // Turn 2: client added cache_control to the system text block (Claude Code style).
+    const systemCached = { role: 'system', content: [{ type: 'text', text: 'You are helpful.', cache_control: { type: 'ephemeral' } }] };
+    const r2 = resolveGroupKey(model, [systemCached, user1, { role: 'assistant', content: 'Hello' }, { role: 'user', content: 'bye' }]);
+    assert.strictEqual(r2.groupKey, r1.groupKey, 'cache_control shift must not break coalescing');
+    // Vision/image blocks still distinguish conversations (cache_control is the only thing stripped).
+    const r3 = resolveGroupKey(model, [{ role: 'user', content: [{ type: 'image_url', image_url: { url: 'x' } }] }]);
+    assert.notStrictEqual(r3.groupKey, r1.groupKey, 'different content still forks');
+  } finally { restoreCoalesceState(orig); }
 });

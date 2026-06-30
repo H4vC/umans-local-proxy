@@ -499,8 +499,8 @@ test('burstQuota ignores burst_percent (hard-limit field, not quota)', () => {
 
 // ---- concurrency: concurrencyQuotaLimit ----
 
-test('concurrencyQuotaLimit returns hard when no soft', () => {
-  assert.strictEqual(concurrencyQuotaLimit({ hard_cap: 20 }), 20);
+test('concurrencyQuotaLimit returns null when no soft', () => {
+  assert.strictEqual(concurrencyQuotaLimit({ hard_cap: 20 }), null);
 });
 
 test('concurrencyQuotaLimit returns soft when no hard', () => {
@@ -511,14 +511,11 @@ test('concurrencyQuotaLimit returns hard when hard <= soft', () => {
   assert.strictEqual(concurrencyQuotaLimit({ limit: 10, hard_cap: 8 }), 8);
 });
 
-test('concurrencyQuotaLimit interpolates with burst quota', () => {
-  // soft=10, hard=20, burst_quota=0.5 → 10 + floor(10*0.5) = 15
-  assert.strictEqual(concurrencyQuotaLimit({ limit: 10, hard_cap: 20, burst_remaining_pct: 0.5 }), 15);
-});
-
-test('concurrencyQuotaLimit uses hard limit via burst_pct when no live quota', () => {
-  // soft=10, burst_pct=0.5 → hard=15; no live remaining field → full burst → 15
-  assert.strictEqual(concurrencyQuotaLimit({ limit: 10, burst_pct: 0.5 }), 15);
+test('concurrencyQuotaLimit ignores burst headroom for local admission', () => {
+  // Burst is provider-side and has caused upstream 429s under large parallel
+  // local batches. Admit only the base concurrency limit.
+  assert.strictEqual(concurrencyQuotaLimit({ limit: 10, hard_cap: 20, burst_remaining_pct: 0.5 }), 10);
+  assert.strictEqual(concurrencyQuotaLimit({ limit: 10, burst_pct: 0.5 }), 10);
 });
 
 test('concurrencyQuotaLimit returns null when usage reports no positive max', () => {
@@ -562,7 +559,7 @@ test('extractThrottle clamps boxed accounts to soft concurrency', () => {
     });
     assert.strictEqual(throttle.limit, 4);
     assert.strictEqual(throttle.softLimit, 4);
-    assert.strictEqual(throttle.quotaLimit, 8);
+    assert.strictEqual(throttle.quotaLimit, 4);
     assert.strictEqual(throttle.boxed, true);
     assert.strictEqual(throttle.boxedUntil, boxedUntil);
   } finally {
@@ -604,7 +601,7 @@ test('extractThrottle clamps to soft while burst cooldown is active', () => {
     });
     assert.strictEqual(throttle.limit, 4);
     assert.strictEqual(throttle.softLimit, 4);
-    assert.strictEqual(throttle.quotaLimit, 8);
+    assert.strictEqual(throttle.quotaLimit, 4);
     assert.strictEqual(throttle.burstCooldown, true);
     assert.strictEqual(throttle.burstCooldownUntil, new Date(until).toISOString());
   } finally {
@@ -908,6 +905,44 @@ test('getEffectiveConcurrency hard-bounds broken post-fetch usage to 4', () => {
   } finally {
     s.config = orig.config; s.concurrencyCache = orig.concurrencyCache; s.usageEverFetched = orig.usageEverFetched;
     s.activeRequests = orig.activeRequests; s.burstDisabledUntil = orig.burstDisabledUntil;
+  }
+});
+
+test('parallel local admission queues requests above the soft concurrency limit', async () => {
+  const s = require('../lib/state');
+  const orig = {
+    config: s.config, concurrencyCache: s.concurrencyCache, usageCache: s.usageCache,
+    usageEverFetched: s.usageEverFetched, activeRequests: s.activeRequests,
+    queuedRequests: s.queuedRequests, throttleWaiters: s.throttleWaiters,
+    refreshUsageInFlight: s.refreshUsageInFlight, refreshUsageTimer: s.refreshUsageTimer,
+    burstDisabledUntil: s.burstDisabledUntil,
+  };
+  s.config = { ...s.config, apiKey: '', overrideConcurrency: 0 };
+  s.concurrencyCache = { concurrent: 0, limit: 4, softLimit: 4, boxedUntil: null, time: Date.now() };
+  s.usageCache = { data: { ok: true }, time: Date.now() };
+  s.usageEverFetched = true;
+  s.activeRequests = 0;
+  s.queuedRequests = 0;
+  s.throttleWaiters = [];
+  s.refreshUsageInFlight = false;
+  s.refreshUsageTimer = null;
+  s.burstDisabledUntil = 0;
+  const controllers = Array.from({ length: 20 }, () => new AbortController());
+  const attempts = controllers.map((c) => acquireThrottleSlot({}, c.signal));
+  try {
+    await new Promise((r) => setImmediate(r));
+    assert.strictEqual(s.activeRequests, 4, 'only four slots may be acquired');
+    assert.strictEqual(s.throttleWaiters.length, 16, 'the rest must queue');
+  } finally {
+    for (let i = 4; i < controllers.length; i++) controllers[i].abort();
+    for (let i = 0; i < 4; i++) releaseThrottleSlot();
+    await Promise.allSettled(attempts);
+    if (s.refreshUsageTimer) clearTimeout(s.refreshUsageTimer);
+    s.config = orig.config; s.concurrencyCache = orig.concurrencyCache; s.usageCache = orig.usageCache;
+    s.usageEverFetched = orig.usageEverFetched; s.activeRequests = orig.activeRequests;
+    s.queuedRequests = orig.queuedRequests; s.throttleWaiters = orig.throttleWaiters;
+    s.refreshUsageInFlight = orig.refreshUsageInFlight; s.refreshUsageTimer = orig.refreshUsageTimer;
+    s.burstDisabledUntil = orig.burstDisabledUntil;
   }
 });
 

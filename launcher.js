@@ -12,6 +12,7 @@ const DEFAULTS = {
   ENABLED_MODELS: [],
   API_KEYS: [],
   REQUEST_TIMEOUT: '15m',
+  REQUEST_LOGGING: 'off',
   OVERRIDE_CONCURRENCY: 0,
   WEBSEARCH_PROVIDER: 'none',
 };
@@ -29,7 +30,6 @@ function cleanList(value) {
   if (Array.isArray(value)) return value.map((entry) => (typeof entry === 'string' ? entry : entry?.key)).map((x) => String(x || '').trim()).filter(Boolean);
   return String(value || '').split(',').map((x) => x.trim()).filter(Boolean);
 }
-
 function loadConfig() {
   const raw = readJSON(CONFIG_FILE);
   return {
@@ -39,6 +39,7 @@ function loadConfig() {
     ENABLED_MODELS: cleanList(raw.ENABLED_MODELS),
     API_KEYS: cleanList(raw.API_KEYS),
     REQUEST_TIMEOUT: raw.REQUEST_TIMEOUT || DEFAULTS.REQUEST_TIMEOUT,
+    REQUEST_LOGGING: raw.REQUEST_LOGGING || DEFAULTS.REQUEST_LOGGING,
     OVERRIDE_CONCURRENCY: Math.max(0, Number(raw.OVERRIDE_CONCURRENCY || DEFAULTS.OVERRIDE_CONCURRENCY) || 0),
     WEBSEARCH_PROVIDER: raw.WEBSEARCH_PROVIDER || DEFAULTS.WEBSEARCH_PROVIDER,
   };
@@ -71,6 +72,7 @@ function applyArgs(config) {
     models: 'ENABLED_MODELS',
     proxyKeys: 'API_KEYS',
     timeout: 'REQUEST_TIMEOUT',
+    logging: 'REQUEST_LOGGING',
     concurrency: 'OVERRIDE_CONCURRENCY',
     websearch: 'WEBSEARCH_PROVIDER',
   };
@@ -85,7 +87,6 @@ function applyArgs(config) {
 function question(rl, prompt) {
   return new Promise((resolve) => rl.question(prompt, resolve));
 }
-
 async function promptSettings(config) {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   try {
@@ -96,9 +97,11 @@ async function promptSettings(config) {
     const listen = await question(rl, `Listen address [${config.LISTEN_ADDR}]: `);
     if (listen.trim()) config.LISTEN_ADDR = listen.trim();
 
-
     const timeout = await question(rl, `Request timeout [${config.REQUEST_TIMEOUT}]: `);
     if (timeout.trim()) config.REQUEST_TIMEOUT = timeout.trim();
+
+    const logging = await question(rl, `Request logging (off|basic|verbose) [${config.REQUEST_LOGGING}]: `);
+    if (logging.trim()) config.REQUEST_LOGGING = logging.trim();
 
     const concurrency = await question(rl, `Override concurrency, 0 = use UMANS limits [${config.OVERRIDE_CONCURRENCY}]: `);
     if (concurrency.trim()) config.OVERRIDE_CONCURRENCY = Math.max(0, Number(concurrency) || 0);
@@ -122,11 +125,11 @@ async function promptSettings(config) {
     rl.close();
   }
 }
-
 function printSettings(config) {
   console.log('\nCurrent settings:');
   console.log(`  LISTEN_ADDR:       ${config.LISTEN_ADDR}`);
   console.log(`  REQUEST_TIMEOUT:   ${config.REQUEST_TIMEOUT}`);
+  console.log(`  REQUEST_LOGGING:   ${config.REQUEST_LOGGING}`);
   console.log(`  OVERRIDE_CONCURRENCY: ${config.OVERRIDE_CONCURRENCY}`);
   console.log(`  WEBSEARCH_PROVIDER:   ${config.WEBSEARCH_PROVIDER}`);
   console.log(`  API_KEY:           ${mask(config.API_KEY)}`);

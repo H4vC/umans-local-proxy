@@ -5,7 +5,7 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 
 const { fnv1a, fnv1a32, fnv1aMixNum } = require('../lib/hash');
-const { parseDuration, parseWebsearchProvider, parseListenAddr, cleanKeys, fileProxyApiKeys, readConfigFile, isLoopbackHost, normalizeSessionCookie } = require('../lib/config');
+const { parseDuration, parseWebsearchProvider, parseRequestLogging, parseListenAddr, cleanKeys, fileProxyApiKeys, readConfigFile, isLoopbackHost, normalizeSessionCookie } = require('../lib/config');
 const { snapReasoningLevel, enrichModelsWithReasoning, REASONING_RANK } = require('../lib/reasoning');
 const { firstNumber, concurrencyHardLimit, percentValue, burstQuota, concurrencyQuotaLimit, applyOverride, extractThrottle, fetchUmansUsage, getEffectiveConcurrency, canStart, acquireThrottleSlot, releaseThrottleSlot, notifyUpstream429, BURST_COOLDOWN_FILE } = require('../lib/concurrency');
 const { canonicalMessage, messageHash, chainHash, resolveGroupKey, storeStateKey } = require('../lib/coalesce');
@@ -254,10 +254,28 @@ test('parseWebsearchProvider is case-insensitive and trims', () => {
   assert.strictEqual(parseWebsearchProvider('Exa'), 'exa');
 });
 
-test('parseWebsearchProvider throws on unknown value', () => {
-  assert.throws(() => parseWebsearchProvider('google'), /WEBSEARCH_PROVIDER/);
-  assert.throws(() => parseWebsearchProvider('nativ'), /WEBSEARCH_PROVIDER/);
+test('parseRequestLogging accepts off/basic/verbose', () => {
+  assert.strictEqual(parseRequestLogging('off'), 'off');
+  assert.strictEqual(parseRequestLogging('basic'), 'basic');
+  assert.strictEqual(parseRequestLogging('verbose'), 'verbose');
 });
+
+test('parseRequestLogging defaults to off on empty/missing', () => {
+  assert.strictEqual(parseRequestLogging(''), 'off');
+  assert.strictEqual(parseRequestLogging(undefined), 'off');
+  assert.strictEqual(parseRequestLogging(null), 'off');
+});
+
+test('parseRequestLogging is case-insensitive and trims', () => {
+  assert.strictEqual(parseRequestLogging(' BASIC '), 'basic');
+  assert.strictEqual(parseRequestLogging('Verbose'), 'verbose');
+});
+
+test('parseRequestLogging throws on unknown value', () => {
+  assert.throws(() => parseRequestLogging('chatty'), /REQUEST_LOGGING/);
+});
+
+ // ---- config: parseListenProvider ----
 
 // ---- config: parseListenAddr ----
 

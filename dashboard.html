@@ -608,6 +608,13 @@
         <input id="sessionCookie" type="password" autocomplete="off" placeholder="Optional — app.umans.ai cap-health. Paste the __Secure-authjs.session-token value (token only, or full cookie). DevTools → Application → Cookies → app.umans.ai">
         <label for="timeout">Request timeout</label>
         <input id="timeout" placeholder="15m">
+        <label for="requestLogging">Request logging</label>
+        <select id="requestLogging">
+          <option value="off">off — no request lifecycle logs</option>
+          <option value="basic">basic — arrival, slot, upstream, release</option>
+          <option value="verbose">verbose — basic plus extra turn detail</option>
+        </select>
+
         <label for="overrideConcurrency">Override concurrency (0 = use UMANS limits)</label>
         <input id="overrideConcurrency" type="number" min="0" step="1" value="0">
         <label for="websearchProvider">Websearch provider</label>
@@ -1167,9 +1174,11 @@
         ['proxy auth', bool(config.proxyAuthEnabled)],
         ['backend routes', routeStr],
         ['timeout', esc(config.requestTimeout ?? '—')],
+        ['request logging', esc(config.requestLogging ?? 'off')],
         ['override concurrency', config.overrideConcurrency ?? 0],
         ['websearch provider', esc(config.websearchProvider ?? 'none')],
         ['enabled models', esc((config.enabledModels?.length ? config.enabledModels : []).join(', ') || 'all (no filter)')],
+
       ])}</tbody></table></div></div>`;
     }
 
@@ -1555,6 +1564,8 @@
           $('apiKey').placeholder = config.hasApiKey ? 'Configured; leave blank to keep' : 'sk-...';
           $('sessionCookie').placeholder = config.hasSessionCookie ? 'Configured; leave blank to keep' : 'Optional — for app.umans.ai account endpoints';
           $('timeout').value = config.requestTimeout || '15m';
+          $('requestLogging').value = config.requestLogging || 'off';
+
         $('overrideConcurrency').value = config.overrideConcurrency || 0;
         $('websearchProvider').value = config.websearchProvider || 'none';
           $('models').value = (config.enabledModels || []).join('\n');
@@ -1577,6 +1588,7 @@
       try {
         const payload = {
           requestTimeout: $('timeout').value.trim(),
+          requestLogging: $('requestLogging').value,
           overrideConcurrency: Number($('overrideConcurrency').value || 0),
           websearchProvider: $('websearchProvider').value
         };

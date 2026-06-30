@@ -700,3 +700,40 @@ test('live snapshot shows tps > 0 and ttftMs during an active stream', async () 
 
   await closeServer(proxy); await closeServer(upstream);
 });
+test('request logging emits lifecycle events for a streaming turn', async () => {
+  const sse = sseOpenAI();
+  const upstream = await startUpstream((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+    setTimeout(() => res.end(sse), 20);
+  });
+  const proxy = await startProxy();
+  seedState(`http://127.0.0.1:${upstream.address().port}`);
+  state.config.requestLogging = 'basic';
+  state.config.requestLoggingRaw = 'basic';
+  const logs = [];
+  const origLog = console.log;
+  console.log = (...args) => { logs.push(args.join(' ')); };
+  try {
+    const port = proxy.address().port;
+    const resp = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: bodyOf({ stream: true }),
+    });
+    await resp.text();
+    await new Promise((r) => setTimeout(r, 30));
+  } finally {
+    console.log = origLog;
+    await closeServer(proxy); await closeServer(upstream);
+  }
+
+  const joined = logs.join('\n');
+  assert.match(joined, /arrived/);
+  assert.match(joined, /waiting for concurrency slot/);
+  assert.match(joined, /acquired concurrency slot/);
+  assert.match(joined, /passing request upstream/);
+  assert.match(joined, /upstream responded/);
+  assert.match(joined, /streaming upstream turn/);
+  assert.match(joined, /upstream finished streaming turn/);
+  assert.match(joined, /released concurrency slot and finalized turn/);
+});

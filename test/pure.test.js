@@ -7,7 +7,7 @@ const assert = require('node:assert/strict');
 const { fnv1a, fnv1a32, fnv1aMixNum } = require('../lib/hash');
 const { parseDuration, parseWebsearchProvider, parseListenAddr, cleanKeys, fileProxyApiKeys, readConfigFile, isLoopbackHost, normalizeSessionCookie } = require('../lib/config');
 const { snapReasoningLevel, enrichModelsWithReasoning, REASONING_RANK } = require('../lib/reasoning');
-const { firstNumber, concurrencyHardLimit, percentValue, burstQuota, concurrencyQuotaLimit, applyOverride, extractThrottle, getEffectiveConcurrency, canStart, acquireThrottleSlot, releaseThrottleSlot, notifyUpstream429, BURST_COOLDOWN_FILE } = require('../lib/concurrency');
+const { firstNumber, concurrencyHardLimit, percentValue, burstQuota, concurrencyQuotaLimit, applyOverride, extractThrottle, fetchUmansUsage, getEffectiveConcurrency, canStart, acquireThrottleSlot, releaseThrottleSlot, notifyUpstream429, BURST_COOLDOWN_FILE } = require('../lib/concurrency');
 const { canonicalMessage, messageHash, chainHash, resolveGroupKey, storeStateKey } = require('../lib/coalesce');
 const { authorized, wsUpgradeAllowed, isLoopback, safeHeaders, requiresProxyAuth } = require('../lib/auth');
 const { createSession, finalizeSession } = require('../lib/sessions');
@@ -521,6 +521,10 @@ test('concurrencyQuotaLimit uses hard limit via burst_pct when no live quota', (
   assert.strictEqual(concurrencyQuotaLimit({ limit: 10, burst_pct: 0.5 }), 15);
 });
 
+test('concurrencyQuotaLimit returns null when usage reports no positive max', () => {
+  assert.strictEqual(concurrencyQuotaLimit({ limit: 0, hard_cap: 0 }), null);
+});
+
 // ---- concurrency: applyOverride ----
 
 test('applyOverride no override returns as-is', () => {
@@ -798,6 +802,80 @@ test('getEffectiveConcurrency trusts upstream concurrent when the cache is fresh
   }
 });
 
+test('fetchUmansUsage caches top-level concurrent_sessions for admission', async () => {
+  const s = require('../lib/state');
+  const origFetch = global.fetch;
+  const orig = { config: s.config, usageCache: s.usageCache, concurrencyCache: s.concurrencyCache, usageEverFetched: s.usageEverFetched, activeRequests: s.activeRequests, burstDisabledUntil: s.burstDisabledUntil };
+  global.fetch = async () => ({ ok: true, json: async () => ({ concurrent_sessions: 8, limits: { concurrency: { limit: 8 } } }) });
+  s.config = { ...s.config, apiKey: 'test-key', upstreamBaseURL: 'https://example.test', overrideConcurrency: 0 };
+  s.usageCache = { data: null, time: 0 };
+  s.concurrencyCache = { concurrent: null, limit: null, softLimit: null, boxedUntil: null, time: 0 };
+  s.usageEverFetched = false;
+  s.activeRequests = 0;
+  s.burstDisabledUntil = 0;
+  try {
+    const data = await fetchUmansUsage({ force: true });
+    const effective = getEffectiveConcurrency();
+    assert.strictEqual(data.throttle.concurrent, 8, 'extractThrottle reads top-level concurrent_sessions');
+    assert.strictEqual(effective.concurrent, 8, 'admission cache must store the same top-level concurrent_sessions');
+    assert.strictEqual(canStart(effective), false, 'at-limit upstream concurrency must block a new local request');
+  } finally {
+    global.fetch = origFetch;
+    s.config = orig.config; s.usageCache = orig.usageCache; s.concurrencyCache = orig.concurrencyCache;
+    s.usageEverFetched = orig.usageEverFetched; s.activeRequests = orig.activeRequests; s.burstDisabledUntil = orig.burstDisabledUntil;
+  }
+});
+
+test('failed stale usage refresh wakes waiters to re-check admission', async () => {
+  const s = require('../lib/state');
+  const origFetch = global.fetch;
+  const orig = {
+    config: s.config, usageCache: s.usageCache, concurrencyCache: s.concurrencyCache,
+    usageEverFetched: s.usageEverFetched, activeRequests: s.activeRequests,
+    queuedRequests: s.queuedRequests, throttleWaiters: s.throttleWaiters,
+    refreshUsageInFlight: s.refreshUsageInFlight, refreshUsageTimer: s.refreshUsageTimer,
+    burstDisabledUntil: s.burstDisabledUntil,
+  };
+  global.fetch = async () => { throw new Error('usage down'); };
+  s.config = { ...s.config, apiKey: 'test-key', upstreamBaseURL: 'https://example.test', overrideConcurrency: 0 };
+  s.usageCache = { data: { ok: true }, time: Date.now() };
+  s.concurrencyCache = { concurrent: 8, limit: 8, softLimit: 4, boxedUntil: null, time: Date.now() };
+  s.usageEverFetched = true;
+  s.activeRequests = 0;
+  s.queuedRequests = 0;
+  s.throttleWaiters = [];
+  s.refreshUsageInFlight = false;
+  s.refreshUsageTimer = null;
+  s.burstDisabledUntil = 0;
+  const controller = new AbortController();
+  let acquired = false;
+  const acquire = acquireThrottleSlot({}, controller.signal).then(() => { acquired = true; });
+  try {
+    await new Promise((r) => setImmediate(r));
+    assert.strictEqual(s.throttleWaiters.length, 1, 'fresh at-limit upstream concurrency queues the request');
+
+    s.concurrencyCache.time = Date.now() - 60000;
+    await fetchUmansUsage({ force: true });
+    await Promise.race([
+      acquire,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('waiter was not woken')), 100)),
+    ]);
+    assert.strictEqual(acquired, true);
+    assert.strictEqual(s.activeRequests, 1, 'wake pre-increments the acquired slot');
+    releaseThrottleSlot();
+  } finally {
+    controller.abort();
+    await acquire.catch(() => {});
+    if (s.refreshUsageTimer) clearTimeout(s.refreshUsageTimer);
+    global.fetch = origFetch;
+    s.config = orig.config; s.usageCache = orig.usageCache; s.concurrencyCache = orig.concurrencyCache;
+    s.usageEverFetched = orig.usageEverFetched; s.activeRequests = orig.activeRequests;
+    s.queuedRequests = orig.queuedRequests; s.throttleWaiters = orig.throttleWaiters;
+    s.refreshUsageInFlight = orig.refreshUsageInFlight; s.refreshUsageTimer = orig.refreshUsageTimer;
+    s.burstDisabledUntil = orig.burstDisabledUntil;
+  }
+});
+
 // ---- C2: canStart cold-start floor before the first /usage fetch ----
 
 test('canStart admits only the cold-start floor before the first /usage fetch (C2)', () => {
@@ -815,15 +893,21 @@ test('canStart admits only the cold-start floor before the first /usage fetch (C
   }
 });
 
-test('canStart treats a null limit as unlimited after the first /usage fetch (C2)', () => {
+test('getEffectiveConcurrency hard-bounds broken post-fetch usage to 4', () => {
   const s = require('../lib/state');
-  const orig = { usageEverFetched: s.usageEverFetched, activeRequests: s.activeRequests };
+  const orig = { config: s.config, concurrencyCache: s.concurrencyCache, usageEverFetched: s.usageEverFetched, activeRequests: s.activeRequests, burstDisabledUntil: s.burstDisabledUntil };
+  s.config = { ...s.config, overrideConcurrency: 0 };
+  s.concurrencyCache = { concurrent: 0, limit: null, softLimit: null, boxedUntil: null, time: Date.now() };
   s.usageEverFetched = true;
-  s.activeRequests = 5;
+  s.activeRequests = 4;
+  s.burstDisabledUntil = 0;
   try {
-    assert.strictEqual(canStart({ limit: null, softLimit: null, concurrent: 0 }), true); // genuinely uncapped
+    const effective = getEffectiveConcurrency();
+    assert.strictEqual(effective.limit, 4);
+    assert.strictEqual(canStart(effective), false);
   } finally {
-    s.usageEverFetched = orig.usageEverFetched; s.activeRequests = orig.activeRequests;
+    s.config = orig.config; s.concurrencyCache = orig.concurrencyCache; s.usageEverFetched = orig.usageEverFetched;
+    s.activeRequests = orig.activeRequests; s.burstDisabledUntil = orig.burstDisabledUntil;
   }
 });
 

@@ -921,6 +921,12 @@
       const win = data?.window || {};
       const concSoft = positive(throttle.soft) ?? throttle.softLimit ?? null;
       const concHard = positive(throttle.hard);
+      // Effective admission hard ceiling: the provider hard cap minus the
+      // one-slot guardrail concurrencyQuotaLimit keeps below it (caps at
+      // hard-1). Shown in the limit box instead of the raw hard_cap so the
+      // displayed ceiling matches what we actually admit to — otherwise the
+      // box reads "hard 8" while admission stops at 7.
+      const hardCeiling = (concHard != null && concSoft != null && concHard > concSoft) ? concHard - 1 : concHard;
       const quotaLimit = positive(throttle.quotaLimit) ?? concSoft;
       let concLimit = throttle.limit ?? quotaLimit;
       // While the cooldown is active the enforced limit is the soft limit; a
@@ -959,16 +965,17 @@
       baseLimitLines = [];
       if (throttle.overridden) baseLimitLines.push({ k: 'override', v: (quotaLimit && quotaLimit !== concLimit) ? `from ${fmt(quotaLimit)}` : 'on', cls: 'v accent' });
       if (concSoft != null && concSoft !== concLimit) baseLimitLines.push({ k: 'soft', v: fmt(concSoft), cls: 'v num' });
-      if (concHard != null && concHard !== concLimit) baseLimitLines.push({ k: 'hard', v: fmt(concHard), cls: 'v num' });
+      if (hardCeiling != null && hardCeiling !== concLimit) baseLimitLines.push({ k: 'hard', v: fmt(hardCeiling), cls: 'v num' });
       if (concHard != null && concSoft != null && concHard > concSoft) {
         baseLimitLines.push({ k: 'burst', v: `${Math.round((throttle.burstQuota ?? 0) * 100)}%`, cls: 'v num' });
       }
       $('concUsed').textContent = fmt(used);
       $('concLimit').textContent = concLimit != null ? fmt(concLimit) : '--';
       const pct = concLimit ? (used / concLimit) * 100 : 0;
+      const over = concLimit ? Math.max(0, used - concLimit) : 0; // sessions beyond our admission cap (external load / in-flight / stale)
       const fill = $('concMeter');
-      fill.style.width = clampPct(pct) + '%';
-      $('concPct').textContent = clampPct(pct) + '%';
+      fill.style.width = clampPct(pct) + '%'; // bar capped at 100%; overflow surfaced as "+N" below
+      $('concPct').textContent = over > 0 ? `${clampPct(pct)}% +${over}` : (clampPct(pct) + '%');
       // Interpolate between theme --good → --warn → --bad as pct rises.
       const mix = (c1, c2, t) => c1.map((v, i) => Math.round(v + (c2[i] - v) * t));
       const hexToRgb = (h) => [1, 3, 5].map((i) => parseInt(h.slice(i, i + 2), 16));

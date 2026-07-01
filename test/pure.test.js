@@ -529,11 +529,13 @@ test('concurrencyQuotaLimit returns hard when hard <= soft', () => {
   assert.strictEqual(concurrencyQuotaLimit({ limit: 10, hard_cap: 8 }), 8);
 });
 
-test('concurrencyQuotaLimit ignores burst headroom for local admission', () => {
-  // Burst is provider-side and has caused upstream 429s under large parallel
-  // local batches. Admit only the base concurrency limit.
-  assert.strictEqual(concurrencyQuotaLimit({ limit: 10, hard_cap: 20, burst_remaining_pct: 0.5 }), 10);
-  assert.strictEqual(concurrencyQuotaLimit({ limit: 10, burst_pct: 0.5 }), 10);
+test('concurrencyQuotaLimit spends burst quota up to hard minus one', () => {
+  assert.strictEqual(concurrencyQuotaLimit({ limit: 10, hard_cap: 20, burst_remaining_pct: 0.5 }), 14);
+  assert.strictEqual(concurrencyQuotaLimit({ limit: 10, hard_cap: 20, burst_remaining_pct: 1 }), 19);
+});
+
+test('concurrencyQuotaLimit uses full burst when no remaining quota field exists', () => {
+  assert.strictEqual(concurrencyQuotaLimit({ limit: 10, burst_pct: 0.5 }), 14);
 });
 
 test('concurrencyQuotaLimit returns null when usage reports no positive max', () => {
@@ -575,9 +577,9 @@ test('extractThrottle clamps boxed accounts to soft concurrency', () => {
       limits: { concurrency: { limit: 4, hard_cap: 8, burst_pct: 1 } },
       usage: { concurrent_sessions: 0, priority: { low: true, boxed_until: boxedUntil } },
     });
-    assert.strictEqual(throttle.limit, 4);
+    assert.strictEqual(throttle.quotaLimit, 7);
     assert.strictEqual(throttle.softLimit, 4);
-    assert.strictEqual(throttle.quotaLimit, 4);
+    assert.strictEqual(throttle.limit, 4);
     assert.strictEqual(throttle.boxed, true);
     assert.strictEqual(throttle.boxedUntil, boxedUntil);
   } finally {
@@ -617,9 +619,9 @@ test('extractThrottle clamps to soft while burst cooldown is active', () => {
       limits: { concurrency: { limit: 4, hard_cap: 8, burst_pct: 1 } },
       usage: { concurrent_sessions: 0 },
     });
-    assert.strictEqual(throttle.limit, 4);
+    assert.strictEqual(throttle.quotaLimit, 7);
     assert.strictEqual(throttle.softLimit, 4);
-    assert.strictEqual(throttle.quotaLimit, 4);
+    assert.strictEqual(throttle.limit, 4);
     assert.strictEqual(throttle.burstCooldown, true);
     assert.strictEqual(throttle.burstCooldownUntil, new Date(until).toISOString());
   } finally {

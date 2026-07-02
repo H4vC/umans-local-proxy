@@ -1,13 +1,13 @@
 'use strict';
 require('./fetch-guard');
 
-const { test } = require('node:test');
+const { test, beforeEach } = require('node:test');
 const assert = require('node:assert/strict');
 
 const { fnv1a, fnv1a32, fnv1aMixNum } = require('../lib/hash');
 const { parseDuration, parseWebsearchProvider, parseRequestLogging, parseListenAddr, cleanKeys, fileProxyApiKeys, readConfigFile, isLoopbackHost, normalizeSessionCookie } = require('../lib/config');
 const { snapReasoningLevel, enrichModelsWithReasoning, REASONING_RANK } = require('../lib/reasoning');
-const { firstNumber, concurrencyHardLimit, percentValue, burstQuota, concurrencyQuotaLimit, applyOverride, extractThrottle, fetchUmansUsage, getEffectiveConcurrency, canStart, acquireThrottleSlot, releaseThrottleSlot, notifyUpstream429, BURST_COOLDOWN_FILE } = require('../lib/concurrency');
+const { firstNumber, concurrencyHardLimit, percentValue, burstQuota, concurrencyQuotaLimit, applyOverride, extractThrottle, fetchUmansUsage, getEffectiveConcurrency, canStart, acquireThrottleSlot, releaseThrottleSlot, notifyUpstream429, BURST_COOLDOWN_FILE, RELEASE_COOLDOWN_MS, PHANTOM_WINDOW, coolingDownNow, currentPhantomEstimate, wakeThrottleWaiters } = require('../lib/concurrency');
 const { canonicalMessage, messageHash, chainHash, resolveGroupKey, storeStateKey } = require('../lib/coalesce');
 const { authorized, wsUpgradeAllowed, isLoopback, safeHeaders, requiresProxyAuth } = require('../lib/auth');
 const { createSession, finalizeSession } = require('../lib/sessions');
@@ -19,6 +19,17 @@ const { PassThrough } = require('node:stream');
 const fs = require('node:fs');
 const os = require('node:os');
 const nodePath = require('node:path');
+
+// The concurrency port added three persistent fields to the shared state
+// singleton (releaseCooldowns, phantomSamples, cooldownWakeTimer) that
+// survive across tests because state.js is a module-level singleton never
+// re-required. Reset them before each test so a prior test's cooldowns or
+// phantom samples can't perturb an unrelated assertion.
+beforeEach(() => {
+  state.releaseCooldowns = [];
+  state.phantomSamples = [];
+  if (state.cooldownWakeTimer) { clearTimeout(state.cooldownWakeTimer); state.cooldownWakeTimer = null; }
+});
 
 // ---- hash ----
 
@@ -345,6 +356,19 @@ test('normalizeSessionCookie returns empty for empty/whitespace/null input', () 
   assert.strictEqual(normalizeSessionCookie(null), '');
 });
 
+test('normalizeSessionCookie discards a token with a copy-paste ellipsis (U+2026)', () => {
+  assert.strictEqual(normalizeSessionCookie('eyJabc\u2026def.sig'), '');
+});
+
+test('normalizeSessionCookie discards a header with smart quotes / NBSP', () => {
+  assert.strictEqual(normalizeSessionCookie('__Secure-authjs.session-token=eyJ\u2019abc'), '');
+  assert.strictEqual(normalizeSessionCookie('foo=bar\u00A0baz'), '');
+});
+
+test('normalizeSessionCookie keeps structural chars (; = space) in a multi-cookie header', () => {
+  assert.strictEqual(normalizeSessionCookie('a=b; c=d e'), 'a=b; c=d e');
+});
+
 // ---- reasoning: snapReasoningLevel ----
 // Requires state.modelInfoCache to be populated.
 
@@ -529,13 +553,13 @@ test('concurrencyQuotaLimit returns hard when hard <= soft', () => {
   assert.strictEqual(concurrencyQuotaLimit({ limit: 10, hard_cap: 8 }), 8);
 });
 
-test('concurrencyQuotaLimit spends burst quota up to hard minus one', () => {
-  assert.strictEqual(concurrencyQuotaLimit({ limit: 10, hard_cap: 20, burst_remaining_pct: 0.5 }), 14);
-  assert.strictEqual(concurrencyQuotaLimit({ limit: 10, hard_cap: 20, burst_remaining_pct: 1 }), 19);
+test('concurrencyQuotaLimit spends burst quota up to hard cap', () => {
+  assert.strictEqual(concurrencyQuotaLimit({ limit: 10, hard_cap: 20, burst_remaining_pct: 0.5 }), 15);
+  assert.strictEqual(concurrencyQuotaLimit({ limit: 10, hard_cap: 20, burst_remaining_pct: 1 }), 20);
 });
 
 test('concurrencyQuotaLimit uses full burst when no remaining quota field exists', () => {
-  assert.strictEqual(concurrencyQuotaLimit({ limit: 10, burst_pct: 0.5 }), 14);
+  assert.strictEqual(concurrencyQuotaLimit({ limit: 10, burst_pct: 0.5 }), 15);
 });
 
 test('concurrencyQuotaLimit returns null when usage reports no positive max', () => {
@@ -577,7 +601,7 @@ test('extractThrottle clamps boxed accounts to soft concurrency', () => {
       limits: { concurrency: { limit: 4, hard_cap: 8, burst_pct: 1 } },
       usage: { concurrent_sessions: 0, priority: { low: true, boxed_until: boxedUntil } },
     });
-    assert.strictEqual(throttle.quotaLimit, 7);
+    assert.strictEqual(throttle.quotaLimit, 8);
     assert.strictEqual(throttle.softLimit, 4);
     assert.strictEqual(throttle.limit, 4);
     assert.strictEqual(throttle.boxed, true);
@@ -619,7 +643,7 @@ test('extractThrottle clamps to soft while burst cooldown is active', () => {
       limits: { concurrency: { limit: 4, hard_cap: 8, burst_pct: 1 } },
       usage: { concurrent_sessions: 0 },
     });
-    assert.strictEqual(throttle.quotaLimit, 7);
+    assert.strictEqual(throttle.quotaLimit, 8);
     assert.strictEqual(throttle.softLimit, 4);
     assert.strictEqual(throttle.limit, 4);
     assert.strictEqual(throttle.burstCooldown, true);
@@ -669,12 +693,16 @@ test('acquireThrottleSlot releases a woken-then-aborted slot (no leak)', async (
   s.refreshUsageTimer = null;
   try {
     const controller = new AbortController();
-    // Queues (waiter pushed). releaseThrottleSlot wakes it (pre-increments
-    // activeRequests) and we abort before the await resumes — the exact
-    // woken-then-aborted race that used to leak a slot.
+    // Queues (waiter pushed). releaseThrottleSlot pushes a cooldown (the
+    // released permit rests 2s) so wakeThrottleWaiters can't wake immediately
+    // — held(0)+cooling(1) >= limit(1). Clear the cooldown and manually wake
+    // to simulate the cooldown timer firing, then abort before the await
+    // resumes — the exact woken-then-aborted race that used to leak a slot.
     const p = acquireThrottleSlot({}, controller.signal);
     releaseThrottleSlot();
-    controller.abort();
+    s.releaseCooldowns = []; // expire the cooling permit so wake finds room
+    wakeThrottleWaiters();   // pre-increments activeRequests to 1
+    controller.abort();      // abort before the await resumes
     await assert.rejects(p, /aborted/);
     assert.strictEqual(s.activeRequests, 0, 'woken-then-aborted slot must be released');
   } finally {
@@ -852,11 +880,17 @@ test('failed stale usage refresh wakes waiters to re-check admission', async () 
     queuedRequests: s.queuedRequests, throttleWaiters: s.throttleWaiters,
     refreshUsageInFlight: s.refreshUsageInFlight, refreshUsageTimer: s.refreshUsageTimer,
     burstDisabledUntil: s.burstDisabledUntil,
+    phantomSamples: s.phantomSamples,
   };
   global.fetch = async () => { throw new Error('usage down'); };
   s.config = { ...s.config, apiKey: 'test-key', upstreamBaseURL: 'https://example.test', overrideConcurrency: 0 };
   s.usageCache = { data: { ok: true }, time: Date.now() };
   s.concurrencyCache = { concurrent: 8, limit: 8, softLimit: 4, boxedUntil: null, time: Date.now() };
+  // Seed a phantom sample so the gate shrinks to 0 and the initial acquire
+  // queues. The new admission model uses held+cooling vs a phantom-absorbed
+  // limit, not max(local, upstream) — without this sample the limit stays 8
+  // and the request acquires immediately (no queue to wake from).
+  s.phantomSamples = [{ observed: 8, local: 0 }];
   s.usageEverFetched = true;
   s.activeRequests = 0;
   s.queuedRequests = 0;
@@ -890,6 +924,7 @@ test('failed stale usage refresh wakes waiters to re-check admission', async () 
     s.queuedRequests = orig.queuedRequests; s.throttleWaiters = orig.throttleWaiters;
     s.refreshUsageInFlight = orig.refreshUsageInFlight; s.refreshUsageTimer = orig.refreshUsageTimer;
     s.burstDisabledUntil = orig.burstDisabledUntil;
+    s.phantomSamples = orig.phantomSamples;
   }
 });
 
@@ -992,6 +1027,249 @@ test('notifyUpstream429 does not wake queued waiters (cascade guard, C5)', () =>
     try { fs.rmSync(BURST_COOLDOWN_FILE, { force: true }); } catch {}
   }
 });
+
+// ---- P1: phantom absorption shrinks the effective limit ----
+
+test('getEffectiveConcurrency shrinks the limit by a sustained phantom estimate (P1)', () => {
+  const s = require('../lib/state');
+  const orig = { config: s.config, concurrencyCache: s.concurrencyCache, burstDisabledUntil: s.burstDisabledUntil, activeRequests: s.activeRequests, phantomSamples: s.phantomSamples };
+  s.config = { ...s.config, overrideConcurrency: 0 };
+  s.burstDisabledUntil = 0;
+  s.concurrencyCache = { concurrent: 6, limit: 8, softLimit: 4, boxedUntil: null, time: Date.now() };
+  s.activeRequests = 4;
+  // Three samples where observed (6) exceeds local (4) by 2 — a sustained
+  // phantom. The windowed min is 2, so the limit shrinks from 8 to 6.
+  s.phantomSamples = [
+    { observed: 6, local: 4 },
+    { observed: 6, local: 4 },
+    { observed: 6, local: 4 },
+  ];
+  try {
+    const effective = getEffectiveConcurrency();
+    assert.strictEqual(effective.phantomEstimate, 2, 'phantom estimate is the windowed sustained excess');
+    assert.strictEqual(effective.limit, 6, 'limit shrinks by the phantom estimate');
+  } finally {
+    s.config = orig.config; s.concurrencyCache = orig.concurrencyCache; s.burstDisabledUntil = orig.burstDisabledUntil;
+    s.activeRequests = orig.activeRequests; s.phantomSamples = orig.phantomSamples;
+  }
+});
+
+test('phantom estimate drops a transient lag spike (windowed min, P1)', () => {
+  const s = require('../lib/state');
+  const orig = { config: s.config, concurrencyCache: s.concurrencyCache, burstDisabledUntil: s.burstDisabledUntil, activeRequests: s.activeRequests, phantomSamples: s.phantomSamples };
+  s.config = { ...s.config, overrideConcurrency: 0 };
+  s.burstDisabledUntil = 0;
+  s.concurrencyCache = { concurrent: 4, limit: 8, softLimit: 4, boxedUntil: null, time: Date.now() };
+  s.activeRequests = 4;
+  // One sample has a lag spike (observed 9 = a just-completed request still
+  // in the provider's counter), but the other two are clean (observed == local).
+  // The windowed min drops the spike; estimate is 0, limit stays at 8.
+  s.phantomSamples = [
+    { observed: 4, local: 4 },
+    { observed: 9, local: 4 },
+    { observed: 4, local: 4 },
+  ];
+  try {
+    const effective = getEffectiveConcurrency();
+    assert.strictEqual(effective.phantomEstimate, 0, 'transient lag spike is dropped by the windowed min');
+    assert.strictEqual(effective.limit, 8, 'limit unchanged when no sustained phantom');
+  } finally {
+    s.config = orig.config; s.concurrencyCache = orig.concurrencyCache; s.burstDisabledUntil = orig.burstDisabledUntil;
+    s.activeRequests = orig.activeRequests; s.phantomSamples = orig.phantomSamples;
+  }
+});
+
+test('phantom absorption is skipped when the usage cache is stale (fail-safe, P1)', () => {
+  const s = require('../lib/state');
+  const orig = { config: s.config, concurrencyCache: s.concurrencyCache, burstDisabledUntil: s.burstDisabledUntil, activeRequests: s.activeRequests, phantomSamples: s.phantomSamples };
+  s.config = { ...s.config, overrideConcurrency: 0 };
+  s.burstDisabledUntil = 0;
+  s.concurrencyCache = { concurrent: 6, limit: 8, softLimit: 4, boxedUntil: null, time: Date.now() - 60000 };
+  s.activeRequests = 4;
+  s.phantomSamples = [{ observed: 6, local: 4 }];
+  try {
+    const effective = getEffectiveConcurrency();
+    assert.strictEqual(effective.phantomEstimate, 0, 'stale cache → phantom estimate reported as 0');
+    assert.strictEqual(effective.limit, 8, 'stale cache → limit not shrunk by outdated samples');
+  } finally {
+    s.config = orig.config; s.concurrencyCache = orig.concurrencyCache; s.burstDisabledUntil = orig.burstDisabledUntil;
+    s.activeRequests = orig.activeRequests; s.phantomSamples = orig.phantomSamples;
+  }
+});
+
+test('canStart blocks when held+cooling reaches the phantom-absorbed limit (P1)', () => {
+  const s = require('../lib/state');
+  const orig = { config: s.config, concurrencyCache: s.concurrencyCache, usageEverFetched: s.usageEverFetched, activeRequests: s.activeRequests, phantomSamples: s.phantomSamples, releaseCooldowns: s.releaseCooldowns };
+  s.config = { ...s.config, overrideConcurrency: 0 };
+  s.usageEverFetched = true;
+  s.concurrencyCache = { concurrent: 4, limit: 4, softLimit: 4, boxedUntil: null, time: Date.now() };
+  s.activeRequests = 2;
+  s.phantomSamples = [{ observed: 4, local: 2 }]; // phantom = 2 → limit shrinks 4→2
+  s.releaseCooldowns = [];
+  try {
+    const effective = getEffectiveConcurrency();
+    assert.strictEqual(effective.limit, 2, 'limit shrunk by phantom estimate');
+    assert.strictEqual(canStart(effective), false, 'held(2) >= limit(2) blocks');
+  } finally {
+    s.config = orig.config; s.concurrencyCache = orig.concurrencyCache; s.usageEverFetched = orig.usageEverFetched;
+    s.activeRequests = orig.activeRequests; s.phantomSamples = orig.phantomSamples; s.releaseCooldowns = orig.releaseCooldowns;
+  }
+});
+
+// ---- P2: release cooldown blocks immediate reuse ----
+
+test('releaseThrottleSlot pushes a cooling permit that blocks admission (P2)', () => {
+  const s = require('../lib/state');
+  const orig = { concurrencyCache: s.concurrencyCache, usageEverFetched: s.usageEverFetched, activeRequests: s.activeRequests, queuedRequests: s.queuedRequests, throttleWaiters: s.throttleWaiters, releaseCooldowns: s.releaseCooldowns, burstDisabledUntil: s.burstDisabledUntil, refreshUsageInFlight: s.refreshUsageInFlight, refreshUsageTimer: s.refreshUsageTimer, usageCache: s.usageCache, phantomSamples: s.phantomSamples };
+  s.config = { ...s.config, overrideConcurrency: 0 };
+  s.concurrencyCache = { concurrent: 0, limit: 2, softLimit: 2, boxedUntil: null, time: Date.now() };
+  s.usageCache = { data: { ok: true }, time: Date.now() };
+  s.usageEverFetched = true;
+  s.activeRequests = 1;
+  s.queuedRequests = 0;
+  s.throttleWaiters = [];
+  s.releaseCooldowns = [];
+  s.phantomSamples = [];
+  s.burstDisabledUntil = 0;
+  s.refreshUsageInFlight = false;
+  s.refreshUsageTimer = null;
+  try {
+    releaseThrottleSlot(); // activeRequests 1→0, pushes a 2s cooldown
+    assert.strictEqual(s.activeRequests, 0, 'permit released');
+    assert.strictEqual(s.releaseCooldowns.length, 1, 'cooldown pushed');
+    assert.strictEqual(coolingDownNow(), 1, 'one permit is cooling');
+    // held(0) + cooling(1) >= limit(2)? No (1 < 2). But the next request
+    // should still be admitted because there's room. Instead test the block:
+    // fill the remaining slot, then the cooling permit should block.
+    s.activeRequests = 1;
+    const effective = getEffectiveConcurrency();
+    assert.strictEqual(canStart(effective), false, 'held(1)+cooling(1) >= limit(2) blocks');
+  } finally {
+    s.concurrencyCache = orig.concurrencyCache; s.usageEverFetched = orig.usageEverFetched;
+    s.activeRequests = orig.activeRequests; s.queuedRequests = orig.queuedRequests;
+    s.throttleWaiters = orig.throttleWaiters; s.releaseCooldowns = orig.releaseCooldowns;
+    s.burstDisabledUntil = orig.burstDisabledUntil; s.refreshUsageInFlight = orig.refreshUsageInFlight;
+    s.refreshUsageTimer = orig.refreshUsageTimer; s.usageCache = orig.usageCache;
+    s.phantomSamples = orig.phantomSamples;
+    if (s.cooldownWakeTimer) { clearTimeout(s.cooldownWakeTimer); s.cooldownWakeTimer = null; }
+  }
+});
+
+test('coolingDownNow prunes expired cooldowns (P2)', () => {
+  const s = require('../lib/state');
+  const orig = { releaseCooldowns: s.releaseCooldowns };
+  // Push an already-expired cooldown — pruning should drop it immediately.
+  s.releaseCooldowns = [Date.now() - 1000];
+  try {
+    assert.strictEqual(coolingDownNow(), 0, 'expired cooldown is pruned');
+    assert.strictEqual(s.releaseCooldowns.length, 0, 'deque emptied');
+  } finally {
+    s.releaseCooldowns = orig.releaseCooldowns;
+  }
+});
+
+test('currentPhantomEstimate returns 0 with no samples (P1)', () => {
+  const s = require('../lib/state');
+  const orig = { phantomSamples: s.phantomSamples };
+  s.phantomSamples = [];
+  try {
+    assert.strictEqual(currentPhantomEstimate(), 0);
+  } finally {
+    s.phantomSamples = orig.phantomSamples;
+  }
+});
+
+test('currentPhantomEstimate takes the min over the window (P1)', () => {
+  const s = require('../lib/state');
+  const orig = { phantomSamples: s.phantomSamples };
+  s.phantomSamples = [
+    { observed: 7, local: 4 }, // excess 3
+    { observed: 6, local: 4 }, // excess 2  ← min
+    { observed: 8, local: 4 }, // excess 4
+  ];
+  try {
+    assert.strictEqual(currentPhantomEstimate(), 2, 'min excess over the window');
+  } finally {
+    s.phantomSamples = orig.phantomSamples;
+  }
+});
+
+test('doFetchUmansUsage records a phantom sample aligned to heldAtFetch (P1)', async () => {
+  const s = require('../lib/state');
+  const origFetch = global.fetch;
+  const orig = { config: s.config, usageCache: s.usageCache, concurrencyCache: s.concurrencyCache, usageEverFetched: s.usageEverFetched, activeRequests: s.activeRequests, burstDisabledUntil: s.burstDisabledUntil, phantomSamples: s.phantomSamples };
+  global.fetch = async () => ({ ok: true, json: async () => ({ usage: { concurrent_sessions: 6 }, limits: { concurrency: { limit: 8 } } }) });
+  s.config = { ...s.config, apiKey: 'test-key', upstreamBaseURL: 'https://example.test', overrideConcurrency: 0 };
+  s.usageCache = { data: null, time: 0 };
+  s.concurrencyCache = { concurrent: null, limit: null, softLimit: null, boxedUntil: null, time: 0 };
+  s.usageEverFetched = false;
+  s.activeRequests = 4;
+  s.burstDisabledUntil = 0;
+  s.phantomSamples = [];
+  try {
+    await fetchUmansUsage({ force: true });
+    assert.strictEqual(s.phantomSamples.length, 1, 'one sample recorded');
+    assert.strictEqual(s.phantomSamples[0].observed, 6, 'observed is the upstream concurrent_sessions');
+    assert.strictEqual(s.phantomSamples[0].local, 4, 'local is heldAtFetch captured before the await');
+  } finally {
+    global.fetch = origFetch;
+    s.config = orig.config; s.usageCache = orig.usageCache; s.concurrencyCache = orig.concurrencyCache;
+    s.usageEverFetched = orig.usageEverFetched; s.activeRequests = orig.activeRequests;
+    s.burstDisabledUntil = orig.burstDisabledUntil; s.phantomSamples = orig.phantomSamples;
+  }
+});
+
+test('phantom sample window is bounded to PHANTOM_WINDOW entries (P1)', async () => {
+  const s = require('../lib/state');
+  const origFetch = global.fetch;
+  const orig = { config: s.config, usageCache: s.usageCache, concurrencyCache: s.concurrencyCache, usageEverFetched: s.usageEverFetched, activeRequests: s.activeRequests, burstDisabledUntil: s.burstDisabledUntil, phantomSamples: s.phantomSamples, refreshUsageInFlight: s.refreshUsageInFlight, refreshUsageTimer: s.refreshUsageTimer };
+  let n = 0;
+  global.fetch = async () => ({ ok: true, json: async () => ({ usage: { concurrent_sessions: ++n }, limits: { concurrency: { limit: 10 } } }) });
+  s.config = { ...s.config, apiKey: 'test-key', upstreamBaseURL: 'https://example.test', overrideConcurrency: 0 };
+  s.usageCache = { data: null, time: 0 };
+  s.concurrencyCache = { concurrent: null, limit: null, softLimit: null, boxedUntil: null, time: 0 };
+  s.usageEverFetched = false;
+  s.activeRequests = 0;
+  s.burstDisabledUntil = 0;
+  s.phantomSamples = [];
+  s.refreshUsageInFlight = false;
+  s.refreshUsageTimer = null;
+  try {
+    for (let i = 0; i < PHANTOM_WINDOW + 2; i++) await fetchUmansUsage({ force: true });
+    assert.strictEqual(s.phantomSamples.length, PHANTOM_WINDOW, 'window bounded');
+  } finally {
+    global.fetch = origFetch;
+    s.config = orig.config; s.usageCache = orig.usageCache; s.concurrencyCache = orig.concurrencyCache;
+    s.usageEverFetched = orig.usageEverFetched; s.activeRequests = orig.activeRequests;
+    s.burstDisabledUntil = orig.burstDisabledUntil; s.phantomSamples = orig.phantomSamples;
+    s.refreshUsageInFlight = orig.refreshUsageInFlight; s.refreshUsageTimer = orig.refreshUsageTimer;
+  }
+});
+
+// ---- P3: extractThrottle surfaces coolingDown + phantomEstimate ----
+
+test('extractThrottle surfaces coolingDown and phantomEstimate fields (P3)', () => {
+  const orig = require('../lib/state').config;
+  require('../lib/state').config = { ...orig, overrideConcurrency: 0 };
+  const s = require('../lib/state');
+  const origCd = s.releaseCooldowns;
+  const origPs = s.phantomSamples;
+  s.releaseCooldowns = [Date.now() + 1000, Date.now() + 2000];
+  s.phantomSamples = [{ observed: 6, local: 4 }];
+  try {
+    const throttle = extractThrottle({
+      limits: { concurrency: { limit: 8, hard_cap: 16, burst_pct: 1 } },
+      usage: { concurrent_sessions: 6 },
+    });
+    assert.strictEqual(throttle.coolingDown, 2, 'two cooling permits reported');
+    assert.strictEqual(throttle.phantomEstimate, 2, 'phantom estimate surfaced');
+  } finally {
+    require('../lib/state').config = orig;
+    s.releaseCooldowns = origCd;
+    s.phantomSamples = origPs;
+  }
+});
+
 
 // ---- cap-health 429 backoff gate ----
 

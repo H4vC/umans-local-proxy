@@ -617,6 +617,8 @@
 
         <label for="overrideConcurrency">Override concurrency (0 = use UMANS limits)</label>
         <input id="overrideConcurrency" type="number" min="0" step="1" value="0">
+        <label for="releaseCooldown">Slot release cooldown (rest before a freed permit is reusable)</label>
+        <input id="releaseCooldown" placeholder="2s">
         <label for="websearchProvider">Websearch provider</label>
         <select id="websearchProvider">
           <option value="none">none — no web search</option>
@@ -1183,6 +1185,7 @@
         ['timeout', esc(config.requestTimeout ?? '—')],
         ['request logging', esc(config.requestLogging ?? 'off')],
         ['override concurrency', config.overrideConcurrency ?? 0],
+        ['slot release cooldown', esc(config.releaseCooldown ?? '—')],
         ['websearch provider', esc(config.websearchProvider ?? 'none')],
         ['enabled models', esc((config.enabledModels?.length ? config.enabledModels : []).join(', ') || 'all (no filter)')],
 
@@ -1574,6 +1577,7 @@
           $('requestLogging').value = config.requestLogging || 'off';
 
         $('overrideConcurrency').value = config.overrideConcurrency || 0;
+        $('releaseCooldown').value = config.releaseCooldown || '2s';
         $('websearchProvider').value = config.websearchProvider || 'none';
           $('models').value = (config.enabledModels || []).join('\n');
           renderConfig(config, health.routes);
@@ -1597,6 +1601,7 @@
           requestTimeout: $('timeout').value.trim(),
           requestLogging: $('requestLogging').value,
           overrideConcurrency: Number($('overrideConcurrency').value || 0),
+          releaseCooldown: $('releaseCooldown').value.trim(),
           websearchProvider: $('websearchProvider').value
         };
         if (configLoaded) payload.enabledModels = $('models').value.split(/\r?\n/).map(x => x.trim()).filter(Boolean);

@@ -44,6 +44,7 @@ Use the launcher, dashboard, or create `.config/config.json`:
   "REQUEST_TIMEOUT": "15m",
   "REQUEST_LOGGING": "off",
   "OVERRIDE_CONCURRENCY": 0,
+  "RELEASE_COOLDOWN_MS": "2s",
   "WEBSEARCH_PROVIDER": "none"
 }
 ```
@@ -110,6 +111,7 @@ Throttling, session tracking, and live tok/s telemetry apply to both shapes. Cla
 ## Throttling and usage
 
 Before chat requests, the proxy reads the concurrency limit from UMANS `/usage` (`limits.concurrency.limit`) and queues requests when in-flight requests reach that limit. The effective in-flight count is the maximum of locally-tracked requests and the upstream-reported `concurrent_sessions` count, so other clients on the same key are counted toward the limit. Queued requests re-read the effective limit each iteration, so config changes or usage refreshes are honored without restarting. `OVERRIDE_CONCURRENCY` caps below the upstream limit.
+`RELEASE_COOLDOWN_MS` (default `2s`; env `RELEASE_COOLDOWN_MS` overrides the file value) is the rest a freed permit takes before it is reusable, blunting the lag race where UMANS hasn't decremented its `concurrent_sessions` counter — tunable from the Config tab.
 
 `/usage` is cached for 10 seconds. If `/usage` is unavailable or no limit is known, the proxy proceeds without gating rather than blocking chat. The proxy refreshes its cache when any proxied chat request starts and ends.
 

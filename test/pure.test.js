@@ -1116,6 +1116,30 @@ test('canStart blocks when held+cooling reaches the phantom-absorbed limit (P1)'
   }
 });
 
+test('canStart bursts to the hard cap even with a queue (soft clause removed)', () => {
+  const s = require('../lib/state');
+  const orig = { config: s.config, concurrencyCache: s.concurrencyCache, usageEverFetched: s.usageEverFetched, burstDisabledUntil: s.burstDisabledUntil, releaseCooldowns: s.releaseCooldowns, phantomSamples: s.phantomSamples, activeRequests: s.activeRequests, queuedRequests: s.queuedRequests };
+  s.config = { ...s.config, overrideConcurrency: 0 };
+  s.concurrencyCache = { concurrent: 0, limit: 8, softLimit: 5, boxedUntil: null, time: Date.now() };
+  s.usageEverFetched = true;
+  s.burstDisabledUntil = 0;
+  s.releaseCooldowns = [];
+  s.phantomSamples = [];
+  s.queuedRequests = 2;
+  try {
+    s.activeRequests = 5;
+    assert.strictEqual(canStart(getEffectiveConcurrency()), true); // at soft (5), with a queue, bursting to 6 is allowed (old soft clause wrongly blocked this)
+    s.activeRequests = 7;
+    assert.strictEqual(canStart(getEffectiveConcurrency()), true); // between soft and hard, still bursts
+    s.activeRequests = 8;
+    assert.strictEqual(canStart(getEffectiveConcurrency()), false); // at the hard cap, queue
+  } finally {
+    s.config = orig.config; s.concurrencyCache = orig.concurrencyCache; s.usageEverFetched = orig.usageEverFetched;
+    s.burstDisabledUntil = orig.burstDisabledUntil; s.releaseCooldowns = orig.releaseCooldowns; s.phantomSamples = orig.phantomSamples;
+    s.activeRequests = orig.activeRequests; s.queuedRequests = orig.queuedRequests;
+  }
+});
+
 // ---- P2: release cooldown blocks immediate reuse ----
 
 test('releaseThrottleSlot pushes a cooling permit that blocks admission (P2)', () => {
@@ -1151,6 +1175,71 @@ test('releaseThrottleSlot pushes a cooling permit that blocks admission (P2)', (
     s.burstDisabledUntil = orig.burstDisabledUntil; s.refreshUsageInFlight = orig.refreshUsageInFlight;
     s.refreshUsageTimer = orig.refreshUsageTimer; s.usageCache = orig.usageCache;
     s.phantomSamples = orig.phantomSamples;
+    if (s.cooldownWakeTimer) { clearTimeout(s.cooldownWakeTimer); s.cooldownWakeTimer = null; }
+  }
+});
+
+test('releaseThrottleSlot uses state.config.releaseCooldownMs when set (config-driven cooldown)', () => {
+  const s = require('../lib/state');
+  const orig = { config: s.config, concurrencyCache: s.concurrencyCache, usageCache: s.usageCache, usageEverFetched: s.usageEverFetched, activeRequests: s.activeRequests, queuedRequests: s.queuedRequests, throttleWaiters: s.throttleWaiters, releaseCooldowns: s.releaseCooldowns, burstDisabledUntil: s.burstDisabledUntil, refreshUsageInFlight: s.refreshUsageInFlight, refreshUsageTimer: s.refreshUsageTimer, phantomSamples: s.phantomSamples };
+  s.config = { ...s.config, releaseCooldownMs: 5000 };
+  s.concurrencyCache = { concurrent: 0, limit: 2, softLimit: 2, boxedUntil: null, time: Date.now() };
+  s.usageCache = { data: { ok: true }, time: Date.now() };
+  s.usageEverFetched = true;
+  s.activeRequests = 1;
+  s.queuedRequests = 0;
+  s.throttleWaiters = [];
+  s.releaseCooldowns = [];
+  s.phantomSamples = [];
+  s.burstDisabledUntil = 0;
+  s.refreshUsageInFlight = false;
+  s.refreshUsageTimer = null;
+  try {
+    const before = Date.now();
+    releaseThrottleSlot();
+    const after = Date.now();
+    assert.strictEqual(s.releaseCooldowns.length, 1, 'cooldown pushed');
+    const expiry = s.releaseCooldowns[0];
+    assert.ok(expiry >= before + 4500 && expiry <= after + 5500, `expiry ${expiry} not within now+5000±500 (before=${before}, after=${after})`);
+  } finally {
+    s.config = orig.config; s.concurrencyCache = orig.concurrencyCache; s.usageCache = orig.usageCache;
+    s.usageEverFetched = orig.usageEverFetched; s.activeRequests = orig.activeRequests; s.queuedRequests = orig.queuedRequests;
+    s.throttleWaiters = orig.throttleWaiters; s.releaseCooldowns = orig.releaseCooldowns;
+    s.burstDisabledUntil = orig.burstDisabledUntil; s.refreshUsageInFlight = orig.refreshUsageInFlight;
+    s.refreshUsageTimer = orig.refreshUsageTimer; s.phantomSamples = orig.phantomSamples;
+    if (s.cooldownWakeTimer) { clearTimeout(s.cooldownWakeTimer); s.cooldownWakeTimer = null; }
+  }
+});
+
+test('releaseThrottleSlot falls back to RELEASE_COOLDOWN_MS when config.releaseCooldownMs is absent', () => {
+  const s = require('../lib/state');
+  const orig = { config: s.config, concurrencyCache: s.concurrencyCache, usageCache: s.usageCache, usageEverFetched: s.usageEverFetched, activeRequests: s.activeRequests, queuedRequests: s.queuedRequests, throttleWaiters: s.throttleWaiters, releaseCooldowns: s.releaseCooldowns, burstDisabledUntil: s.burstDisabledUntil, refreshUsageInFlight: s.refreshUsageInFlight, refreshUsageTimer: s.refreshUsageTimer, phantomSamples: s.phantomSamples };
+  s.config = { ...s.config };
+  delete s.config.releaseCooldownMs;
+  s.concurrencyCache = { concurrent: 0, limit: 2, softLimit: 2, boxedUntil: null, time: Date.now() };
+  s.usageCache = { data: { ok: true }, time: Date.now() };
+  s.usageEverFetched = true;
+  s.activeRequests = 1;
+  s.queuedRequests = 0;
+  s.throttleWaiters = [];
+  s.releaseCooldowns = [];
+  s.phantomSamples = [];
+  s.burstDisabledUntil = 0;
+  s.refreshUsageInFlight = false;
+  s.refreshUsageTimer = null;
+  try {
+    const before = Date.now();
+    releaseThrottleSlot();
+    const after = Date.now();
+    assert.strictEqual(s.releaseCooldowns.length, 1, 'cooldown pushed');
+    const expiry = s.releaseCooldowns[0];
+    assert.ok(expiry >= before + RELEASE_COOLDOWN_MS - 500 && expiry <= after + RELEASE_COOLDOWN_MS + 500, `expiry ${expiry} not within now+${RELEASE_COOLDOWN_MS}±500 (before=${before}, after=${after})`);
+  } finally {
+    s.config = orig.config; s.concurrencyCache = orig.concurrencyCache; s.usageCache = orig.usageCache;
+    s.usageEverFetched = orig.usageEverFetched; s.activeRequests = orig.activeRequests; s.queuedRequests = orig.queuedRequests;
+    s.throttleWaiters = orig.throttleWaiters; s.releaseCooldowns = orig.releaseCooldowns;
+    s.burstDisabledUntil = orig.burstDisabledUntil; s.refreshUsageInFlight = orig.refreshUsageInFlight;
+    s.refreshUsageTimer = orig.refreshUsageTimer; s.phantomSamples = orig.phantomSamples;
     if (s.cooldownWakeTimer) { clearTimeout(s.cooldownWakeTimer); s.cooldownWakeTimer = null; }
   }
 });

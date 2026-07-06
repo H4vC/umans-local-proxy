@@ -14,6 +14,7 @@ const DEFAULTS = {
   REQUEST_TIMEOUT: '15m',
   REQUEST_LOGGING: 'off',
   OVERRIDE_CONCURRENCY: 0,
+  RELEASE_COOLDOWN_MS: '2s',
   WEBSEARCH_PROVIDER: 'none',
 };
 
@@ -41,6 +42,7 @@ function loadConfig() {
     REQUEST_TIMEOUT: raw.REQUEST_TIMEOUT || DEFAULTS.REQUEST_TIMEOUT,
     REQUEST_LOGGING: raw.REQUEST_LOGGING || DEFAULTS.REQUEST_LOGGING,
     OVERRIDE_CONCURRENCY: Math.max(0, Number(raw.OVERRIDE_CONCURRENCY || DEFAULTS.OVERRIDE_CONCURRENCY) || 0),
+    RELEASE_COOLDOWN_MS: raw.RELEASE_COOLDOWN_MS || DEFAULTS.RELEASE_COOLDOWN_MS,
     WEBSEARCH_PROVIDER: raw.WEBSEARCH_PROVIDER || DEFAULTS.WEBSEARCH_PROVIDER,
   };
 }
@@ -74,6 +76,7 @@ function applyArgs(config) {
     timeout: 'REQUEST_TIMEOUT',
     logging: 'REQUEST_LOGGING',
     concurrency: 'OVERRIDE_CONCURRENCY',
+    releaseCooldown: 'RELEASE_COOLDOWN_MS',
     websearch: 'WEBSEARCH_PROVIDER',
   };
   for (const [arg, field] of Object.entries(map)) {
@@ -106,6 +109,9 @@ async function promptSettings(config) {
     const concurrency = await question(rl, `Override concurrency, 0 = use UMANS limits [${config.OVERRIDE_CONCURRENCY}]: `);
     if (concurrency.trim()) config.OVERRIDE_CONCURRENCY = Math.max(0, Number(concurrency) || 0);
 
+    const releaseCooldown = await question(rl, `Slot release cooldown, e.g. 2s or 1500ms (rest before a freed permit is reusable) [${config.RELEASE_COOLDOWN_MS}]: `);
+    if (releaseCooldown.trim()) config.RELEASE_COOLDOWN_MS = releaseCooldown.trim();
+
     const websearch = await question(rl, `Websearch provider (native|exa|none) [${config.WEBSEARCH_PROVIDER}]: `);
     if (websearch.trim()) config.WEBSEARCH_PROVIDER = websearch.trim();
 
@@ -131,6 +137,7 @@ function printSettings(config) {
   console.log(`  REQUEST_TIMEOUT:   ${config.REQUEST_TIMEOUT}`);
   console.log(`  REQUEST_LOGGING:   ${config.REQUEST_LOGGING}`);
   console.log(`  OVERRIDE_CONCURRENCY: ${config.OVERRIDE_CONCURRENCY}`);
+  console.log(`  RELEASE_COOLDOWN_MS:  ${config.RELEASE_COOLDOWN_MS}`);
   console.log(`  WEBSEARCH_PROVIDER:   ${config.WEBSEARCH_PROVIDER}`);
   console.log(`  API_KEY:           ${mask(config.API_KEY)}`);
   console.log(`  SESSION_COOKIE:    ${mask(config.SESSION_COOKIE)}`);

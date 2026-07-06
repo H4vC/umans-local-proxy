@@ -42,6 +42,11 @@ The comment "pings auto-answered by Node's net" is false — Node's net doesn't 
 (1) unmasked client frames accepted (§5.1 violation — must close 1002); (2) control frames (ping/pong/close) not capped to 125 bytes and not checked FIN=1; (3) `buf = Buffer.concat([buf, chunk])` per chunk is O(n²) — a client dribbling a 1 MiB frame as 1-byte writes forces ~512 GB of copying.
 **Fix:** reject unmasked; enforce ≤125 + FIN for control opcodes; replace concat-per-chunk with a single growing buffer capped at `MAX_FRAME_SIZE`.
 
+### A8. Requests stall at the soft cap instead of bursting to the hard cap ✓
+`lib/concurrency.js:canStart`
+`if (soft && held + cooling >= soft && state.queuedRequests > 0) return false` refused admission once `held` reached `soft` while any queue existed — and `wakeThrottleWaiters` calls the same `canStart`, so a queue that formed at soft never drained via bursting. Throughput was capped at soft under load instead of bursting to the hard cap (the "delayed at soft instead of hard" symptom). Removed; admission is now `held + cooling < limit` (hard cap only). Soft is still enforced: during a burst-cooldown or priority box `getEffectiveConcurrency` clamps `effectiveLimit` to `softLimit`, so admission caps at soft then. Regression test added (`pure.test.js`).
+**Fix:** applied.
+
 ---
 
 ## B. Security risks
@@ -186,6 +191,61 @@ Unreachable today: both abort sources (timeout, res-close) are macrotasks and mi
 README is stale on two points:
 - line 84 says telemetry runs in a `setImmediate` drain (it's a worker thread);
 - line 98 says completed sessions "remain visible for 5 seconds" (`SESSION_TTL_MS` is 5 **minutes**, `state.js:26`).
+
+---
+
+## H. Performance & memory
+> **Status: H FIXED** (uncommitted) — adversarial review; all applied. 223 tests pass. `bench/hotpath.js`: small-chunk tap +28% (2.06→2.63 Gbps; tap/ceiling ratio 0.24→0.32); big flat (1 buf/flush, little to gain). Stale `PERF-REVIEW.md` removed (its bench reference numbers and several finding framings were superseded).
+
+### H1. Tap path copied every response byte twice ✓
+`lib/chat-tap.js:_flush` + `lib/tap-worker.js` chunk handler
+Main thread did N×(`allocUnsafeSlow`+`set`) per batch, then the worker `Buffer.concat`'d them — two memcpy passes per streamed byte. One `allocUnsafeSlow`+copy now, transferred as a single buffer, worker feeds it directly (legacy multi-buffer `bufs` from in-flight pre-reload taps still concats). Micro-bench confirmed the concat can't simply be dropped (feed-each was 36× worse for small chunks) — the fix relocates, not removes, the copy.
+**Fix:** applied (+28% small-chunk tap).
+
+### H2. Full session snapshot built every 1s even with zero WS clients ✓
+`lib/sessions.js:scheduleSessionsBroadcast`
+`getSessionsSnapshot()` was evaluated as the argument to `broadcastEvent` *before* its `wsClients.size === 0` guard, so the 4-pass snapshot (H3) was built and discarded every second while sessions were active and the dashboard was closed. Guarded all 3 call sites behind `wsClients.size > 0`.
+**Fix:** applied.
+
+### H3. `getSessionsSnapshot` was 4 passes + a redundant `sessionMetrics` rebuild ✓
+`lib/sessions.js`
+Four walks over `state.sessions` per broadcast; `sessionMetrics()` rebuilt an identical `tpsByModel` and re-sorted a `[...arr]` copy per `pct()` call. Merged into one pass accumulating `tpsByModel`+`ttftByModel`; percentiles sort-in-place once. `sessionMetrics` removed.
+**Fix:** applied.
+
+### H4. `stableContent` allocated-then-discarded for text-only messages ✓
+`lib/coalesce.js:stableContent`
+`content.map(withoutCacheControl)` allocated a stripped array + N object spreads per message, then returned a joined string and GC'd it all — per message, per request, before the `messageHash` cache check. Single pass now; zero allocation on the text-only path (strip only on the non-text branch).
+**Fix:** applied.
+
+### H5. `_handleSseLine` triple-scanned every SSE line ✓
+`lib/tap-worker.js:_handleSseLine`
+`indexOf('"usage"')` + two `_scanStringLen` key lookups per line. Reordered: `exactTokens` short-circuit → content/reasoning scan → usage-only-on-miss. Saves one `indexOf` per content delta; post-usage tail is O(1)/line. Preserves A3 (content whose value contains "usage" is now counted without the wasted parse).
+**Fix:** applied.
+
+### H6. Finished sessions leaked `tpsSamples` for the 5-min TTL ✓
+`lib/sessions.js:finalizeSession`
+A 60s stream left ~600 `{ts,tok}` objects retained per finished session until the TTL delete. `finalizeSession` now nulls `tpsSamples`/`tpsHead` (finished sessions report `finalTps`; `sessionTps` is never called on them).
+**Fix:** applied.
+
+### H7. `localeCompare` sort + 2 `new Date()` per session per broadcast ✓
+`lib/sessions.js:getSessionsSnapshot` + `sessionPublicView`
+`b.startedAt.localeCompare(a.startedAt)` (~10× a numeric `<`, O(n log n) calls) + `new Date(startedAt).toISOString()` twice per session per broadcast. Sort raw sessions by numeric `startedAt` once before mapping; cache `startedAtIso`/`endedAtIso` on the session (fallback for test-constructed sessions).
+**Fix:** applied.
+
+### H8. `chainHash` round-tripped uint32→hex→`parseInt` per request ✓
+`lib/coalesce.js:chainHash` + `storeStateKey`
+`resolveGroupKey` returned the chain as a hex string; `storeStateKey` passed it to `chainHash` which `parseInt`'d it back to uint32. Added `chainHashNum` (numeric seed); `resolveGroupKey` returns the uint32; `storeStateKey` extends numerically. Public `chainHash` hex API and 5-arg `storeStateKey` unchanged.
+**Fix:** applied.
+
+### H9. `tpsSamples` used `shift()` (O(n)) per sync ✓
+`lib/chat-tap.js:onWorkerMessage`
+`samples.shift()` reindexed the array every 100ms sync per session. Replaced with a head-index (O(1) prune) + amortized compaction. `sessionTps` needed no change (walks back from the tail, stops at the first out-of-window sample).
+**Fix:** applied.
+
+### H10. `contentParts` join was O(n²) ✓
+`lib/tap-worker.js:finish`
+`out += JSON.parse('"' + part + '"')` in a loop — n parses + O(n²) concat. One `join`+one `JSON.parse` decodes all escapes in a single pass (`["p1","p2",…]` is a valid JSON array of string-body fragments). Prior perf review #7, was unapplied.
+**Fix:** applied.
 
 ---
 

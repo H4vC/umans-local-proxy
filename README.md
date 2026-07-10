@@ -44,7 +44,7 @@ Use the launcher, dashboard, or create `.config/config.json`:
   "REQUEST_TIMEOUT": "15m",
   "REQUEST_LOGGING": "off",
   "OVERRIDE_CONCURRENCY": 0,
-  "RELEASE_COOLDOWN_MS": "2s",
+  "RELEASE_COOLDOWN_MS": "1s",
   "WEBSEARCH_PROVIDER": "none"
 }
 ```
@@ -110,10 +110,13 @@ Throttling, session tracking, and live tok/s telemetry apply to both shapes. Cla
 
 ## Throttling and usage
 
-Before chat requests, the proxy reads the concurrency limit from UMANS `/usage` (`limits.concurrency.limit`) and queues requests when in-flight requests reach that limit. The effective in-flight count is the maximum of locally-tracked requests and the upstream-reported `concurrent_sessions` count, so other clients on the same key are counted toward the limit. Queued requests re-read the effective limit each iteration, so config changes or usage refreshes are honored without restarting. `OVERRIDE_CONCURRENCY` caps below the upstream limit.
-`RELEASE_COOLDOWN_MS` (default `2s`; env `RELEASE_COOLDOWN_MS` overrides the file value) is the rest a freed permit takes before it is reusable, blunting the lag race where UMANS hasn't decremented its `concurrent_sessions` counter — tunable from the Config tab.
+Before chat requests, the proxy reads the concurrency limit from UMANS `/usage` (`limits.concurrency.limit`) and queues locally held leases at the effective quota. A sustained upstream-over-local count reduces that quota, so other clients on the same key are protected without trusting a stale count per request. The FIFO queue is capped at 8 requests; further requests receive a local 429 instead of retaining unbounded payloads. `OVERRIDE_CONCURRENCY` caps below the upstream limit.
 
-`/usage` is cached for 10 seconds. If `/usage` is unavailable or no limit is known, the proxy proceeds without gating rather than blocking chat. The proxy refreshes its cache when any proxied chat request starts and ends.
+An upstream 429's `Retry-After` header is forwarded to the caller and installs a shared local admission pause for all queued and new requests. The optional cap-health check still controls the longer burst cooldown independently.
+
+`RELEASE_COOLDOWN_MS` defaults to `1s` (env overrides the file value). It is a short rest before a released permit is reusable, retained only to absorb provider accounting lag; tune it if provider behavior changes.
+
+`/usage` is cached for 10 seconds. Before the first successful read, the proxy admits only one request; a malformed post-fetch limit is bounded to four requests. The proxy refreshes its cache when proxied chat requests start and end.
 
 The dashboard connects to `/ws` (WebSocket) for live updates — the proxy pushes fresh usage data whenever it fetches `/usage` (on session start/end, manual refresh, config changes). If the WebSocket drops, the dashboard auto-reconnects with exponential backoff (no separate polling loop). The dashboard also force-refreshes before and after a smoke test, and exposes local `active`/`queued` counts. A manual **Refresh now** button force-bypasses the cache.
 

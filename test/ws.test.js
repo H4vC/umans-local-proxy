@@ -124,3 +124,22 @@ test('send swallows a write error on a dead socket instead of throwing (C10)', (
   assert.doesNotThrow(() => ws.send(client, 'hello'));
   assert.strictEqual(client.alive, false, 'dead socket marks the client not alive');
 });
+
+test('slow-client queue is byte-bounded and keeps only the latest sessions snapshot', () => {
+  const client = {
+    socket: { write: () => true },
+    queue: [],
+    paused: true,
+    alive: true,
+  };
+  ws.send(client, JSON.stringify({ type: 'sessions', data: { version: 1 } }));
+  ws.send(client, JSON.stringify({ type: 'sessions', data: { version: 2 } }));
+  assert.equal(client.queue.length, 1, 'new snapshot supersedes a queued older snapshot');
+  assert.ok(client.queue[0].includes(Buffer.from('"version":2')));
+
+  for (let i = 0; i < 100; i++) {
+    ws.send(client, JSON.stringify({ type: 'session', data: { i, detail: 'x'.repeat(16 * 1024) } }));
+  }
+  assert.ok(client.queueBytes <= ws.MAX_QUEUE_BYTES, `queued ${client.queueBytes} bytes`);
+  assert.ok(client.queue.some((frame) => frame.includes(Buffer.from('"version":2'))), 'latest dashboard snapshot survives pressure');
+});

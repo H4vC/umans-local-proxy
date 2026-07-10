@@ -178,6 +178,8 @@ function seedState(upstreamBase) {
   if (state.sessionsBroadcastTimer) { clearTimeout(state.sessionsBroadcastTimer); state.sessionsBroadcastTimer = null; }
   if (state.refreshUsageTimer) { clearTimeout(state.refreshUsageTimer); state.refreshUsageTimer = null; }
   state.broadcastThrottled = false;
+  state.pendingBodyReads = 0;
+  state.modelInfoCache = { data: null, time: 0 };
 }
 
 function startProxy() {
@@ -351,9 +353,85 @@ test('client disconnect mid-stream aborts the upstream connection', async () => 
   await closeServer(proxy); await closeServer(upstream);
 });
 
+test('client disconnect before TTFT aborts the upstream request and releases its slot', async () => {
+  const upstreamState = { aborted: false };
+  let upstreamStarted;
+  const started = new Promise((resolve) => { upstreamStarted = resolve; });
+  const upstream = await startUpstream((req, res) => {
+    res.on('close', () => { upstreamState.aborted = true; });
+    upstreamStarted(); // Deliberately withhold headers: this is the stretched-TTFT path.
+  });
+  const proxy = await startProxy();
+  seedState(`http://127.0.0.1:${upstream.address().port}`);
+
+  const ac = new AbortController();
+  const pending = fetch(`http://127.0.0.1:${proxy.address().port}/v1/chat/completions`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: bodyOf({ stream: true }), signal: ac.signal,
+  }).catch(() => null);
+  await started;
+  ac.abort();
+  await pending;
+  await new Promise((r) => setTimeout(r, 100));
+
+  assert.ok(upstreamState.aborted, 'upstream request must close before it emits a first token');
+  assert.strictEqual(state.activeRequests, 0, 'disconnect must release the locally held slot');
+  await closeServer(proxy); await closeServer(upstream);
+});
+
+test('client disconnect while resolving model info cancels the prerequisite fetch', async () => {
+  const upstreamState = { aborted: false };
+  let upstreamStarted;
+  const started = new Promise((resolve) => { upstreamStarted = resolve; });
+  const upstream = await startUpstream((req, res) => {
+    assert.strictEqual(req.url, '/models/info');
+    res.on('close', () => { upstreamState.aborted = true; });
+    upstreamStarted();
+  });
+  const proxy = await startProxy();
+  seedState(`http://127.0.0.1:${upstream.address().port}`);
+
+  const ac = new AbortController();
+  const pending = fetch(`http://127.0.0.1:${proxy.address().port}/v1/chat/completions`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: bodyOf({ stream: true, reasoning_effort: 'high' }), signal: ac.signal,
+  }).catch(() => null);
+  await started;
+  ac.abort();
+  await pending;
+  await new Promise((r) => setTimeout(r, 100));
+
+  assert.ok(upstreamState.aborted, 'disconnect must cancel cold /models/info work');
+  assert.strictEqual(state.inFlightControllers.size, 0, 'pre-admission controller must be cleaned up');
+  await closeServer(proxy); await closeServer(upstream);
+});
+
+test('streaming request timeout emits a terminal error instead of clean truncation', async () => {
+  const upstream = await startUpstream((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+    res.write('data: {"choices":[{"delta":{"content":"partial"}}]}\n\n');
+    // Keep the upstream turn open until the proxy's request deadline aborts it.
+  });
+  const proxy = await startProxy();
+  seedState(`http://127.0.0.1:${upstream.address().port}`);
+  state.config.requestTimeout = 40;
+
+  const resp = await fetch(`http://127.0.0.1:${proxy.address().port}/v1/chat/completions`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: bodyOf({ stream: true }),
+  });
+  const text = await resp.text();
+
+  assert.strictEqual(resp.status, 200, 'headers were committed before the timeout');
+  assert.match(text, /partial/);
+  assert.match(text, /upstream request timed out/);
+  assert.match(text, /data: \[DONE\]/);
+  const session = state.sessions.values().next().value;
+  assert.strictEqual(session.status, 'error');
+  await closeServer(proxy); await closeServer(upstream);
+});
+
 test('upstream non-2xx on a streaming request preserves HTTP status', async () => {
   const upstream = await startUpstream((req, res) => {
-    res.writeHead(429, { 'Content-Type': 'application/json' });
+    res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': '3' });
     res.end(Buffer.from(JSON.stringify({ error: 'rate limited' })));
   });
   const proxy = await startProxy();
@@ -367,9 +445,27 @@ test('upstream non-2xx on a streaming request preserves HTTP status', async () =
   const text = await resp.text();
 
   assert.strictEqual(resp.status, 429);
+  assert.strictEqual(resp.headers.get('retry-after'), '3');
   assert.match(text, /rate limited/);
   assert.ok(state.burstDisabledUntil > Date.now());
 
+  await closeServer(proxy); await closeServer(upstream);
+});
+
+test('body intake capacity rejects before parsing or contacting upstream', async () => {
+  let upstreamCalls = 0;
+  const upstream = await startUpstream(() => { upstreamCalls++; });
+  const proxy = await startProxy();
+  seedState(`http://127.0.0.1:${upstream.address().port}`);
+  state.pendingBodyReads = 4;
+
+  const resp = await fetch(`http://127.0.0.1:${proxy.address().port}/v1/chat/completions`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: bodyOf({ stream: true }),
+  });
+
+  assert.strictEqual(resp.status, 429);
+  assert.match(await resp.text(), /request-body capacity is saturated/);
+  assert.strictEqual(upstreamCalls, 0);
   await closeServer(proxy); await closeServer(upstream);
 });
 

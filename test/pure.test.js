@@ -7,7 +7,7 @@ const assert = require('node:assert/strict');
 const { fnv1a, fnv1a32, fnv1aMixNum } = require('../lib/hash');
 const { parseDuration, parseWebsearchProvider, parseRequestLogging, parseListenAddr, cleanKeys, fileProxyApiKeys, readConfigFile, isLoopbackHost, normalizeSessionCookie } = require('../lib/config');
 const { snapReasoningLevel, enrichModelsWithReasoning, REASONING_RANK } = require('../lib/reasoning');
-const { firstNumber, concurrencyHardLimit, percentValue, burstQuota, concurrencyQuotaLimit, applyOverride, extractThrottle, fetchUmansUsage, getEffectiveConcurrency, canStart, acquireThrottleSlot, releaseThrottleSlot, notifyUpstream429, BURST_COOLDOWN_FILE, RELEASE_COOLDOWN_MS, PHANTOM_WINDOW, coolingDownNow, currentPhantomEstimate, wakeThrottleWaiters } = require('../lib/concurrency');
+const { firstNumber, concurrencyHardLimit, percentValue, burstQuota, concurrencyQuotaLimit, applyOverride, extractThrottle, fetchUmansUsage, getEffectiveConcurrency, canStart, acquireThrottleSlot, releaseThrottleSlot, notifyUpstream429, parseRetryAfter, ThrottleQueueFullError, MAX_THROTTLE_WAITERS, BURST_COOLDOWN_FILE, RELEASE_COOLDOWN_MS, PHANTOM_WINDOW, coolingDownNow, currentPhantomEstimate, wakeThrottleWaiters } = require('../lib/concurrency');
 const { canonicalMessage, messageHash, chainHash, resolveGroupKey, storeStateKey } = require('../lib/coalesce');
 const { authorized, wsUpgradeAllowed, isLoopback, safeHeaders, requiresProxyAuth } = require('../lib/auth');
 const { createSession, finalizeSession } = require('../lib/sessions');
@@ -20,15 +20,16 @@ const fs = require('node:fs');
 const os = require('node:os');
 const nodePath = require('node:path');
 
-// The concurrency port added three persistent fields to the shared state
-// singleton (releaseCooldowns, phantomSamples, cooldownWakeTimer) that
-// survive across tests because state.js is a module-level singleton never
-// re-required. Reset them before each test so a prior test's cooldowns or
-// phantom samples can't perturb an unrelated assertion.
+// Reset shared admission state because state.js is a module-level singleton.
 beforeEach(() => {
   state.releaseCooldowns = [];
   state.phantomSamples = [];
-  if (state.cooldownWakeTimer) { clearTimeout(state.cooldownWakeTimer); state.cooldownWakeTimer = null; }
+  clearTimeout(state.cooldownWakeTimer);
+  state.cooldownWakeTimer = null;
+  state.cooldownWakeAt = 0;
+  clearTimeout(state.retryAfterWakeTimer);
+  state.retryAfterWakeTimer = null;
+  state.retryAfterUntil = 0;
 });
 
 // ---- hash ----
@@ -871,6 +872,41 @@ test('fetchUmansUsage caches top-level concurrent_sessions for admission', async
   }
 });
 
+test('acquireThrottleSlot abandons a shared usage fetch when its caller aborts', async () => {
+  const s = require('../lib/state');
+  const origFetch = global.fetch;
+  const orig = {
+    config: s.config, usageCache: s.usageCache, concurrencyCache: s.concurrencyCache,
+    usageEverFetched: s.usageEverFetched, activeRequests: s.activeRequests,
+    queuedRequests: s.queuedRequests, throttleWaiters: s.throttleWaiters,
+  };
+  let resolveFetch;
+  global.fetch = () => new Promise((resolve) => { resolveFetch = resolve; });
+  s.config = { ...s.config, apiKey: 'test-key', upstreamBaseURL: 'https://example.test', overrideConcurrency: 0 };
+  s.usageCache = { data: null, time: 0 };
+  s.concurrencyCache = { concurrent: null, limit: null, softLimit: null, boxedUntil: null, time: 0 };
+  s.usageEverFetched = false;
+  s.activeRequests = 1;
+  s.queuedRequests = 0;
+  s.throttleWaiters = [];
+  const controller = new AbortController();
+  const acquire = acquireThrottleSlot({}, controller.signal);
+  try {
+    await new Promise((r) => setImmediate(r));
+    controller.abort();
+    await assert.rejects(acquire, /aborted/);
+    assert.strictEqual(s.throttleWaiters.length, 0, 'caller must not become a waiter while shared usage is pending');
+    assert.strictEqual(s.activeRequests, 1, 'caller must not alter an unrelated active lease');
+  } finally {
+    resolveFetch?.({ ok: true, json: async () => ({ usage: { concurrent_sessions: 1 }, limits: { concurrency: { limit: 1 } } }) });
+    await new Promise((r) => setImmediate(r));
+    global.fetch = origFetch;
+    s.config = orig.config; s.usageCache = orig.usageCache; s.concurrencyCache = orig.concurrencyCache;
+    s.usageEverFetched = orig.usageEverFetched; s.activeRequests = orig.activeRequests;
+    s.queuedRequests = orig.queuedRequests; s.throttleWaiters = orig.throttleWaiters;
+  }
+});
+
 test('failed stale usage refresh wakes waiters to re-check admission', async () => {
   const s = require('../lib/state');
   const origFetch = global.fetch;
@@ -963,7 +999,7 @@ test('getEffectiveConcurrency hard-bounds broken post-fetch usage to 4', () => {
   }
 });
 
-test('parallel local admission queues requests above the soft concurrency limit', async () => {
+test('parallel local admission queues requests only up to the explicit bound', async () => {
   const s = require('../lib/state');
   const orig = {
     config: s.config, concurrencyCache: s.concurrencyCache, usageCache: s.usageCache,
@@ -982,22 +1018,65 @@ test('parallel local admission queues requests above the soft concurrency limit'
   s.refreshUsageInFlight = false;
   s.refreshUsageTimer = null;
   s.burstDisabledUntil = 0;
-  const controllers = Array.from({ length: 20 }, () => new AbortController());
-  const attempts = controllers.map((c) => acquireThrottleSlot({}, c.signal));
+  const controllers = Array.from({ length: 4 + MAX_THROTTLE_WAITERS + 4 }, () => new AbortController());
+  const attempts = controllers.map((controller) => acquireThrottleSlot({}, controller.signal));
+  // Observe immediate overload rejections as they occur so Node does not flag
+  // intentionally rejected overflow promises as unhandled.
+  const settled = attempts.map((attempt) => attempt.then(() => null, (err) => err));
   try {
     await new Promise((r) => setImmediate(r));
     assert.strictEqual(s.activeRequests, 4, 'only four slots may be acquired');
-    assert.strictEqual(s.throttleWaiters.length, 16, 'the rest must queue');
+    assert.strictEqual(s.throttleWaiters.length, MAX_THROTTLE_WAITERS, 'only the bounded FIFO is retained');
+    const overflow = await Promise.all(settled.slice(4 + MAX_THROTTLE_WAITERS));
+    assert.ok(overflow.every((err) => err instanceof ThrottleQueueFullError), 'overflow rejects explicitly instead of retaining payloads');
   } finally {
-    for (let i = 4; i < controllers.length; i++) controllers[i].abort();
+    for (let i = 4; i < 4 + MAX_THROTTLE_WAITERS; i++) controllers[i].abort();
     for (let i = 0; i < 4; i++) releaseThrottleSlot();
     await Promise.allSettled(attempts);
-    if (s.refreshUsageTimer) clearTimeout(s.refreshUsageTimer);
+    clearTimeout(s.refreshUsageTimer);
     s.config = orig.config; s.concurrencyCache = orig.concurrencyCache; s.usageCache = orig.usageCache;
     s.usageEverFetched = orig.usageEverFetched; s.activeRequests = orig.activeRequests;
     s.queuedRequests = orig.queuedRequests; s.throttleWaiters = orig.throttleWaiters;
     s.refreshUsageInFlight = orig.refreshUsageInFlight; s.refreshUsageTimer = orig.refreshUsageTimer;
     s.burstDisabledUntil = orig.burstDisabledUntil;
+  }
+});
+
+test('acquireThrottleSlot rejects overload before retaining a full FIFO', async () => {
+  const s = require('../lib/state');
+  const orig = {
+    config: s.config, concurrencyCache: s.concurrencyCache, usageCache: s.usageCache,
+    usageEverFetched: s.usageEverFetched, activeRequests: s.activeRequests,
+    queuedRequests: s.queuedRequests, throttleWaiters: s.throttleWaiters,
+    refreshUsageInFlight: s.refreshUsageInFlight, refreshUsageTimer: s.refreshUsageTimer,
+  };
+  s.config = { ...s.config, apiKey: '', overrideConcurrency: 0 };
+  s.concurrencyCache = { concurrent: 0, limit: 1, softLimit: 1, boxedUntil: null, time: Date.now() };
+  s.usageCache = { data: { ok: true }, time: Date.now() };
+  s.usageEverFetched = true;
+  s.activeRequests = 1;
+  s.queuedRequests = 0;
+  s.throttleWaiters = [];
+  s.refreshUsageInFlight = false;
+  s.refreshUsageTimer = null;
+  const controllers = Array.from({ length: MAX_THROTTLE_WAITERS }, () => new AbortController());
+  const queued = controllers.map((controller) => acquireThrottleSlot({}, controller.signal));
+  try {
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.strictEqual(s.throttleWaiters.length, MAX_THROTTLE_WAITERS, 'FIFO reaches its explicit bound');
+    await assert.rejects(
+      acquireThrottleSlot({}, new AbortController().signal),
+      (err) => err instanceof ThrottleQueueFullError && err.code === 'ERR_THROTTLE_QUEUE_FULL',
+    );
+    assert.strictEqual(s.throttleWaiters.length, MAX_THROTTLE_WAITERS, 'overload must not retain another waiter');
+  } finally {
+    for (const controller of controllers) controller.abort();
+    await Promise.allSettled(queued);
+    clearTimeout(s.refreshUsageTimer);
+    s.config = orig.config; s.concurrencyCache = orig.concurrencyCache; s.usageCache = orig.usageCache;
+    s.usageEverFetched = orig.usageEverFetched; s.activeRequests = orig.activeRequests;
+    s.queuedRequests = orig.queuedRequests; s.throttleWaiters = orig.throttleWaiters;
+    s.refreshUsageInFlight = orig.refreshUsageInFlight; s.refreshUsageTimer = orig.refreshUsageTimer;
   }
 });
 
@@ -1025,6 +1104,74 @@ test('notifyUpstream429 does not wake queued waiters (cascade guard, C5)', () =>
     s.usageCache = orig.usageCache;
     s.burstDisabledUntil = 0;
     try { fs.rmSync(BURST_COOLDOWN_FILE, { force: true }); } catch {}
+  }
+});
+
+test('parseRetryAfter accepts delay-seconds and valid HTTP dates only', () => {
+  const now = Date.UTC(2026, 6, 10, 12, 0, 0);
+  assert.strictEqual(parseRetryAfter('5', now), now + 5000);
+  assert.strictEqual(parseRetryAfter(' Fri, 10 Jul 2026 12:00:05 GMT ', now), now + 5000);
+  assert.strictEqual(parseRetryAfter('Sunday, 06-Nov-94 08:49:37 GMT', now), Date.UTC(1994, 10, 6, 8, 49, 37));
+  assert.strictEqual(parseRetryAfter('1.5', now), null);
+  assert.strictEqual(parseRetryAfter('Thu, 31 Feb 2026 12:00:00 GMT', now), null);
+  assert.strictEqual(parseRetryAfter('not-a-date', now), null);
+});
+
+test('Retry-After barrier blocks admission and wakes FIFO at its max expiry', () => {
+  const s = require('../lib/state');
+  const orig = {
+    config: s.config, concurrencyCache: s.concurrencyCache, usageEverFetched: s.usageEverFetched,
+    activeRequests: s.activeRequests, queuedRequests: s.queuedRequests, throttleWaiters: s.throttleWaiters,
+    retryAfterUntil: s.retryAfterUntil, retryAfterWakeTimer: s.retryAfterWakeTimer,
+    lastBlocksToday: s.lastBlocksToday, capHealthInFlight: s.capHealthInFlight,
+  };
+  const originalNow = Date.now;
+  const originalSetTimeout = global.setTimeout;
+  const originalClearTimeout = global.clearTimeout;
+  let now = Date.UTC(2026, 6, 10, 12, 0, 0);
+  const timers = [];
+  Date.now = () => now;
+  global.setTimeout = (callback, delay) => {
+    const timer = { callback, delay, cleared: false, unref() { return this; } };
+    timers.push(timer);
+    return timer;
+  };
+  global.clearTimeout = (timer) => { if (timer) timer.cleared = true; };
+  s.config = { ...s.config, apiKey: '', overrideConcurrency: 0, sessionCookie: 'test-cookie' };
+  s.concurrencyCache = { concurrent: 0, limit: 1, softLimit: 1, boxedUntil: null, time: now };
+  s.usageEverFetched = true;
+  s.activeRequests = 0;
+  s.queuedRequests = 1;
+  let resolved = 0;
+  s.throttleWaiters = [{ resolve: () => { resolved++; }, reject: () => {}, signal: undefined, onAbort: null }];
+  s.retryAfterUntil = 0;
+  s.retryAfterWakeTimer = null;
+  s.lastBlocksToday = 5;
+  s.capHealthInFlight = Promise.resolve({ blocksToday: 5 });
+  try {
+    notifyUpstream429('1');
+    assert.strictEqual(s.retryAfterUntil, now + 1000, 'first valid header sets an absolute deadline');
+    assert.strictEqual(canStart(getEffectiveConcurrency()), false, 'admission is blocked before cap-health resolves');
+    notifyUpstream429('2');
+    assert.strictEqual(s.retryAfterUntil, now + 2000, 'a longer header extends the shared deadline');
+    notifyUpstream429('1');
+    assert.strictEqual(s.retryAfterUntil, now + 2000, 'a shorter header cannot shorten the barrier');
+    assert.strictEqual(timers.filter((timer) => !timer.cleared).length, 1, 'exactly one barrier wake timer remains');
+    const wakeTimer = timers.find((timer) => !timer.cleared);
+    assert.strictEqual(wakeTimer.delay, 2000, 'wake is scheduled at the actual max deadline');
+    now += 2000;
+    wakeTimer.callback();
+    assert.strictEqual(s.retryAfterUntil, 0, 'expired barrier clears its deadline');
+    assert.strictEqual(resolved, 1, 'the FIFO head wakes after expiry');
+    assert.strictEqual(s.activeRequests, 1, 'wake reserves the admitted slot before resolving');
+  } finally {
+    Date.now = originalNow;
+    global.setTimeout = originalSetTimeout;
+    global.clearTimeout = originalClearTimeout;
+    s.config = orig.config; s.concurrencyCache = orig.concurrencyCache; s.usageEverFetched = orig.usageEverFetched;
+    s.activeRequests = orig.activeRequests; s.queuedRequests = orig.queuedRequests; s.throttleWaiters = orig.throttleWaiters;
+    s.retryAfterUntil = orig.retryAfterUntil; s.retryAfterWakeTimer = orig.retryAfterWakeTimer;
+    s.lastBlocksToday = orig.lastBlocksToday; s.capHealthInFlight = orig.capHealthInFlight;
   }
 });
 
@@ -1254,6 +1401,88 @@ test('coolingDownNow prunes expired cooldowns (P2)', () => {
     assert.strictEqual(s.releaseCooldowns.length, 0, 'deque emptied');
   } finally {
     s.releaseCooldowns = orig.releaseCooldowns;
+  }
+});
+
+test('staggered cooldown expiries re-arm and wake each eligible FIFO waiter', () => {
+  const s = require('../lib/state');
+  const orig = {
+    config: s.config, concurrencyCache: s.concurrencyCache, usageCache: s.usageCache,
+    usageEverFetched: s.usageEverFetched, activeRequests: s.activeRequests,
+    queuedRequests: s.queuedRequests, throttleWaiters: s.throttleWaiters,
+    releaseCooldowns: s.releaseCooldowns, phantomSamples: s.phantomSamples,
+    burstDisabledUntil: s.burstDisabledUntil, refreshUsageInFlight: s.refreshUsageInFlight,
+    refreshUsageTimer: s.refreshUsageTimer, cooldownWakeTimer: s.cooldownWakeTimer,
+    cooldownWakeAt: s.cooldownWakeAt,
+  };
+  const originalNow = Date.now;
+  const originalSetTimeout = global.setTimeout;
+  const originalClearTimeout = global.clearTimeout;
+  let now = Date.UTC(2026, 6, 10, 12, 0, 0);
+  const timers = [];
+  Date.now = () => now;
+  global.setTimeout = (callback, delay) => {
+    const timer = {
+      delay,
+      cleared: false,
+      fired: false,
+      unref() { return this; },
+      fire() { this.fired = true; callback(); },
+    };
+    timers.push(timer);
+    return timer;
+  };
+  global.clearTimeout = (timer) => { if (timer) timer.cleared = true; };
+  s.config = { ...s.config, apiKey: '', overrideConcurrency: 0, releaseCooldownMs: 100 };
+  s.concurrencyCache = { concurrent: 0, limit: 2, softLimit: 2, boxedUntil: null, time: now };
+  s.usageCache = { data: { ok: true }, time: now };
+  s.usageEverFetched = true;
+  s.activeRequests = 2;
+  s.queuedRequests = 0;
+  s.throttleWaiters = [];
+  s.releaseCooldowns = [];
+  s.phantomSamples = [];
+  s.burstDisabledUntil = 0;
+  s.refreshUsageInFlight = false;
+  s.refreshUsageTimer = null;
+  s.cooldownWakeTimer = null;
+  s.cooldownWakeAt = 0;
+  try {
+    releaseThrottleSlot();
+    const firstWake = s.cooldownWakeTimer;
+    s.config = { ...s.config, releaseCooldownMs: 20 };
+    releaseThrottleSlot();
+    const earlyWake = s.cooldownWakeTimer;
+    assert.deepStrictEqual(s.releaseCooldowns, [now + 20, now + 100], 'cooldowns are ordered by actual expiry');
+    assert.strictEqual(firstWake.cleared, true, 'later release with earlier expiry re-arms the timer');
+    assert.strictEqual(earlyWake.delay, 20, 'the re-armed timer targets the earliest expiry');
+    const woken = [];
+    s.queuedRequests = 2;
+    s.throttleWaiters = [
+      { resolve: () => { woken.push('first'); }, reject: () => {}, signal: undefined, onAbort: null },
+      { resolve: () => { woken.push('second'); }, reject: () => {}, signal: undefined, onAbort: null },
+    ];
+    now += 20;
+    earlyWake.fire();
+    assert.deepStrictEqual(woken, ['first'], 'first expiry wakes only the first newly eligible waiter');
+    assert.strictEqual(s.throttleWaiters.length, 1, 'second waiter remains queued behind the later cooldown');
+    const lateWake = s.cooldownWakeTimer;
+    assert.strictEqual(lateWake.delay, 80, 'remaining cooldown re-arms from its actual expiry');
+    now += 80;
+    lateWake.fire();
+    assert.deepStrictEqual(woken, ['first', 'second'], 'second waiter wakes after the later cooldown expires');
+    assert.strictEqual(s.throttleWaiters.length, 0, 'no eligible waiter is stranded');
+  } finally {
+    Date.now = originalNow;
+    global.setTimeout = originalSetTimeout;
+    global.clearTimeout = originalClearTimeout;
+    s.config = orig.config; s.concurrencyCache = orig.concurrencyCache; s.usageCache = orig.usageCache;
+    s.usageEverFetched = orig.usageEverFetched; s.activeRequests = orig.activeRequests;
+    s.queuedRequests = orig.queuedRequests; s.throttleWaiters = orig.throttleWaiters;
+    s.releaseCooldowns = orig.releaseCooldowns; s.phantomSamples = orig.phantomSamples;
+    s.burstDisabledUntil = orig.burstDisabledUntil; s.refreshUsageInFlight = orig.refreshUsageInFlight;
+    s.refreshUsageTimer = orig.refreshUsageTimer; s.cooldownWakeTimer = orig.cooldownWakeTimer;
+    s.cooldownWakeAt = orig.cooldownWakeAt;
   }
 });
 

@@ -45,13 +45,25 @@ Use the launcher, dashboard, or create `.config/config.json`:
   "REQUEST_LOGGING": "off",
   "OVERRIDE_CONCURRENCY": 0,
   "RELEASE_COOLDOWN_MS": "1s",
-  "WEBSEARCH_PROVIDER": "none"
+  "WEBSEARCH_PROVIDER": "none",
+  "SESSION_HISTORY_LIMIT": 500,
+  "GROUP_SUMMARY_LIMIT": 500,
+  "SEEN_MODELS_LIMIT": 128,
+  "MODEL_RATIO_LIMIT": 128,
+  "STATE_MAP_LIMIT": 5000,
+  "MESSAGE_HASH_CACHE_LIMIT": 5000,
+  "THROTTLE_QUEUE_LIMIT": 8,
+  "BODY_READ_LIMIT": 4,
+  "TAP_PENDING_BYTES": 262144,
+  "GLOBAL_TAP_PENDING_BYTES": 4194304,
+  "TPS_SAMPLE_LIMIT": 128
 }
-```
 
 `.config/` is gitignored and never committed — it holds your live API key. `UMANS_API_KEY` overrides `API_KEY`; `UMANS_SESSION_COOKIE` overrides `SESSION_COOKIE`. `API_KEYS` or comma-separated env `API_KEYS` protects `/api/config`, `/api/umans/*`, and `/v1/*`. Proxy auth is **disabled by default** (empty `API_KEYS`): intended for a localhost single-user tool. The proxy refuses to boot if bound to a non-loopback address with empty `API_KEYS` — set `API_KEYS` first. When auth is disabled, `GET /api/debug/coalesce` exposes conversation-prefix hashes and short response-content previews — protect it if you have untrusted local users. `SESSION_COOKIE` is optional: when set, the proxy sends it as a `Cookie` header **only to `app.umans.ai`** for the cap-health account checks.
 
 `WEBSEARCH_PROVIDER` selects the value sent as the `X-Umans-Websearch-Provider` header on chat upstream requests: `none` (default, no web search), `native` (UMANS built-in), or `exa` (Exa search). `REQUEST_LOGGING` controls request lifecycle logs: `off` (default), `basic`, or `verbose`. Env `WEBSEARCH_PROVIDER` / `REQUEST_LOGGING` override the file value; unknown values fail fast at boot.
+
+Scaling settings are also accepted from environment variables with the same names. `SESSION_HISTORY_LIMIT` bounds completed-session history; active sessions remain retained for correctness. The group, model, coalescing, and sample limits bound optional telemetry/cache state. `THROTTLE_QUEUE_LIMIT`, `BODY_READ_LIMIT`, and the tap byte budgets are overload-protection budgets: raise them only after measuring memory and CPU under representative load. Protocol safety bounds (request body, SSE line, response capture, and WebSocket frame sizes) remain intentionally fixed.
 
 Launcher flags:
 
@@ -110,7 +122,7 @@ Throttling, session tracking, and live tok/s telemetry apply to both shapes. Cla
 
 ## Throttling and usage
 
-Before chat requests, the proxy reads the concurrency limit from UMANS `/usage` (`limits.concurrency.limit`) and queues locally held leases at the effective quota. A sustained upstream-over-local count reduces that quota, so other clients on the same key are protected without trusting a stale count per request. The FIFO queue is capped at 8 requests; further requests receive a local 429 instead of retaining unbounded payloads. `OVERRIDE_CONCURRENCY` caps below the upstream limit.
+Before chat requests, the proxy reads the concurrency limit from UMANS `/usage` (`limits.concurrency.limit`) and queues locally held leases at the effective quota. A sustained upstream-over-local count reduces that quota, so other clients on the same key are protected without trusting a stale count per request. The FIFO queue is bounded by `THROTTLE_QUEUE_LIMIT` (default 8); further requests receive a local 429 instead of retaining unbounded payloads. `OVERRIDE_CONCURRENCY` caps below the upstream limit.
 
 An upstream 429's `Retry-After` header is forwarded to the caller and installs a shared local admission pause for all queued and new requests. The optional cap-health check still controls the longer burst cooldown independently.
 
@@ -136,7 +148,7 @@ The dashboard **Sessions** tab shows per-session cards with:
 - Token breakdown: input cached, input uncached, output, cache hit rate
 - Elapsed time, bytes forwarded, session id
 
-Sessions are pushed via the WebSocket (message type: `sessions`) at most once per second while sessions are active. Completed sessions remain visible for 5 minutes before being dropped. A local timer in the dashboard updates elapsed times at 2fps between WebSocket pushes.
+Sessions are pushed via the WebSocket (message type: `sessions`) at most once per second while sessions are active. Terminal sessions remain visible for 5 minutes before being dropped. `SESSION_HISTORY_LIMIT` bounds only successfully completed (`done`) session history; active sessions are never evicted for reaching that budget. A local timer in the dashboard updates elapsed times at 2fps between WebSocket pushes.
 
 ## Service health
 

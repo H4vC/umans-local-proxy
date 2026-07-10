@@ -5,7 +5,7 @@ const { test, beforeEach } = require('node:test');
 const assert = require('node:assert/strict');
 
 const { fnv1a, fnv1a32, fnv1aMixNum } = require('../lib/hash');
-const { parseDuration, parseWebsearchProvider, parseRequestLogging, parseListenAddr, cleanKeys, fileProxyApiKeys, readConfigFile, isLoopbackHost, normalizeSessionCookie } = require('../lib/config');
+const { parseDuration, parseWebsearchProvider, parseRequestLogging, parseListenAddr, cleanKeys, fileProxyApiKeys, readConfigFile, isLoopbackHost, normalizeSessionCookie, SCALING_DEFAULTS, loadScaling, saveScaling } = require('../lib/config');
 const { snapReasoningLevel, enrichModelsWithReasoning, REASONING_RANK } = require('../lib/reasoning');
 const { firstNumber, concurrencyHardLimit, percentValue, burstQuota, concurrencyQuotaLimit, applyOverride, extractThrottle, fetchUmansUsage, getEffectiveConcurrency, canStart, acquireThrottleSlot, releaseThrottleSlot, notifyUpstream429, parseRetryAfter, ThrottleQueueFullError, MAX_THROTTLE_WAITERS, BURST_COOLDOWN_FILE, RELEASE_COOLDOWN_MS, PHANTOM_WINDOW, coolingDownNow, currentPhantomEstimate, wakeThrottleWaiters } = require('../lib/concurrency');
 const { canonicalMessage, messageHash, chainHash, resolveGroupKey, storeStateKey } = require('../lib/coalesce');
@@ -245,6 +245,26 @@ test('parseDuration case-insensitive', () => {
 
 test('parseDuration throws on invalid', () => {
   assert.throws(() => parseDuration('abc'), /REQUEST_TIMEOUT/);
+});
+
+test('scaling limits use defaults and accept configured non-negative integers', () => {
+  const limits = loadScaling({ SESSION_HISTORY_LIMIT: '2000', TAP_PENDING_BYTES: 1048576, TPS_SAMPLE_LIMIT: 0 });
+  assert.equal(limits.sessionHistory, 2000);
+  assert.equal(limits.tapPendingBytes, 1048576);
+  assert.equal(limits.tpsSamples, 0);
+  assert.equal(limits.throttleWaiters, SCALING_DEFAULTS.throttleWaiters);
+});
+
+test('scaling limits reject malformed values', () => {
+  assert.throws(() => loadScaling({ BODY_READ_LIMIT: '-1' }), /BODY_READ_LIMIT/);
+  assert.throws(() => loadScaling({ STATE_MAP_LIMIT: 'many' }), /STATE_MAP_LIMIT/);
+});
+
+test('scaling limits persist through config serialization', () => {
+  const saved = saveScaling({ sessionHistory: 3000, globalTapPendingBytes: 8 * 1024 * 1024 });
+  assert.equal(saved.SESSION_HISTORY_LIMIT, 3000);
+  assert.equal(saved.GLOBAL_TAP_PENDING_BYTES, 8 * 1024 * 1024);
+  assert.equal(saved.STATE_MAP_LIMIT, SCALING_DEFAULTS.stateMap);
 });
 
 // ---- config: parseWebsearchProvider ----

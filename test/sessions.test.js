@@ -16,6 +16,8 @@ const sessions = require('../lib/sessions');
 
 function reset() {
   state.sessions.clear();
+  state.completedSessionOrder.length = 0;
+  state.completedSessionHead = 0;
   for (const timer of state.sessionTimers.values()) clearTimeout(timer);
   state.sessionTimers.clear();
   state.sessionsByGroup?.clear();
@@ -26,6 +28,12 @@ function reset() {
     state.groupSummaryTimers.clear();
   }
   if (state.modelCharRatio) state.modelCharRatio.clear();
+}
+
+function withLimits(overrides, fn) {
+  const original = state.config;
+  state.config = { ...(original || {}), limits: { ...(original?.limits || {}), ...overrides } };
+  try { return fn(); } finally { state.config = original; }
 }
 
 // Build a raw session record. For active sessions, `tps` populates a rolling
@@ -199,55 +207,74 @@ test('per-model ttftMsP50 surfaces in the snapshot models array', () => {
   assert.equal(gpt5.ttftMsP50, 400);
 });
 
-test('session history evicts the oldest completed record at its retention limit', () => {
+test('session history evicts completed records without evicting active records', () => {
   reset();
-  let completed;
-  for (let i = 0; i < sessions.MAX_RETAINED_SESSIONS; i++) {
-    const record = sessions.createSession({ model: 'm' + i, stream: true, groupKey: 'g' + i });
-    if (i === 0) { record.status = 'done'; completed = record; }
-  }
-  const newest = sessions.createSession({ model: 'new', stream: true, groupKey: 'new' });
-  assert.equal(state.sessions.size, sessions.MAX_RETAINED_SESSIONS);
-  assert.equal(state.sessions.has(completed.id), false);
-  assert.equal(state.sessions.has(newest.id), true);
-  reset();
-});
-
-test('active session records remain bounded when every retained record is live', () => {
-  reset();
-  let oldest;
-  for (let i = 0; i < sessions.MAX_RETAINED_SESSIONS; i++) {
-    const record = sessions.createSession({ model: 'm', stream: true, groupKey: 'g' + i });
-    if (i === 0) oldest = record;
-  }
-  const newest = sessions.createSession({ model: 'm', stream: true, groupKey: 'new' });
-  assert.equal(state.sessions.size, sessions.MAX_RETAINED_SESSIONS);
-  assert.equal(state.sessions.has(oldest.id), false);
-  assert.equal(state.sessions.has(newest.id), true);
+  withLimits({ sessionHistory: 2 }, () => {
+    const first = createAndComplete('first');
+    const second = createAndComplete('second');
+    const active = sessions.createSession({ model: 'm', stream: true, groupKey: 'active' });
+    const third = createAndComplete('third');
+    assert.equal(state.sessions.has(first.id), false);
+    assert.equal(state.sessions.has(second.id), true);
+    assert.equal(state.sessions.has(active.id), true);
+    assert.equal(state.sessions.has(third.id), true);
+  });
   reset();
 });
 
-test('group summaries and learned model telemetry have hard cardinality bounds', () => {
+test('history eviction counts only successful done sessions', () => {
   reset();
-  for (let i = 0; i <= sessions.MAX_GROUP_SUMMARIES; i++) {
-    sessions.updateGroupSummary({ groupKey: 'g' + i, model: 'm', completionTokens: 1, cachedTokens: 0, promptTokens: 0, bytes: 1, finalTps: null });
-  }
-  for (let i = 0; i <= sessions.MAX_MODEL_RATIOS; i++) sessions.updateModelRatio('m' + i, 4, 1);
-  for (let i = 0; i <= sessions.MAX_SEEN_MODELS; i++) sessions.createSession({ model: 'seen-' + i, stream: true, groupKey: 'seen-g' + i });
-  assert.ok(state.groupSummaries.size <= sessions.MAX_GROUP_SUMMARIES);
-  assert.ok(state.groupSummaryTimers.size <= sessions.MAX_GROUP_SUMMARIES);
-  assert.ok(state.modelCharRatio.size <= sessions.MAX_MODEL_RATIOS);
-  assert.ok(state.seenModels.size <= sessions.MAX_SEEN_MODELS);
+  withLimits({ sessionHistory: 1 }, () => {
+    const first = createAndComplete('first');
+    const failed = sessions.createSession({ model: 'm', stream: true, groupKey: 'failed' });
+    sessions.finalizeSession(failed, 'error');
+    const second = createAndComplete('second');
+    assert.equal(state.sessions.has(first.id), false);
+    assert.equal(state.sessions.has(second.id), true);
+    assert.equal(state.sessions.has(failed.id), true);
+    assert.equal(state.groupSummaries.has('failed'), false);
+  });
   reset();
 });
 
-test('expired-session timer retention is capped with session history', () => {
+test('active session records are retained beyond the history budget', () => {
   reset();
-  for (let i = 0; i <= sessions.MAX_RETAINED_SESSIONS; i++) {
-    const record = sessions.createSession({ model: 'm', stream: true, groupKey: 'timer-' + i });
-    sessions.finalizeSession(record, 'done');
-  }
-  assert.ok(state.sessions.size <= sessions.MAX_RETAINED_SESSIONS);
-  assert.ok(state.sessionTimers.size <= sessions.MAX_RETAINED_SESSIONS);
+  withLimits({ sessionHistory: 2 }, () => {
+    const records = [];
+    for (let i = 0; i < 100; i++) records.push(sessions.createSession({ model: 'm', stream: true, groupKey: 'g' + i }));
+    assert.equal(state.sessions.size, 100);
+    assert.equal(state.sessions.has(records[0].id), true);
+    assert.equal(state.sessions.has(records[99].id), true);
+  });
   reset();
 });
+
+test('group summaries and learned model telemetry honor configured cardinality budgets', () => {
+  reset();
+  withLimits({ groupSummaries: 2, modelRatios: 3, seenModels: 4 }, () => {
+    for (let i = 0; i <= 2; i++) sessions.updateGroupSummary({ groupKey: 'g' + i, model: 'm', completionTokens: 1, cachedTokens: 0, promptTokens: 0, bytes: 1, finalTps: null });
+    for (let i = 0; i <= 3; i++) sessions.updateModelRatio('m' + i, 4, 1);
+    for (let i = 0; i <= 4; i++) sessions.createSession({ model: 'seen-' + i, stream: true, groupKey: 'seen-g' + i });
+    assert.ok(state.groupSummaries.size <= 2);
+    assert.ok(state.groupSummaryTimers.size <= 2);
+    assert.ok(state.modelCharRatio.size <= 3);
+    assert.ok(state.seenModels.size <= 4);
+  });
+  reset();
+});
+
+test('completed-session timers stay within the configured history budget', () => {
+  reset();
+  withLimits({ sessionHistory: 2 }, () => {
+    for (let i = 0; i < 20; i++) createAndComplete('timer-' + i);
+    assert.ok(state.sessions.size <= 2);
+    assert.ok(state.sessionTimers.size <= 2);
+  });
+  reset();
+});
+
+function createAndComplete(groupKey) {
+  const record = sessions.createSession({ model: 'm', stream: true, groupKey });
+  sessions.finalizeSession(record, 'done');
+  return record;
+}

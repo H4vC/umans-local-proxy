@@ -7,7 +7,7 @@ const assert = require('node:assert/strict');
 const state = require('../lib/state');
 const { TapParser, MAX_SSE_LINE_CHARS, MAX_RESPONSE_CONTENT_CHARS } = require('../lib/tap-worker');
 const { ChatTap, TAP_PENDING_BYTES_MAX, GLOBAL_PENDING_BYTES_MAX, MAX_TPS_SAMPLES, onWorkerMessage } = require('../lib/chat-tap');
-const { chainHash, storeStateKey, logCoalesce, MAX_STATE_MAP_ENTRIES } = require('../lib/coalesce');
+const { chainHash, storeStateKey, logCoalesce } = require('../lib/coalesce');
 
 function session() {
   return {
@@ -120,15 +120,21 @@ test('worker acknowledgement replenishes a tap credit after a transferred batch'
   assert.equal(s.responseContent, 'ack');
 });
 
-test('coalescing state evicts its oldest entry before exceeding the retention limit', () => {
+test('coalescing state evicts its oldest entry at the configured retention limit', () => {
   clearCoalesceState();
-  for (let i = 0; i < MAX_STATE_MAP_ENTRIES; i++) state.stateMap.set('old-' + i, 'g-' + i);
-  const messages = [{ role: 'user', content: 'new' }];
-  storeStateKey('m', messages, 'answer', 'new-group', chainHash('m', []));
-  assert.equal(state.stateMap.size, MAX_STATE_MAP_ENTRIES);
-  assert.equal(state.stateMap.has('old-0'), false);
-  assert.equal([...state.stateMap.values()].includes('new-group'), true);
-
+  const original = state.config;
+  state.config = { ...(original || {}), limits: { ...(original?.limits || {}), stateMap: 2 } };
+  try {
+    state.stateMap.set('old-0', 'g-0');
+    state.stateMap.set('old-1', 'g-1');
+    const messages = [{ role: 'user', content: 'new' }];
+    storeStateKey('m', messages, 'answer', 'new-group', chainHash('m', []));
+    assert.equal(state.stateMap.size, 2);
+    assert.equal(state.stateMap.has('old-0'), false);
+    assert.equal([...state.stateMap.values()].includes('new-group'), true);
+  } finally {
+    state.config = original;
+  }
   const originalDebugMax = state.COALESCE_DEBUG_MAX;
   try {
     state.COALESCE_DEBUG_MAX = 2;

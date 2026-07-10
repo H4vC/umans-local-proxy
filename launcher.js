@@ -2,6 +2,8 @@ const fs = require('fs');
 const path = require('path');
 const readline = require('readline');
 const { spawn } = require('child_process');
+const { SCALING_DEFAULTS, SCALING_FIELDS } = require('./lib/config');
+const SCALING_DEFAULT_FIELDS = Object.fromEntries(Object.entries(SCALING_FIELDS).map(([key, field]) => [field, SCALING_DEFAULTS[key]]));
 
 const CONFIG_DIR = path.join(__dirname, '.config');
 const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json');
@@ -17,6 +19,15 @@ const DEFAULTS = {
   RELEASE_COOLDOWN_MS: '2s',
   WEBSEARCH_PROVIDER: 'none',
 };
+
+function loadScaling(raw) {
+  const out = {};
+  for (const [field, fallback] of Object.entries(SCALING_DEFAULT_FIELDS)) {
+    const value = Number(process.env[field] !== undefined ? process.env[field] : raw[field]);
+    out[field] = Number.isSafeInteger(value) && value >= 0 ? value : fallback;
+  }
+  return out;
+}
 
 function readJSON(file) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
@@ -44,13 +55,14 @@ function loadConfig() {
     OVERRIDE_CONCURRENCY: Math.max(0, Number(raw.OVERRIDE_CONCURRENCY || DEFAULTS.OVERRIDE_CONCURRENCY) || 0),
     RELEASE_COOLDOWN_MS: raw.RELEASE_COOLDOWN_MS || DEFAULTS.RELEASE_COOLDOWN_MS,
     WEBSEARCH_PROVIDER: raw.WEBSEARCH_PROVIDER || DEFAULTS.WEBSEARCH_PROVIDER,
+    ...loadScaling(raw),
   };
 }
 
 function saveConfig(config) {
   if (!fs.existsSync(CONFIG_DIR)) fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
   fs.chmodSync(CONFIG_DIR, 0o700);
-  fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2) + '\n', { mode: 0o600 });
+  fs.writeFileSync(CONFIG_FILE, JSON.stringify({ ...config, ...loadScaling(config) }, null, 2) + '\n', { mode: 0o600 });
   fs.chmodSync(CONFIG_FILE, 0o600);
 }
 
